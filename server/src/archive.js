@@ -16,10 +16,12 @@ import path from "node:path"
 const RAW_STDERR_TAIL_BYTES = 4096
 
 // Filesystem-safe filename for a UTC ISO-8601 instant.
-// 2026-05-21T14:30:45.123Z → 2026-05-21T14-30-45Z (millis dropped).
+// 2026-05-21T14:30:45.123Z → 2026-05-21T14-30-45-123Z.
+// Milliseconds are preserved deliberately so two Codex rounds in the same
+// second do not collide on the same filename.
 export const tsForFilename = (epochMs) => {
-    const iso = new Date(epochMs).toISOString().replace(/\.\d{3}Z$/, "Z")
-    return iso.replace(/:/g, "-")
+    const iso = new Date(epochMs).toISOString()
+    return iso.replace(/:/g, "-").replace(/\.(\d{3})Z$/, "-$1Z")
 }
 
 export const sanitizeBranch = (branch) => {
@@ -158,6 +160,8 @@ const buildRecord = ({
     trigger,
     priorFindingsFedIn,
     timestampMs,
+    round,
+    blockCount,
 }) => ({
     timestamp: new Date(timestampMs).toISOString(),
     context: {
@@ -166,8 +170,11 @@ const buildRecord = ({
         repoRoot: context.repoRoot,
         branch: context.branch,
     },
-    round: state?.codexRounds ?? null,
-    blockCount: state?.blockCount ?? null,
+    // Explicit round/blockCount win over the state snapshot — useful when
+    // the caller has zeroed the live counters for a terminal status but
+    // wants the archive to reflect this round's actual count.
+    round: round ?? state?.codexRounds ?? null,
+    blockCount: blockCount ?? state?.blockCount ?? null,
     trigger,
     baseline: {
         headSha: payload?.headSha ?? null,
@@ -205,12 +212,12 @@ const buildRecord = ({
 })
 
 const parseTimestampFromFilename = (name) => {
-    // Matches "2026-05-21T14-30-45Z.json" (or .md).
+    // Matches "2026-05-21T14-30-45-123Z.json" (or .md).
     const m = name.match(
-        /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})Z\.(?:json|md)$/
+        /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z\.(?:json|md)$/
     )
     if (!m) return null
-    const iso = `${m[1]}T${m[2]}:${m[3]}:${m[4]}Z`
+    const iso = `${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`
     const t = Date.parse(iso)
     return Number.isFinite(t) ? t : null
 }
@@ -248,9 +255,20 @@ export const createArchive = ({
         state,
         trigger,
         priorFindingsFedIn = [],
+        round,
+        blockCount,
     }) => {
         const ts = now()
-        const folder = ensureFolder(context)
+        let folder
+        try {
+            folder = ensureFolder(context)
+        } catch (err) {
+            logger?.error?.(
+                { err: err?.message, reviewsDir, repo: context?.repo },
+                "archive: failed to create context folder"
+            )
+            return { ok: false, error: err }
+        }
         const base = tsForFilename(ts)
         const jsonPath = path.join(folder, `${base}.json`)
         const mdPath = path.join(folder, `${base}.md`)
@@ -264,22 +282,38 @@ export const createArchive = ({
             trigger,
             priorFindingsFedIn,
             timestampMs: ts,
+            round,
+            blockCount,
         })
 
         const md = renderMarkdown(record, blockingSeverities)
-        // Write JSON first — it's the source of truth. If MD fails after,
-        // we still have the durable record.
-        writeAtomic(jsonPath, JSON.stringify(record, null, 2))
+
+        // Write JSON first — it's the source of truth. Errors here are
+        // logged loudly; the caller sees ok:false but never sees an
+        // exception (archive failure must not break the review path).
+        try {
+            writeAtomic(jsonPath, JSON.stringify(record, null, 2))
+        } catch (err) {
+            logger?.error?.(
+                { err: err?.message, jsonPath },
+                "archive: failed to write JSON record"
+            )
+            return { ok: false, error: err }
+        }
+
+        // Markdown is best-effort; a failure here is logged but the JSON
+        // sibling already landed.
         try {
             writeAtomic(mdPath, md)
         } catch (err) {
             logger?.warn?.(
                 { err: err?.message, mdPath },
-                "failed to write markdown sibling; JSON record kept"
+                "archive: failed to write markdown sibling; JSON record kept"
             )
+            return { ok: true, jsonPath, record, mdError: err }
         }
 
-        return { jsonPath, mdPath, record }
+        return { ok: true, jsonPath, mdPath, record }
     }
 
     const pruneOnStartup = () => {

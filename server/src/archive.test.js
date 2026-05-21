@@ -63,9 +63,15 @@ const happyCodexRaw = {
 }
 
 describe("tsForFilename", () => {
-    test("strips millis and replaces colons with hyphens", () => {
+    test("keeps millis and replaces colons + dot with hyphens", () => {
         const out = tsForFilename(Date.parse("2026-05-21T14:30:45.123Z"))
-        expect(out).toBe("2026-05-21T14-30-45Z")
+        expect(out).toBe("2026-05-21T14-30-45-123Z")
+    })
+
+    test("same-second instants produce distinct filenames via the millis suffix", () => {
+        const a = tsForFilename(Date.parse("2026-05-21T14:30:45.001Z"))
+        const b = tsForFilename(Date.parse("2026-05-21T14:30:45.999Z"))
+        expect(a).not.toBe(b)
     })
 })
 
@@ -88,9 +94,15 @@ describe("folderName", () => {
 })
 
 describe("parseTimestampFromFilename", () => {
-    test("recognizes well-formed names", () => {
-        const t = parseTimestampFromFilename("2026-05-21T14-30-45Z.json")
-        expect(t).toBe(Date.parse("2026-05-21T14:30:45Z"))
+    test("recognizes well-formed names with millis", () => {
+        const t = parseTimestampFromFilename("2026-05-21T14-30-45-123Z.json")
+        expect(t).toBe(Date.parse("2026-05-21T14:30:45.123Z"))
+    })
+
+    test("rejects legacy names without millis (collision risk)", () => {
+        expect(
+            parseTimestampFromFilename("2026-05-21T14-30-45Z.json")
+        ).toBeNull()
     })
     test("returns null on garbage", () => {
         expect(parseTimestampFromFilename("notes.txt")).toBeNull()
@@ -278,6 +290,50 @@ describe("renderMarkdown", () => {
     })
 })
 
+describe("buildRecord — round/blockCount override", () => {
+    test("explicit round/blockCount win over the state snapshot", () => {
+        const rec = buildRecord({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 0, blockCount: 0 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+            round: 3,
+            blockCount: 2,
+        })
+        expect(rec.round).toBe(3)
+        expect(rec.blockCount).toBe(2)
+    })
+
+    test("falls back to state.codexRounds/blockCount when not explicit", () => {
+        const rec = buildRecord({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 5, blockCount: 4 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+        })
+        expect(rec.round).toBe(5)
+        expect(rec.blockCount).toBe(4)
+    })
+})
+
 describe("renderMarkdown — edges", () => {
     test("renders Reason bullet when result.reason is set", () => {
         const record = buildRecord({
@@ -409,10 +465,10 @@ describe("createArchive.write", () => {
     test("writes <reviewsDir>/<repo>:<branch>/<ts>.{json,md}", () => {
         const r = writeOne()
         expect(r.jsonPath).toBe(
-            path.join(reviewsDir, "foo:main", "2026-05-21T14-30-45Z.json")
+            path.join(reviewsDir, "foo:main", "2026-05-21T14-30-45-000Z.json")
         )
         expect(r.mdPath).toBe(
-            path.join(reviewsDir, "foo:main", "2026-05-21T14-30-45Z.md")
+            path.join(reviewsDir, "foo:main", "2026-05-21T14-30-45-000Z.md")
         )
         // Files exist on disk and JSON round-trips.
         const j = JSON.parse(readFileSync(r.jsonPath, "utf8"))
@@ -480,6 +536,35 @@ describe("createArchive.write", () => {
         const j = JSON.parse(readFileSync(r.jsonPath, "utf8"))
         expect(j.codex.rawStderrTail.length).toBeLessThanOrEqual(4096)
         expect(j.codex.rawStderrTail).toBe(huge.slice(-4096))
+    })
+
+    test("logs and returns ok:false when ensureFolder throws (e.g. permissions)", () => {
+        // A file already exists where the context folder should be created.
+        const collision = path.join(reviewsDir, "foo:main")
+        writeFileSync(collision, "not a directory")
+        const logger = { error: jest.fn(), warn: jest.fn() }
+        const archive = createArchive({
+            reviewsDir,
+            now: () => Date.parse("2026-05-21T14:30:45Z"),
+            logger,
+        })
+        const r = archive.write({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 1, blockCount: 0 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+        })
+        expect(r.ok).toBe(false)
+        expect(r.error).toBeDefined()
+        expect(logger.error).toHaveBeenCalled()
     })
 
     test("logs but does not throw when md write fails", () => {

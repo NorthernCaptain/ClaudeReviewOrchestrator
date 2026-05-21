@@ -1169,6 +1169,52 @@ describe("handleReview — archive integration", () => {
         expect(archive.write).not.toHaveBeenCalled()
     })
 
+    test("archive captures pre-reset round/blockCount on terminal status", async () => {
+        // Seed state at round 1 so this Codex run is round 2; GOOD_TO_GO
+        // would zero the live counter but the archive should record 2.
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 1,
+            lastReviewedAt: 1,
+            lastResultStatus: "ISSUES",
+            priorFindings: [findingOn("a.js")],
+            lastBaseline: { progressHash: "OLD" },
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(archive.write).toHaveBeenCalledTimes(1)
+        const args = archive.write.mock.calls[0][0]
+        expect(args.round).toBe(2)
+        expect(args.blockCount).toBe(0)
+    })
+
+    test("archive receives the configured codex.model", async () => {
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: { ...minimalConfig(), codex: { ...minimalConfig().codex, model: "gpt-5-codex" } },
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+            }),
+        })
+        const args = archive.write.mock.calls[0][0]
+        expect(args.codexRaw.model).toBe("gpt-5-codex")
+    })
+
     test("archive failure does not break the response", async () => {
         const throwingArchive = {
             write: jest.fn(() => {

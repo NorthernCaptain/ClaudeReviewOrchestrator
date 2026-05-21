@@ -136,14 +136,18 @@ const stateSummary = (state) => ({
 // blockCount consumption, decision:"block" on ISSUES).
 const isStopHook = (trigger) => trigger === "stop_hook"
 
-const tryArchive = (archive, args) => {
+// archive.write logs its own errors and returns {ok: boolean, error?}.
+// We still wrap defensively: if an injected mock or a future bug throws
+// in a way archive.write doesn't catch, we don't want the review path
+// itself to crash. Any caught error is logged via the archive's own
+// logger when it has one, otherwise dropped (which is the legacy
+// behavior).
+const safeArchive = (archive, args) => {
     if (!archive) return
     try {
         archive.write(args)
-    } catch (err) {
-        // Archive failure must not break the review loop. Logged at the
-        // archive layer when a logger is passed; here we swallow.
-        void err
+    } catch {
+        // archive.write should not throw; this is a backstop.
     }
 }
 
@@ -355,10 +359,13 @@ export const handleReview = async ({
             lastResultStatus: "ESCALATE",
             lastEscalateReason: codexResult.reason,
         })
-        tryArchive(archive, {
+        safeArchive(archive, {
             context,
             payload,
-            codexRaw: codexResult.raw,
+            codexRaw: {
+                ...codexResult.raw,
+                model: config.codex?.model ?? null,
+            },
             result: {
                 status: "ESCALATE",
                 findings: [],
@@ -368,6 +375,8 @@ export const handleReview = async ({
                 schemaError: codexResult.schemaError ?? null,
             },
             state: nextState,
+            round: nextState.codexRounds,
+            blockCount: nextState.blockCount,
             trigger,
             priorFindingsFedIn: state.priorFindings,
         })
@@ -423,6 +432,12 @@ export const handleReview = async ({
                   : state.blockCount,
     }
 
+    // Capture this round's counters BEFORE the terminal reset zeroes them,
+    // so the archive records "round N / blockCount M" of the actual work
+    // even when the loop just ended.
+    const archivedRound = nextState.codexRounds
+    const archivedBlockCount = nextState.blockCount
+
     if (isTerminal) {
         // Both terminal statuses end the loop — counters go to zero, the
         // prior-findings cache is dropped.
@@ -433,10 +448,13 @@ export const handleReview = async ({
 
     const saved = store.save(context.key, nextState)
 
-    tryArchive(archive, {
+    safeArchive(archive, {
         context,
         payload,
-        codexRaw: codexResult.raw,
+        codexRaw: {
+            ...codexResult.raw,
+            model: config.codex?.model ?? null,
+        },
         result: {
             status,
             findings: kept,
@@ -444,6 +462,8 @@ export const handleReview = async ({
             droppedFindings: dropped,
         },
         state: saved,
+        round: archivedRound,
+        blockCount: archivedBlockCount,
         trigger,
         priorFindingsFedIn: state.priorFindings,
     })
