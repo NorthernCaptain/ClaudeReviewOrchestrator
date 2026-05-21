@@ -118,6 +118,41 @@ describe("loadProjectConfig", () => {
         expect(logger.error).toHaveBeenCalled()
     })
 
+    test("rejects safety-critical limits (maxCodexRounds / maxBlocks / codexTimeoutSeconds / maxCodexOutputBytes)", () => {
+        for (const key of [
+            "maxCodexRounds",
+            "maxBlocks",
+            "codexTimeoutSeconds",
+            "maxCodexOutputBytes",
+        ]) {
+            writeProjectConfig(repoRoot, {
+                limits: { [key]: 9999 },
+            })
+            const logger = { error: jest.fn(), warn: jest.fn() }
+            const r = loadProjectConfig({ repoRoot, logger })
+            expect(r).toBeNull()
+            expect(logger.error).toHaveBeenCalled()
+        }
+    })
+
+    test("accepts the allowed review-shaping limit keys", () => {
+        writeProjectConfig(repoRoot, {
+            limits: {
+                maxPayloadBytes: 524288,
+                maxFileBytes: 131072,
+                maxFiles: 80,
+                idleResetMinutes: 20,
+            },
+        })
+        const r = loadProjectConfig({ repoRoot })
+        expect(r.limits).toEqual({
+            maxPayloadBytes: 524288,
+            maxFileBytes: 131072,
+            maxFiles: 80,
+            idleResetMinutes: 20,
+        })
+    })
+
     test("propagates non-ENOENT read errors through the logger", () => {
         const err = Object.assign(new Error("perm denied"), {
             code: "EACCES",
@@ -181,11 +216,22 @@ describe("mergeWithGlobal", () => {
         expect(mergeWithGlobal(g, null)).toBe(g)
     })
 
-    test("replaces ignorePaths fully when supplied", () => {
+    test("EXTENDS ignorePaths (project appends, global defaults stay)", () => {
         const out = mergeWithGlobal(global(), {
-            ignorePaths: ["docs/**"],
+            ignorePaths: ["docs/**", "**/__snapshots__/**"],
         })
-        expect(out.ignorePaths).toEqual(["docs/**"])
+        expect(out.ignorePaths).toEqual([
+            "**/node_modules/**",
+            "docs/**",
+            "**/__snapshots__/**",
+        ])
+    })
+
+    test("ignorePaths extension dedupes when project repeats a global pattern", () => {
+        const out = mergeWithGlobal(global(), {
+            ignorePaths: ["**/node_modules/**", "docs/**"],
+        })
+        expect(out.ignorePaths).toEqual(["**/node_modules/**", "docs/**"])
     })
 
     test("replaces blockingSeverities fully when supplied", () => {

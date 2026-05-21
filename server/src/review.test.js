@@ -7,7 +7,7 @@ import { jest } from "@jest/globals"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { handleReview } from "./review.js"
+import { handleReview, computeReviewConfigHash } from "./review.js"
 import { ContextError } from "./context.js"
 import { createStateStore } from "./state.js"
 
@@ -41,6 +41,15 @@ const happyContext = {
     branch: "main",
     key: "/repo|main",
 }
+
+// Helper for tests that seed lastBaseline. The unchanged-baseline check
+// now requires both progressHash AND reviewConfigHash to match — every
+// seed that wants to hit the unchanged branch must include the hash for
+// the config it's testing under.
+const seededBaseline = (progressHash, cfg = minimalConfig()) => ({
+    progressHash,
+    reviewConfigHash: computeReviewConfigHash(cfg),
+})
 
 const makePayload = (overrides = {}) => ({
     headSha: "abc1234",
@@ -252,7 +261,7 @@ describe("handleReview — change detection", () => {
             ...happyContext,
             codexRounds: 0,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             priorFindings: [],
             lastReviewedAt: 1,
             lastResultStatus: "GOOD_TO_GO",
@@ -277,7 +286,7 @@ describe("handleReview — change detection", () => {
             ...happyContext,
             codexRounds: 1,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             priorFindings: issueFindings,
             lastReviewedAt: 1,
             lastResultStatus: "ISSUES",
@@ -308,7 +317,7 @@ describe("handleReview — change detection", () => {
             ...happyContext,
             codexRounds: 1,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             priorFindings: [
                 {
                     file: "../../secret.txt",
@@ -346,7 +355,7 @@ describe("handleReview — change detection", () => {
             ...happyContext,
             codexRounds: 1,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             priorFindings: issueFindings,
             lastReviewedAt: 1,
             lastResultStatus: "ISSUES",
@@ -597,7 +606,7 @@ describe("handleReview — unchanged ESCALATE short-circuit", () => {
             ...happyContext,
             codexRounds: 1,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             lastReviewedAt: 1,
             lastResultStatus: "ESCALATE",
             lastEscalateReason: "codex output failed schema",
@@ -625,7 +634,7 @@ describe("handleReview — unchanged ESCALATE short-circuit", () => {
             ...happyContext,
             codexRounds: 1,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             lastReviewedAt: 1,
             lastResultStatus: "ESCALATE",
             lastEscalateReason: "codex output failed schema",
@@ -1063,7 +1072,7 @@ describe("handleReview — archive integration", () => {
             ...happyContext,
             codexRounds: 1,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             priorFindings: [],
             lastReviewedAt: 1,
             lastResultStatus: "GOOD_TO_GO",
@@ -1086,7 +1095,7 @@ describe("handleReview — archive integration", () => {
             ...happyContext,
             codexRounds: 1,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             priorFindings: [findingOn("a.js", "blocker")],
             lastReviewedAt: 1,
             lastResultStatus: "ISSUES",
@@ -1109,7 +1118,7 @@ describe("handleReview — archive integration", () => {
             ...happyContext,
             codexRounds: 1,
             blockCount: 0,
-            lastBaseline: { progressHash: "g-hash-1" },
+            lastBaseline: seededBaseline("g-hash-1"),
             priorFindings: [],
             lastReviewedAt: 1,
             lastResultStatus: "ESCALATE",
@@ -1232,6 +1241,177 @@ describe("handleReview — archive integration", () => {
         })
         expect(r.body.status).toBe("GOOD_TO_GO")
         expect(throwingArchive.write).toHaveBeenCalled()
+    })
+})
+
+describe("handleReview — reviewConfigHash invalidation", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadWith = (paths) =>
+        makePayload({
+            files: {
+                modified: paths.map((p) => ({ path: p })),
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    test("policy change (blockingSeverities) invalidates the unchanged-baseline cache", async () => {
+        // Seed: a previous NO_PROGRESS-worthy state under the GLOBAL policy.
+        const globalCfg = minimalConfig()
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: seededBaseline("g-hash-1", globalCfg),
+            priorFindings: [],
+            lastReviewedAt: 1,
+            lastResultStatus: "GOOD_TO_GO",
+        })
+
+        const codexSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0, timedOut: false },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: globalCfg,
+            store,
+            deps: makeDeps({
+                // Project widens severities → policy hash changes → cache
+                // must NOT serve the stale GOOD_TO_GO.
+                loadProjectConfig: () => ({
+                    blockingSeverities: ["blocker", "major", "minor", "nit"],
+                }),
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: codexSpy,
+            }),
+        })
+        expect(codexSpy).toHaveBeenCalledTimes(1)
+        expect(r.body.status).toBe("GOOD_TO_GO")
+    })
+
+    test("policy change (extraReviewerInstructions) invalidates the cache", async () => {
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: seededBaseline("g-hash-1"),
+            priorFindings: [],
+            lastReviewedAt: 1,
+            lastResultStatus: "GOOD_TO_GO",
+        })
+        const codexSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0, timedOut: false },
+        }))
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                loadProjectConfig: () => ({
+                    extraReviewerInstructions: "Be stricter.",
+                }),
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: codexSpy,
+            }),
+        })
+        expect(codexSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("identical policy + same progressHash still hits NO_CHANGES", async () => {
+        // Seed under the SAME policy: the cache should fire.
+        const cfg = minimalConfig()
+        const projectCfg = {
+            blockingSeverities: ["blocker", "major", "minor"],
+        }
+        const merged = {
+            ...cfg,
+            blockingSeverities: projectCfg.blockingSeverities,
+        }
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: {
+                progressHash: "g-hash-1",
+                reviewConfigHash: computeReviewConfigHash(merged),
+            },
+            priorFindings: [],
+            lastReviewedAt: 1,
+            lastResultStatus: "GOOD_TO_GO",
+        })
+        const codexSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: cfg,
+            store,
+            deps: makeDeps({
+                loadProjectConfig: () => projectCfg,
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: codexSpy,
+            }),
+        })
+        expect(codexSpy).not.toHaveBeenCalled()
+        expect(r.body.status).toBe("NO_CHANGES")
+    })
+
+    test("baselineSummary records reviewConfigHash so subsequent rounds can compare", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+            }),
+        })
+        expect(r.body.baseline.reviewConfigHash).toEqual(expect.any(String))
+        expect(r.body.baseline.reviewConfigHash.length).toBe(64)
+    })
+})
+
+describe("handleReview — logger plumbing for project config", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("invokes the supplied logger when the project loader injects one", async () => {
+        const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            logger,
+            deps: makeDeps({
+                // The injected loader receives the logger and uses it.
+                loadProjectConfig: ({ logger: l }) => {
+                    l?.warn?.({ unknown: ["x"] }, "test warning")
+                    return null
+                },
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+            }),
+        })
+        expect(logger.warn).toHaveBeenCalled()
     })
 })
 

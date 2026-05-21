@@ -3,10 +3,40 @@
  * Author: Leo Khramov
  */
 
+import { createHash } from "node:crypto"
 import { resolveContext, ContextError } from "./context.js"
 import { buildPayload, sanitizeFindingPath } from "./diff.js"
 import { runAndParse, wrapPrompt } from "./codex.js"
 import { loadProjectConfig, mergeWithGlobal } from "./project-config.js"
+
+// Stable hash of the review-policy fields that change the meaning of a
+// review result without necessarily changing the prompt bytes. The
+// unchanged-baseline check requires this hash to match what was stored
+// alongside lastBaseline; if any of these knobs flipped between rounds,
+// the cache is invalidated and Codex re-runs.
+//
+// Notably included:
+//   * blockingSeverities — flips between blocking and informational.
+//   * extraReviewerInstructions — changes what the reviewer is told.
+//   * ignorePaths — could affect which files Codex even sees.
+//   * review-shaping limits — could cause different truncation behavior.
+// Excluded: per-call body.extra_instructions (changes per request and is
+// out of band with persistent state).
+export const computeReviewConfigHash = (config) => {
+    const blockingSeverities = [...(config.blockingSeverities ?? [])].sort()
+    const ignorePaths = [...(config.ignorePaths ?? [])].sort()
+    const policy = {
+        blockingSeverities,
+        ignorePaths,
+        extraReviewerInstructions: config.extraReviewerInstructions ?? null,
+        limits: {
+            maxPayloadBytes: config.limits?.maxPayloadBytes ?? null,
+            maxFileBytes: config.limits?.maxFileBytes ?? null,
+            maxFiles: config.limits?.maxFiles ?? null,
+        },
+    }
+    return createHash("sha256").update(JSON.stringify(policy)).digest("hex")
+}
 
 // Concatenate the project-config static directive and the per-call
 // extra_instructions, in that order. Project guidance comes first so the
@@ -125,10 +155,11 @@ const contextSummary = (context) => ({
     key: context.key,
 })
 
-const baselineSummary = (payload) => ({
+const baselineSummary = (payload, reviewConfigHash = null) => ({
     headSha: payload.headSha,
     promptHash: payload.promptHash,
     progressHash: payload.progressHash,
+    reviewConfigHash,
     files: payload.files,
     totalBytes: payload.totalBytes,
     truncated: payload.truncated,
@@ -168,11 +199,14 @@ const safeArchive = (archive, args) => {
     }
 }
 
+const noopLogger = { info() {}, warn() {}, error() {} }
+
 export const handleReview = async ({
     body,
     config,
     store,
     archive = null,
+    logger = noopLogger,
     deps = {},
     now = Date.now,
 }) => {
@@ -208,8 +242,10 @@ export const handleReview = async ({
     // wholesale for ignorePaths / blockingSeverities / extraReviewerInstructions.
     const projectConfig = (deps.loadProjectConfig ?? loadProjectConfig)({
         repoRoot: context.repoRoot,
+        logger,
     })
     config = mergeWithGlobal(config, projectConfig)
+    const reviewConfigHash = computeReviewConfigHash(config)
 
     const trigger = body?.trigger ?? "manual"
     const state = store.get(context)
@@ -248,17 +284,21 @@ export const handleReview = async ({
                 reason: "payload empty or fully binary",
                 code: "EMPTY_PAYLOAD",
                 context: contextSummary(context),
-                baseline: baselineSummary(payload),
+                baseline: baselineSummary(payload, reviewConfigHash),
                 state: stateSummary(state),
             }),
         }
     }
 
     // Change detection: NO_CHANGES or NO_PROGRESS_WITH_OPEN_ISSUES short
-    // circuits before we spawn codex.
+    // circuits before we spawn codex. The check requires BOTH the disk-
+    // state hash AND the review-policy hash to match — a project edit to
+    // blockingSeverities or extraReviewerInstructions invalidates the
+    // cache even when the file bytes have not changed.
     const unchanged =
         state.lastBaseline &&
-        state.lastBaseline.progressHash === payload.progressHash
+        state.lastBaseline.progressHash === payload.progressHash &&
+        state.lastBaseline.reviewConfigHash === reviewConfigHash
 
     if (unchanged) {
         if (
@@ -269,7 +309,7 @@ export const handleReview = async ({
                 httpStatus: 200,
                 body: envelope("NO_CHANGES", {
                     context: contextSummary(context),
-                    baseline: baselineSummary(payload),
+                    baseline: baselineSummary(payload, reviewConfigHash),
                     state: stateSummary(state),
                 }),
             }
@@ -301,7 +341,7 @@ export const handleReview = async ({
                     droppedFindings: [],
                     reason: "No on-disk progress on flagged files since the last review.",
                     context: contextSummary(context),
-                    baseline: baselineSummary(payload),
+                    baseline: baselineSummary(payload, reviewConfigHash),
                     state: stateSummary(nextState),
                 },
             }
@@ -328,7 +368,7 @@ export const handleReview = async ({
                         "previous codex run failed and the on-disk state has not changed",
                     code: "CODEX_ERROR_CACHED",
                     context: contextSummary(context),
-                    baseline: baselineSummary(payload),
+                    baseline: baselineSummary(payload, reviewConfigHash),
                     state: stateSummary(nextState),
                 }),
             }
@@ -390,7 +430,7 @@ export const handleReview = async ({
         const nextState = store.save(context.key, {
             ...state,
             codexRounds: state.codexRounds + 1,
-            lastBaseline: baselineSummary(payload),
+            lastBaseline: baselineSummary(payload, reviewConfigHash),
             lastReviewedAt: now(),
             lastResultStatus: "ESCALATE",
             lastEscalateReason: codexResult.reason,
@@ -422,7 +462,7 @@ export const handleReview = async ({
                 reason: codexResult.reason,
                 code: "CODEX_ERROR",
                 context: contextSummary(context),
-                baseline: baselineSummary(payload),
+                baseline: baselineSummary(payload, reviewConfigHash),
                 codex: codexSummary(codexResult),
                 state: stateSummary(nextState),
             }),
@@ -452,7 +492,7 @@ export const handleReview = async ({
     const nextState = {
         ...state,
         codexRounds: state.codexRounds + 1,
-        lastBaseline: baselineSummary(payload),
+        lastBaseline: baselineSummary(payload, reviewConfigHash),
         lastReviewedAt: now(),
         lastEscalateReason: null,
         lastResultStatus: status,
@@ -512,7 +552,7 @@ export const handleReview = async ({
             blockingFindings,
             droppedFindings: dropped,
             context: contextSummary(context),
-            baseline: baselineSummary(payload),
+            baseline: baselineSummary(payload, reviewConfigHash),
             codex: codexSummary(codexResult),
             state: stateSummary(saved),
         },
@@ -521,7 +561,7 @@ export const handleReview = async ({
 
 export const mountReviewRoute = (
     app,
-    { config, store, archive = null, deps } = {}
+    { config, store, archive = null, logger = noopLogger, deps } = {}
 ) => {
     app.post("/review", async (req, res) => {
         const result = await handleReview({
@@ -529,6 +569,7 @@ export const mountReviewRoute = (
             config,
             store,
             archive,
+            logger,
             deps,
         })
         res.status(result.httpStatus).json(result.body)

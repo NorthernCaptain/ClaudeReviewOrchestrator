@@ -12,7 +12,13 @@ import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { logger } from "./logger.js"
 
-export const createApp = ({ config, store, archive = null, deps = {} }) => {
+export const createApp = ({
+    config,
+    store,
+    archive = null,
+    logger: log = logger,
+    deps = {},
+}) => {
     const app = express()
     app.disable("x-powered-by")
     app.use(express.json({ limit: "1mb" }))
@@ -22,7 +28,7 @@ export const createApp = ({ config, store, archive = null, deps = {} }) => {
     })
 
     app.use(authMiddleware({ token: config.authToken }))
-    mountReviewRoute(app, { config, store, archive, deps })
+    mountReviewRoute(app, { config, store, archive, logger: log, deps })
     mountResetRoute(app, { config, store, deps })
 
     return app
@@ -36,7 +42,13 @@ export const startServer = ({
     log = logger,
 } = {}) =>
     new Promise((resolve) => {
-        const app = createApp({ config, store, archive, deps })
+        const app = createApp({
+            config,
+            store,
+            archive,
+            logger: log,
+            deps,
+        })
         const server = app.listen(config.port, config.bind)
         let settled = false
 
