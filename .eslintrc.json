@@ -6,8 +6,7 @@
         "browser": true,
         "es2022": true
     },
-    "settings": {
-    },
+    "settings": {},
     "extends": [
         "eslint:recommended",
         "plugin:node/recommended",
@@ -23,12 +22,7 @@
         "sourceType": "module",
         "ecmaVersion": 2024
     },
-    "plugins": [
-        "prettier",
-        "@typescript-eslint",
-        "unused-imports",
-        "node"
-    ],
+    "plugins": ["prettier", "@typescript-eslint", "unused-imports", "node"],
     "rules": {
         "prettier/prettier": "error",
         "linebreak-style": ["warn", "unix"],

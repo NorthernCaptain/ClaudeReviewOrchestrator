@@ -2,6 +2,8 @@
 **/.svn
 **/.hg
 **/*.yml
+**/*.md
 **/node_modules
 reviews
 coverage
+package-lock.json

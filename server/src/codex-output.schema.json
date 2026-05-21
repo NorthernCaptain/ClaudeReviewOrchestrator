@@ -49,7 +49,14 @@
                 },
                 "category": {
                     "type": "string",
-                    "enum": ["bug", "security", "perf", "style", "test", "other"]
+                    "enum": [
+                        "bug",
+                        "security",
+                        "perf",
+                        "style",
+                        "test",
+                        "other"
+                    ]
                 },
                 "message": { "type": "string", "minLength": 1 },
                 "suggestion": { "type": "string" }

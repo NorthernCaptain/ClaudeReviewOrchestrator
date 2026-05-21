@@ -40,11 +40,15 @@
     "jest": {
         "testEnvironment": "node",
         "transform": {},
-        "testMatch": ["**/?(*.)+test.js"],
+        "testMatch": [
+            "<rootDir>/server/**/*.test.js",
+            "<rootDir>/hooks/**/*.test.mjs"
+        ],
         "collectCoverageFrom": [
             "server/src/**/*.js",
             "hooks/**/*.mjs",
-            "!**/*.test.js"
+            "!**/*.test.js",
+            "!**/*.test.mjs"
         ],
         "coverageThreshold": {
             "global": {
