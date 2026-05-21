@@ -49,8 +49,7 @@
             "hooks/**/*.mjs",
             "!**/*.test.js",
             "!**/*.test.mjs",
-            "!server/src/status.js",
-            "!hooks/stop-review.mjs"
+            "!server/src/status.js"
         ],
         "coverageThreshold": {
             "global": {
