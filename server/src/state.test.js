@@ -200,9 +200,7 @@ describe("createStateStore — disk robustness", () => {
             codexRounds: 1,
             lastReviewedAt: 0,
         })
-        expect(() =>
-            readFileSync(`${filePath}.tmp`, "utf8")
-        ).toThrow()
+        expect(() => readFileSync(`${filePath}.tmp`, "utf8")).toThrow()
     })
 
     test("list returns all current contexts", () => {

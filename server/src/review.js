@@ -136,10 +136,22 @@ const stateSummary = (state) => ({
 // blockCount consumption, decision:"block" on ISSUES).
 const isStopHook = (trigger) => trigger === "stop_hook"
 
+const tryArchive = (archive, args) => {
+    if (!archive) return
+    try {
+        archive.write(args)
+    } catch (err) {
+        // Archive failure must not break the review loop. Logged at the
+        // archive layer when a logger is passed; here we swallow.
+        void err
+    }
+}
+
 export const handleReview = async ({
     body,
     config,
     store,
+    archive = null,
     deps = {},
     now = Date.now,
 }) => {
@@ -343,6 +355,22 @@ export const handleReview = async ({
             lastResultStatus: "ESCALATE",
             lastEscalateReason: codexResult.reason,
         })
+        tryArchive(archive, {
+            context,
+            payload,
+            codexRaw: codexResult.raw,
+            result: {
+                status: "ESCALATE",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+                reason: codexResult.reason,
+                schemaError: codexResult.schemaError ?? null,
+            },
+            state: nextState,
+            trigger,
+            priorFindingsFedIn: state.priorFindings,
+        })
         return {
             httpStatus: 200,
             body: envelope("ESCALATE", {
@@ -405,6 +433,21 @@ export const handleReview = async ({
 
     const saved = store.save(context.key, nextState)
 
+    tryArchive(archive, {
+        context,
+        payload,
+        codexRaw: codexResult.raw,
+        result: {
+            status,
+            findings: kept,
+            blockingFindings,
+            droppedFindings: dropped,
+        },
+        state: saved,
+        trigger,
+        priorFindingsFedIn: state.priorFindings,
+    })
+
     return {
         httpStatus: 200,
         body: {
@@ -420,12 +463,16 @@ export const handleReview = async ({
     }
 }
 
-export const mountReviewRoute = (app, { config, store, deps } = {}) => {
+export const mountReviewRoute = (
+    app,
+    { config, store, archive = null, deps } = {}
+) => {
     app.post("/review", async (req, res) => {
         const result = await handleReview({
             body: req.body,
             config,
             store,
+            archive,
             deps,
         })
         res.status(result.httpStatus).json(result.body)

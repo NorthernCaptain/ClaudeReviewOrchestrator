@@ -31,8 +31,7 @@ const makeStore = () => {
     return store
 }
 
-const cleanup = (store) =>
-    rmSync(store.__dir, { recursive: true, force: true })
+const cleanup = (store) => rmSync(store.__dir, { recursive: true, force: true })
 
 describe("handleReset", () => {
     let store
@@ -59,10 +58,7 @@ describe("handleReset", () => {
             store,
             deps: {
                 resolveContext: () => {
-                    throw new ContextError(
-                        "NOT_IN_ALLOWED_ROOT",
-                        "nope"
-                    )
+                    throw new ContextError("NOT_IN_ALLOWED_ROOT", "nope")
                 },
             },
         })
@@ -83,6 +79,22 @@ describe("handleReset", () => {
         })
         expect(r.httpStatus).toBe(400)
         expect(r.body.code).toBe("NOT_A_GIT_REPO")
+    })
+
+    test("falls back to INTERNAL_ERROR when resolveContext throws a non-ContextError", () => {
+        const r = handleReset({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store,
+            deps: {
+                resolveContext: () => {
+                    throw new Error("disk read failure")
+                },
+            },
+        })
+        expect(r.httpStatus).toBe(400)
+        expect(r.body.code).toBe("INTERNAL_ERROR")
+        expect(r.body.reason).toMatch(/disk read failure/)
     })
 
     test("clears counters/baseline/priorFindings for the resolved context", () => {

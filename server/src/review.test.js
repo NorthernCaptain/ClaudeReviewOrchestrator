@@ -761,9 +761,11 @@ describe("handleReview — Phase 3: status derivation", () => {
         expect(r.body.status).toBe("ISSUES")
         expect(r.body.findings).toHaveLength(4)
         expect(r.body.blockingFindings).toHaveLength(2)
-        expect(r.body.blockingFindings.every(
-            (f) => f.severity === "blocker" || f.severity === "major"
-        )).toBe(true)
+        expect(
+            r.body.blockingFindings.every(
+                (f) => f.severity === "blocker" || f.severity === "major"
+            )
+        ).toBe(true)
         // priorFindings tracks ONLY blockers across rounds.
         const persisted = store.get(happyContext)
         expect(persisted.priorFindings).toHaveLength(2)
@@ -971,6 +973,219 @@ describe("handleReview — Phase 3: status derivation", () => {
         })
         expect(r2Prompt).toContain("<<<PRIOR_FINDINGS>>>")
         expect(r2Prompt).toContain("round-1")
+    })
+})
+
+describe("handleReview — archive integration", () => {
+    let store
+    let archive
+    beforeEach(() => {
+        store = makeStoreInMemory()
+        archive = { write: jest.fn() }
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadWith = (paths) =>
+        makePayload({
+            files: {
+                modified: paths.map((p) => ({ path: p })),
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    const findingOn = (file, sev = "blocker") => ({
+        file,
+        line: 1,
+        severity: sev,
+        category: "bug",
+        message: "x",
+    })
+
+    test("writes archive on GOOD_TO_GO (codex ran)", async () => {
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+            }),
+        })
+        expect(archive.write).toHaveBeenCalledTimes(1)
+        expect(archive.write.mock.calls[0][0].result.status).toBe("GOOD_TO_GO")
+    })
+
+    test("writes archive on ISSUES (codex ran)", async () => {
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [findingOn("a.js", "blocker")],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(archive.write).toHaveBeenCalledTimes(1)
+        expect(archive.write.mock.calls[0][0].result.status).toBe("ISSUES")
+    })
+
+    test("writes archive on Codex ESCALATE (codex ran but failed)", async () => {
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "ESCALATE",
+                    reason: "codex output failed schema",
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(archive.write).toHaveBeenCalledTimes(1)
+        const args = archive.write.mock.calls[0][0]
+        expect(args.result.status).toBe("ESCALATE")
+        expect(args.result.reason).toMatch(/failed schema/)
+    })
+
+    test("does NOT write archive on NO_CHANGES (cache hit)", async () => {
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: { progressHash: "g-hash-1" },
+            priorFindings: [],
+            lastReviewedAt: 1,
+            lastResultStatus: "GOOD_TO_GO",
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+            }),
+        })
+        expect(r.body.status).toBe("NO_CHANGES")
+        expect(archive.write).not.toHaveBeenCalled()
+    })
+
+    test("does NOT write archive on NO_PROGRESS_WITH_OPEN_ISSUES", async () => {
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: { progressHash: "g-hash-1" },
+            priorFindings: [findingOn("a.js", "blocker")],
+            lastReviewedAt: 1,
+            lastResultStatus: "ISSUES",
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+            }),
+        })
+        expect(r.body.status).toBe("NO_PROGRESS_WITH_OPEN_ISSUES")
+        expect(archive.write).not.toHaveBeenCalled()
+    })
+
+    test("does NOT write archive on CODEX_ERROR_CACHED", async () => {
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: { progressHash: "g-hash-1" },
+            priorFindings: [],
+            lastReviewedAt: 1,
+            lastResultStatus: "ESCALATE",
+            lastEscalateReason: "codex output failed schema",
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+            }),
+        })
+        expect(r.body.code).toBe("CODEX_ERROR_CACHED")
+        expect(archive.write).not.toHaveBeenCalled()
+    })
+
+    test("does NOT write archive on MAX_BLOCKS escalation", async () => {
+        const cfg = minimalConfig()
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: cfg.limits.maxBlocks,
+            lastReviewedAt: 1,
+            lastResultStatus: "ISSUES",
+            priorFindings: [],
+            lastBaseline: { progressHash: "g" },
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: cfg,
+            store,
+            archive,
+            deps: makeDeps(),
+        })
+        expect(r.body.code).toBe("MAX_BLOCKS")
+        expect(archive.write).not.toHaveBeenCalled()
+    })
+
+    test("does NOT write archive on EMPTY_PAYLOAD escalation", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        empty: true,
+                        nonBinaryFileCount: 0,
+                        promptText: "",
+                    }),
+            }),
+        })
+        expect(r.body.code).toBe("EMPTY_PAYLOAD")
+        expect(archive.write).not.toHaveBeenCalled()
+    })
+
+    test("archive failure does not break the response", async () => {
+        const throwingArchive = {
+            write: jest.fn(() => {
+                throw new Error("disk full")
+            }),
+        }
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            archive: throwingArchive,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+            }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(throwingArchive.write).toHaveBeenCalled()
     })
 })
 

@@ -119,9 +119,9 @@ describe("loadConfig", () => {
         const read = () => {
             throw err
         }
-        expect(() =>
-            loadConfig({ configPath: "/nope", read })
-        ).toThrow("permission denied")
+        expect(() => loadConfig({ configPath: "/nope", read })).toThrow(
+            "permission denied"
+        )
     })
 
     test("throws CONFIG_INVALID and includes path in message", () => {

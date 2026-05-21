@@ -109,16 +109,12 @@ describe("sanitizeFindingPath", () => {
     test("rejects parent-directory escapes", () => {
         expect(sanitizeFindingPath("../secret.txt", root)).toBeNull()
         expect(sanitizeFindingPath("../../secret.txt", root)).toBeNull()
-        expect(
-            sanitizeFindingPath("src/../../escape.txt", root)
-        ).toBeNull()
+        expect(sanitizeFindingPath("src/../../escape.txt", root)).toBeNull()
     })
 
     test("rejects backslash traversal", () => {
         expect(sanitizeFindingPath("..\\secret.txt", root)).toBeNull()
-        expect(
-            sanitizeFindingPath("src\\foo.js", root)
-        ).toBeNull()
+        expect(sanitizeFindingPath("src\\foo.js", root)).toBeNull()
     })
 
     test("rejects null bytes", () => {
@@ -330,13 +326,7 @@ describe("buildPayload (integration)", () => {
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "add"])
         for (let i = 0; i < 3; i++) {
-            execFileSync("git", [
-                "-C",
-                dir,
-                "mv",
-                `r${i}.txt`,
-                `r${i}-new.txt`,
-            ])
+            execFileSync("git", ["-C", dir, "mv", `r${i}.txt`, `r${i}-new.txt`])
         }
         const cfg = baseConfig()
         cfg.limits.maxFiles = 1
@@ -364,9 +354,7 @@ describe("buildPayload (integration)", () => {
         expect(Buffer.byteLength(out.promptText, "utf8")).toBeLessThanOrEqual(
             cfg.limits.maxPayloadBytes
         )
-        expect(out.totalBytes).toBe(
-            Buffer.byteLength(out.promptText, "utf8")
-        )
+        expect(out.totalBytes).toBe(Buffer.byteLength(out.promptText, "utf8"))
     })
 
     test("promptHash is sha256 of promptText bytes", () => {
@@ -457,9 +445,7 @@ describe("buildPayload (integration)", () => {
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "add"])
 
-        const priorFindings = [
-            { file: "f.txt", line: 1, severity: "blocker" },
-        ]
+        const priorFindings = [{ file: "f.txt", line: 1, severity: "blocker" }]
         const before = buildPayload({
             repoRoot: dir,
             config: baseConfig(),
@@ -481,9 +467,7 @@ describe("buildPayload (integration)", () => {
         const out = buildPayload({
             repoRoot: dir,
             config: baseConfig(),
-            priorFindings: [
-                { file: flagged, line: 1, severity: "blocker" },
-            ],
+            priorFindings: [{ file: flagged, line: 1, severity: "blocker" }],
         })
         // Without prior-findings this file would be filtered by ignorePaths.
         expect(out.promptText).toMatch(/node_modules\/foo.js/)
@@ -525,9 +509,7 @@ describe("buildPayload (integration)", () => {
         const out = buildPayload({
             repoRoot: dir,
             config: cfg,
-            priorFindings: [
-                { file: flagged, line: 1, severity: "blocker" },
-            ],
+            priorFindings: [{ file: flagged, line: 1, severity: "blocker" }],
         })
         expect(out.promptText).toMatch(/node_modules\/foo.js/)
     })

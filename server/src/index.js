@@ -9,9 +9,10 @@ import { authMiddleware } from "./auth.js"
 import { mountReviewRoute } from "./review.js"
 import { mountResetRoute } from "./reset.js"
 import { createStateStore } from "./state.js"
+import { createArchive } from "./archive.js"
 import { logger } from "./logger.js"
 
-export const createApp = ({ config, store, deps = {} }) => {
+export const createApp = ({ config, store, archive = null, deps = {} }) => {
     const app = express()
     app.disable("x-powered-by")
     app.use(express.json({ limit: "1mb" }))
@@ -21,15 +22,21 @@ export const createApp = ({ config, store, deps = {} }) => {
     })
 
     app.use(authMiddleware({ token: config.authToken }))
-    mountReviewRoute(app, { config, store, deps })
+    mountReviewRoute(app, { config, store, archive, deps })
     mountResetRoute(app, { config, store, deps })
 
     return app
 }
 
-export const startServer = ({ config, store, deps = {}, log = logger } = {}) =>
+export const startServer = ({
+    config,
+    store,
+    archive = null,
+    deps = {},
+    log = logger,
+} = {}) =>
     new Promise((resolve) => {
-        const app = createApp({ config, store, deps })
+        const app = createApp({ config, store, archive, deps })
         const server = app.listen(config.port, config.bind)
         let settled = false
 
@@ -93,8 +100,21 @@ const main = async () => {
     const store = createStateStore({
         idleResetMs: config.limits.idleResetMinutes * 60 * 1000,
     })
+    const archive = createArchive({
+        reviewsDir: config.reviewsDir,
+        retentionDays: config.reviewsRetentionDays,
+        blockingSeverities: config.blockingSeverities,
+        logger,
+    })
+    const pruneResult = archive.pruneOnStartup()
+    if (pruneResult.removed > 0) {
+        logger.info(
+            { removed: pruneResult.removed },
+            "pruned old archive files on startup"
+        )
+    }
 
-    const result = await startServer({ config, store })
+    const result = await startServer({ config, store, archive })
     if (!result.ok) {
         process.exitCode = 1
         return

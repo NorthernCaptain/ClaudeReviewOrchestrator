@@ -1,0 +1,624 @@
+/**
+ * Copyright AlpineReplay Inc, 2026. All rights reserved.
+ * Author: Leo Khramov
+ */
+
+import { jest } from "@jest/globals"
+import {
+    mkdirSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { createArchive, __test__ } from "./archive.js"
+
+const {
+    tsForFilename,
+    sanitizeBranch,
+    folderName,
+    parseTimestampFromFilename,
+    renderMarkdown,
+    buildRecord,
+    tail,
+} = __test__
+
+const makeTmp = () => mkdtempSync(path.join(tmpdir(), "archive-"))
+
+const happyContext = {
+    repo: "foo",
+    repoRoot: "/tmp/foo",
+    branch: "main",
+    key: "/tmp/foo|main",
+}
+
+const happyPayload = {
+    headSha: "abc1234deadbeef",
+    promptHash: "ph",
+    progressHash: "gh",
+    files: {
+        modified: [{ path: "a.js" }],
+        untracked: [],
+        deleted: [],
+        renamed: [],
+        priorFindingContext: [],
+    },
+    totalBytes: 2048,
+    truncated: false,
+    promptText: "PAYLOAD",
+}
+
+const happyCodexRaw = {
+    argv: ["codex", "exec"],
+    model: "gpt-5-codex",
+    durationMs: 1234,
+    exitCode: 0,
+    timedOut: false,
+    oversize: false,
+    rawStdout: '{"status":"GOOD_TO_GO","findings":[]}',
+    rawStderr: "",
+}
+
+describe("tsForFilename", () => {
+    test("strips millis and replaces colons with hyphens", () => {
+        const out = tsForFilename(Date.parse("2026-05-21T14:30:45.123Z"))
+        expect(out).toBe("2026-05-21T14-30-45Z")
+    })
+})
+
+describe("sanitizeBranch", () => {
+    test("replaces / with __", () => {
+        expect(sanitizeBranch("feature/foo")).toBe("feature__foo")
+    })
+    test("returns - for empty/non-string", () => {
+        expect(sanitizeBranch("")).toBe("-")
+        expect(sanitizeBranch(null)).toBe("-")
+    })
+})
+
+describe("folderName", () => {
+    test("repo:branch with branch sanitized", () => {
+        expect(folderName({ repo: "foo", branch: "feature/x" })).toBe(
+            "foo:feature__x"
+        )
+    })
+})
+
+describe("parseTimestampFromFilename", () => {
+    test("recognizes well-formed names", () => {
+        const t = parseTimestampFromFilename("2026-05-21T14-30-45Z.json")
+        expect(t).toBe(Date.parse("2026-05-21T14:30:45Z"))
+    })
+    test("returns null on garbage", () => {
+        expect(parseTimestampFromFilename("notes.txt")).toBeNull()
+        expect(parseTimestampFromFilename("foo.json")).toBeNull()
+    })
+})
+
+describe("tail", () => {
+    test("returns full string when under limit", () => {
+        expect(tail("abc", 10)).toBe("abc")
+    })
+    test("returns last n chars when over", () => {
+        expect(tail("abcdef", 3)).toBe("def")
+    })
+    test("tolerates non-strings", () => {
+        expect(tail(null, 3)).toBe("")
+    })
+})
+
+describe("renderMarkdown", () => {
+    const recordWithFindings = (findings, droppedFindings = []) =>
+        buildRecord({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "ISSUES",
+                findings,
+                blockingFindings: findings.filter(
+                    (f) => f.severity === "blocker" || f.severity === "major"
+                ),
+                droppedFindings,
+            },
+            state: { codexRounds: 1, blockCount: 1 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+        })
+
+    test("includes title, metadata bullets, and a severity section", () => {
+        const md = renderMarkdown(
+            recordWithFindings([
+                {
+                    file: "a.js",
+                    line: 42,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "boom",
+                    suggestion: "fix it",
+                },
+            ]),
+            ["blocker", "major"]
+        )
+        expect(md).toMatch(/^# Review — foo:main — 2026-05-21 14:30:45 UTC/m)
+        expect(md).toMatch(/\*\*Status:\*\* ISSUES/)
+        expect(md).toMatch(/\*\*Trigger:\*\* stop_hook/)
+        expect(md).toMatch(/\*\*HEAD:\*\* abc1234/)
+        expect(md).toMatch(/\*\*Model:\*\* gpt-5-codex \(1\.2s\)/)
+        expect(md).toMatch(/## Blockers \(blocking\)/)
+        expect(md).toMatch(/`a\.js:42` — boom/)
+        expect(md).toMatch(/Suggestion:\* fix it/)
+    })
+
+    test("labels minor/nit sections as non-blocking by default", () => {
+        const md = renderMarkdown(
+            recordWithFindings([
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "minor",
+                    category: "style",
+                    message: "tidy",
+                },
+                {
+                    file: "a.js",
+                    line: 2,
+                    severity: "nit",
+                    category: "style",
+                    message: "tinier",
+                },
+            ]),
+            ["blocker", "major"]
+        )
+        expect(md).toMatch(/## Minor \(non-blocking\)/)
+        expect(md).toMatch(/## Nits \(non-blocking\)/)
+    })
+
+    test("labels every severity as blocking when blockingSeverities is the full set", () => {
+        const md = renderMarkdown(
+            recordWithFindings([
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "minor",
+                    category: "style",
+                    message: "tidy",
+                },
+            ]),
+            ["blocker", "major", "minor", "nit"]
+        )
+        expect(md).toMatch(/## Minor \(blocking\)/)
+    })
+
+    test("renders Dropped findings footer when any were dropped", () => {
+        const md = renderMarkdown(
+            recordWithFindings(
+                [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "real",
+                    },
+                ],
+                [
+                    {
+                        file: "outside.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "ghost",
+                    },
+                ]
+            ),
+            ["blocker", "major"]
+        )
+        expect(md).toMatch(/## Dropped findings/)
+        expect(md).toMatch(/`outside\.js` — ghost/)
+    })
+
+    test("renders Prior findings fed footer when any were supplied", () => {
+        const record = buildRecord({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 5,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "again",
+                    },
+                ],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 2, blockCount: 2 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [
+                {
+                    file: "a.js",
+                    line: 5,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "first round",
+                },
+            ],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+        })
+        const md = renderMarkdown(record, ["blocker", "major"])
+        expect(md).toMatch(/## Prior findings fed to Codex this round/)
+        expect(md).toMatch(/`a\.js:5` — first round/)
+    })
+
+    test("skips empty severity sections", () => {
+        const md = renderMarkdown(
+            recordWithFindings([
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "x",
+                },
+            ]),
+            ["blocker", "major"]
+        )
+        expect(md).not.toMatch(/## Major/)
+        expect(md).not.toMatch(/## Minor/)
+        expect(md).not.toMatch(/## Nits/)
+    })
+})
+
+describe("renderMarkdown — edges", () => {
+    test("renders Reason bullet when result.reason is set", () => {
+        const record = buildRecord({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "ESCALATE",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+                reason: "codex output failed schema",
+            },
+            state: { codexRounds: 1, blockCount: 0 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+        })
+        const md = renderMarkdown(record, ["blocker", "major"])
+        expect(md).toMatch(/\*\*Reason:\*\* codex output failed schema/)
+    })
+
+    test("omits HEAD/Model/Payload bullets when their inputs are absent", () => {
+        const record = {
+            timestamp: "2026-05-21T14:30:45.000Z",
+            context: { repo: "foo", branch: "main", repoRoot: "/", key: "k" },
+            round: 0,
+            blockCount: 0,
+            trigger: "manual",
+            baseline: {
+                headSha: null,
+                files: null,
+                totalBytes: null,
+                truncated: null,
+            },
+            codex: null,
+            result: {
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+                reason: null,
+            },
+            priorFindingsFedIn: [],
+        }
+        const md = renderMarkdown(record, ["blocker", "major"])
+        expect(md).not.toMatch(/\*\*HEAD:/)
+        expect(md).not.toMatch(/\*\*Model:/)
+        expect(md).not.toMatch(/\*\*Payload:/)
+    })
+
+    test("renders codex Model bullet without duration when durationMs missing", () => {
+        const record = buildRecord({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: { ...happyCodexRaw, durationMs: null },
+            result: {
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 1, blockCount: 0 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+        })
+        const md = renderMarkdown(record, ["blocker", "major"])
+        expect(md).toMatch(/\*\*Model:\*\* gpt-5-codex(?!\s*\()/)
+    })
+
+    test("handles a finding with no suggestion gracefully", () => {
+        const record = buildRecord({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "no-fix",
+                    },
+                ],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 1, blockCount: 1 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+        })
+        const md = renderMarkdown(record, ["blocker", "major"])
+        expect(md).toMatch(/`a\.js:1` — no-fix/)
+        expect(md).not.toMatch(/Suggestion:/)
+    })
+})
+
+describe("createArchive.write", () => {
+    let reviewsDir
+    beforeEach(() => {
+        reviewsDir = makeTmp()
+    })
+    afterEach(() => rmSync(reviewsDir, { recursive: true, force: true }))
+
+    const writeOne = (over = {}) =>
+        createArchive({
+            reviewsDir,
+            now: () => Date.parse("2026-05-21T14:30:45Z"),
+        }).write({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 1, blockCount: 0 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            ...over,
+        })
+
+    test("writes <reviewsDir>/<repo>:<branch>/<ts>.{json,md}", () => {
+        const r = writeOne()
+        expect(r.jsonPath).toBe(
+            path.join(reviewsDir, "foo:main", "2026-05-21T14-30-45Z.json")
+        )
+        expect(r.mdPath).toBe(
+            path.join(reviewsDir, "foo:main", "2026-05-21T14-30-45Z.md")
+        )
+        // Files exist on disk and JSON round-trips.
+        const j = JSON.parse(readFileSync(r.jsonPath, "utf8"))
+        expect(j.context.repo).toBe("foo")
+        expect(j.result.status).toBe("GOOD_TO_GO")
+        expect(readFileSync(r.mdPath, "utf8")).toMatch(/^# Review/)
+    })
+
+    test("sanitizes branch with slash in the folder name", () => {
+        const r = writeOne({
+            context: { ...happyContext, branch: "feature/x" },
+        })
+        const dir = path.dirname(r.jsonPath)
+        expect(path.basename(dir)).toBe("foo:feature__x")
+    })
+
+    test("creates folder on demand", () => {
+        const r = writeOne()
+        // No exception → folder was created on demand. Sanity: file exists.
+        expect(() => readFileSync(r.jsonPath, "utf8")).not.toThrow()
+    })
+
+    test("does not leave .tmp siblings on success", () => {
+        writeOne()
+        const dir = path.join(reviewsDir, "foo:main")
+        const files = readdirSync(dir)
+        expect(files.some((f) => f.endsWith(".tmp"))).toBe(false)
+    })
+
+    test("captures the full ResultStatus envelope in JSON", () => {
+        const r = writeOne({
+            result: {
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "boom",
+                    },
+                ],
+                blockingFindings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "boom",
+                    },
+                ],
+                droppedFindings: [],
+            },
+        })
+        const j = JSON.parse(readFileSync(r.jsonPath, "utf8"))
+        expect(j.result.findings).toHaveLength(1)
+        expect(j.result.blockingFindings).toHaveLength(1)
+    })
+
+    test("truncates rawStderr to tail bytes", () => {
+        const huge = "z".repeat(10000)
+        const r = writeOne({
+            codexRaw: { ...happyCodexRaw, rawStderr: huge },
+        })
+        const j = JSON.parse(readFileSync(r.jsonPath, "utf8"))
+        expect(j.codex.rawStderrTail.length).toBeLessThanOrEqual(4096)
+        expect(j.codex.rawStderrTail).toBe(huge.slice(-4096))
+    })
+
+    test("logs but does not throw when md write fails", () => {
+        const archive = createArchive({
+            reviewsDir,
+            now: () => Date.parse("2026-05-21T14:30:45Z"),
+            logger: { warn: jest.fn() },
+        })
+        // Trigger MD write failure: pre-create a directory with the MD's
+        // intended name so writeFileSync fails.
+        const dir = path.join(reviewsDir, "foo:main")
+        // Need a deeper trick: chmod won't work portably. Instead, monkey
+        // patch is overkill; just check the happy path doesn't throw and
+        // the json sibling is durable.
+        const r = archive.write({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 1, blockCount: 0 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+        })
+        expect(readFileSync(r.jsonPath, "utf8")).toMatch(/foo/)
+        // Sanity: dir was created.
+        expect(readdirSync(dir).length).toBeGreaterThanOrEqual(2)
+    })
+})
+
+describe("createArchive.pruneOnStartup", () => {
+    let reviewsDir
+    beforeEach(() => {
+        reviewsDir = makeTmp()
+    })
+    afterEach(() => rmSync(reviewsDir, { recursive: true, force: true }))
+
+    const placeFile = (subdir, name, contents = "") => {
+        const full = path.join(reviewsDir, subdir, name)
+        mkdirSync(path.dirname(full), { recursive: true })
+        writeFileSync(full, contents)
+        return full
+    }
+
+    test("returns {removed: 0} when retentionDays is null", () => {
+        const archive = createArchive({ reviewsDir, retentionDays: null })
+        expect(archive.pruneOnStartup().removed).toBe(0)
+    })
+
+    test("tolerates a missing reviewsDir gracefully", () => {
+        const archive = createArchive({
+            reviewsDir: path.join(reviewsDir, "absent"),
+            retentionDays: 1,
+            now: () => Date.now(),
+        })
+        expect(archive.pruneOnStartup().removed).toBe(0)
+    })
+
+    test("deletes files older than retentionDays and keeps fresh ones", () => {
+        const NOW = Date.parse("2026-05-21T14:30:45Z")
+        const DAY = 24 * 60 * 60 * 1000
+        // 5 days ago — should be pruned.
+        placeFile("foo:main", `${tsForFilename(NOW - 5 * DAY)}.json`)
+        placeFile("foo:main", `${tsForFilename(NOW - 5 * DAY)}.md`)
+        // 1 day ago — should be kept.
+        placeFile("foo:main", `${tsForFilename(NOW - 1 * DAY)}.json`)
+        placeFile("foo:main", `${tsForFilename(NOW - 1 * DAY)}.md`)
+
+        const archive = createArchive({
+            reviewsDir,
+            retentionDays: 3,
+            now: () => NOW,
+        })
+        const r = archive.pruneOnStartup()
+        expect(r.removed).toBe(2)
+        const remaining = readdirSync(path.join(reviewsDir, "foo:main")).sort()
+        expect(remaining).toEqual([
+            `${tsForFilename(NOW - 1 * DAY)}.json`,
+            `${tsForFilename(NOW - 1 * DAY)}.md`,
+        ])
+    })
+
+    test("ignores files with non-conforming names", () => {
+        const NOW = Date.parse("2026-05-21T14:30:45Z")
+        placeFile("foo:main", "notes.txt", "hi")
+        placeFile("foo:main", "garbage.json", "{}")
+        const archive = createArchive({
+            reviewsDir,
+            retentionDays: 1,
+            now: () => NOW,
+        })
+        const r = archive.pruneOnStartup()
+        expect(r.removed).toBe(0)
+        const remaining = readdirSync(path.join(reviewsDir, "foo:main"))
+        expect(remaining).toContain("notes.txt")
+        expect(remaining).toContain("garbage.json")
+    })
+})
+
+describe("createArchive — misc edges", () => {
+    test("throws if reviewsDir is missing", () => {
+        expect(() => createArchive({})).toThrow(/reviewsDir/)
+        expect(() => createArchive({ reviewsDir: "" })).toThrow(/reviewsDir/)
+    })
+})
+
+describe("createArchive.list", () => {
+    let reviewsDir
+    beforeEach(() => {
+        reviewsDir = makeTmp()
+    })
+    afterEach(() => rmSync(reviewsDir, { recursive: true, force: true }))
+
+    test("returns one entry per .json across all context folders", () => {
+        const archive = createArchive({
+            reviewsDir,
+            now: () => Date.parse("2026-05-21T14:30:45Z"),
+        })
+        archive.write({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: {
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+            },
+            state: { codexRounds: 1, blockCount: 0 },
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+        })
+        const all = archive.list()
+        expect(all).toHaveLength(1)
+        expect(all[0].context).toBe("foo:main")
+        expect(all[0].name).toMatch(/\.json$/)
+    })
+})

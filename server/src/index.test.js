@@ -190,6 +190,33 @@ describe("createApp wiring", () => {
         }
     })
 
+    test("/reset with valid token clears the context", async () => {
+        const { url, store, close } = await start(minimalConfig(), happyDeps)
+        try {
+            // Seed something to clear.
+            store.save("/repo|main", {
+                repoRoot: "/repo",
+                branch: "main",
+                codexRounds: 3,
+                lastReviewedAt: 1,
+            })
+            const r = await fetch(`${url}/reset`, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    "x-review-token": "secret",
+                },
+                body: JSON.stringify({ cwd: "/repo" }),
+            })
+            expect(r.status).toBe(200)
+            const body = await r.json()
+            expect(body.ok).toBe(true)
+            expect(body.state.codexRounds).toBe(0)
+        } finally {
+            await close()
+        }
+    })
+
     test("/review with valid token returns the envelope", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
