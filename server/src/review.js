@@ -5,28 +5,66 @@
 
 import { resolveContext, ContextError } from "./context.js"
 import { buildPayload, sanitizeFindingPath } from "./diff.js"
-import { runAndParse } from "./codex.js"
+import { runAndParse, wrapPrompt } from "./codex.js"
 
-// Drop findings whose file path is unsafe (absolute, escapes repoRoot via
-// "..", backslashes, null bytes). The dropped paths are visible to the
-// caller via the dropped count; Phase 3 will surface them as
-// result.droppedFindings.
-const safeFindingsOnly = (findings, repoRoot) => {
-    const safe = []
-    let droppedForPath = 0
-    for (const f of findings ?? []) {
-        if (!f || typeof f.file !== "string") {
-            droppedForPath++
-            continue
-        }
-        const sanitized = sanitizeFindingPath(f.file, repoRoot)
-        if (sanitized === null) {
-            droppedForPath++
-            continue
-        }
-        safe.push({ ...f, file: sanitized })
+// The set of repo-relative paths that the current payload exposes to Codex.
+// Codex findings referencing anything outside this set are dropped.
+const collectPayloadPaths = (payload) => {
+    const set = new Set()
+    for (const f of payload.files?.modified ?? []) {
+        if (f?.path) set.add(f.path)
     }
-    return { safe, droppedForPath }
+    for (const f of payload.files?.untracked ?? []) {
+        if (f?.path) set.add(f.path)
+    }
+    for (const p of payload.files?.deleted ?? []) {
+        if (p) set.add(p)
+    }
+    for (const r of payload.files?.renamed ?? []) {
+        if (r?.from) set.add(r.from)
+        if (r?.to) set.add(r.to)
+    }
+    for (const f of payload.files?.priorFindingContext ?? []) {
+        if (f?.path) set.add(f.path)
+    }
+    return set
+}
+
+// Sanitize a finding path (path-traversal guard already done at storage
+// time, but Codex's fresh output also passes through here) AND check the
+// payload-set membership rule. Returns the safe finding (with normalized
+// `file`) or null.
+const acceptFinding = (finding, payloadPaths, repoRoot) => {
+    if (!finding || typeof finding.file !== "string") return null
+    const safe = sanitizeFindingPath(finding.file, repoRoot)
+    if (safe === null) return null
+    if (!payloadPaths.has(safe)) return null
+    return { ...finding, file: safe }
+}
+
+const partitionFindings = (findings, payloadPaths, repoRoot) => {
+    const kept = []
+    const dropped = []
+    for (const f of findings ?? []) {
+        const accepted = acceptFinding(f, payloadPaths, repoRoot)
+        if (accepted) kept.push(accepted)
+        else dropped.push(f)
+    }
+    return { kept, dropped }
+}
+
+const computeBlocking = (findings, blockingSeverities) => {
+    const set = new Set(blockingSeverities)
+    return findings.filter((f) => set.has(f.severity))
+}
+
+// Derive the public status from kept findings and the blocking subset.
+// Codex never returns GOOD_TO_GO_WITH_NOTES itself — that's a server-side
+// notion based on severity classification.
+const derivePublicStatus = ({ kept, blocking }) => {
+    if (kept.length === 0) return "GOOD_TO_GO"
+    if (blocking.length === 0) return "GOOD_TO_GO_WITH_NOTES"
+    return "ISSUES"
 }
 
 const envelope = (status, extra = {}) => ({
@@ -246,11 +284,24 @@ export const handleReview = async ({
         }
     }
 
+    // Build the wrapped prompt (system preamble + delimiters + payload +
+    // optional prior findings + optional extras). All of Codex's view of
+    // the world goes through this single function.
+    const extraInstructions =
+        typeof body?.extra_instructions === "string"
+            ? body.extra_instructions
+            : null
+    const wrappedPrompt = wrapPrompt({
+        payloadText: payload.promptText,
+        priorFindings: state.priorFindings,
+        extraInstructions,
+    })
+
     let codexResult
     try {
         codexResult = await (deps.runAndParse ?? runAndParse)({
             repoRoot: context.repoRoot,
-            prompt: payload.promptText,
+            prompt: wrappedPrompt,
             config,
         })
     } catch (err) {
@@ -282,16 +333,25 @@ export const handleReview = async ({
         }
     }
 
-    // Codex returned a structured result. Sanitize finding paths before
-    // they enter state — Codex output is untrusted and a path like
-    // "../../secret.txt" would otherwise be hashed and read on the next
-    // round. In Phase 2 we still surface the sanitized list as `findings`
-    // (blockingFindings / droppedFindings get wired in Phase 3).
-    const status = codexResult.status === "ISSUES" ? "ISSUES" : "GOOD_TO_GO"
-    const { safe: safeFindings } = safeFindingsOnly(
+    // Codex returned a schema-valid result. Two post-processing passes:
+    //   1) Drop findings that reference files outside the payload. Codex's
+    //      sandbox lets it read additional files for context, but it may
+    //      not raise issues against unchanged code. Out-of-payload findings
+    //      are recorded as droppedFindings for visibility and discarded.
+    //   2) Compute blockingFindings from the remaining set using
+    //      config.blockingSeverities (the project-config-merged value when
+    //      Phase 5 lands).
+    const payloadPaths = collectPayloadPaths(payload)
+    const { kept, dropped } = partitionFindings(
         codexResult.findings,
+        payloadPaths,
         context.repoRoot
     )
+    const blockingFindings = computeBlocking(kept, config.blockingSeverities)
+    const status = derivePublicStatus({ kept, blocking: blockingFindings })
+
+    const isTerminal =
+        status === "GOOD_TO_GO" || status === "GOOD_TO_GO_WITH_NOTES"
 
     const nextState = {
         ...state,
@@ -300,18 +360,21 @@ export const handleReview = async ({
         lastReviewedAt: now(),
         lastEscalateReason: null,
         lastResultStatus: status,
-        priorFindings: status === "ISSUES" ? safeFindings : [],
-        // Only stop-hook ISSUES results consume block budget.
+        // priorFindings tracks ONLY blockers across rounds — Codex's next
+        // job is to verify each one is resolved, not to chase nits.
+        priorFindings: status === "ISSUES" ? blockingFindings : [],
+        // blockCount is consumed only by Stop-hook ISSUES results.
         blockCount:
             isStopHook(trigger) && status === "ISSUES"
                 ? state.blockCount + 1
-                : status === "GOOD_TO_GO"
+                : isTerminal
                   ? 0
                   : state.blockCount,
     }
 
-    // GOOD_TO_GO also resets codexRounds — the loop is over.
-    if (status === "GOOD_TO_GO") {
+    if (isTerminal) {
+        // Both terminal statuses end the loop — counters go to zero, the
+        // prior-findings cache is dropped.
         nextState.codexRounds = 0
         nextState.blockCount = 0
         nextState.priorFindings = []
@@ -323,9 +386,9 @@ export const handleReview = async ({
         httpStatus: 200,
         body: {
             status,
-            findings: safeFindings,
-            blockingFindings: [],
-            droppedFindings: [],
+            findings: kept,
+            blockingFindings,
+            droppedFindings: dropped,
             context: contextSummary(context),
             baseline: baselineSummary(payload),
             codex: codexSummary(codexResult),

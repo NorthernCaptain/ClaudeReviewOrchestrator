@@ -11,6 +11,8 @@ import {
     parseCodexOutput,
     buildCodexArgs,
     runAndParse,
+    wrapPrompt,
+    SYSTEM_PREAMBLE,
     __defaults__,
 } from "./codex.js"
 
@@ -52,6 +54,85 @@ const collectStdin = (child) =>
             resolve(Buffer.concat(chunks).toString("utf8"))
         )
     })
+
+describe("wrapPrompt", () => {
+    test("always includes the REVIEW_SYSTEM preamble and REVIEW_INPUT markers", () => {
+        const out = wrapPrompt({ payloadText: "DIFF" })
+        expect(out).toContain("<<<REVIEW_SYSTEM>>>")
+        expect(out).toContain(SYSTEM_PREAMBLE)
+        expect(out).toContain("<<<END_REVIEW_SYSTEM>>>")
+        expect(out).toMatch(/<<<REVIEW_INPUT>>>\nDIFF\n<<<END_REVIEW_INPUT>>>/)
+    })
+
+    test("omits PRIOR_FINDINGS section when none supplied", () => {
+        // The preamble itself mentions the marker name; check for the end
+        // tag which only appears when the section is emitted.
+        const out = wrapPrompt({ payloadText: "x" })
+        expect(out).not.toContain("<<<END_PRIOR_FINDINGS>>>")
+    })
+
+    test("includes PRIOR_FINDINGS as JSON when supplied", () => {
+        const findings = [
+            {
+                file: "a.js",
+                line: 1,
+                severity: "blocker",
+                category: "bug",
+                message: "boom",
+            },
+        ]
+        const out = wrapPrompt({ payloadText: "x", priorFindings: findings })
+        expect(out).toContain("<<<PRIOR_FINDINGS>>>")
+        expect(out).toContain('"file": "a.js"')
+        expect(out).toContain("<<<END_PRIOR_FINDINGS>>>")
+    })
+
+    test("omits EXTRA_INSTRUCTIONS section when null/empty", () => {
+        expect(wrapPrompt({ payloadText: "x" })).not.toContain(
+            "<<<END_EXTRA_INSTRUCTIONS>>>"
+        )
+        expect(
+            wrapPrompt({ payloadText: "x", extraInstructions: "" })
+        ).not.toContain("<<<END_EXTRA_INSTRUCTIONS>>>")
+    })
+
+    test("includes EXTRA_INSTRUCTIONS verbatim when supplied", () => {
+        const out = wrapPrompt({
+            payloadText: "x",
+            extraInstructions: "Pay extra attention to auth.",
+        })
+        expect(out).toContain("<<<EXTRA_INSTRUCTIONS>>>")
+        expect(out).toContain("Pay extra attention to auth.")
+        expect(out).toContain("<<<END_EXTRA_INSTRUCTIONS>>>")
+    })
+
+    test("section order is SYSTEM → INPUT → PRIOR_FINDINGS → EXTRA", () => {
+        const out = wrapPrompt({
+            payloadText: "x",
+            priorFindings: [
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "y",
+                },
+            ],
+            extraInstructions: "z",
+        })
+        const sys = out.indexOf("<<<REVIEW_SYSTEM>>>")
+        const input = out.indexOf("<<<REVIEW_INPUT>>>")
+        const prior = out.indexOf("<<<PRIOR_FINDINGS>>>")
+        const extra = out.indexOf("<<<EXTRA_INSTRUCTIONS>>>")
+        expect(sys).toBeLessThan(input)
+        expect(input).toBeLessThan(prior)
+        expect(prior).toBeLessThan(extra)
+    })
+
+    test("preamble explicitly labels input as UNTRUSTED DATA", () => {
+        expect(SYSTEM_PREAMBLE).toMatch(/UNTRUSTED DATA/)
+    })
+})
 
 describe("buildCodexArgs", () => {
     test("constructs the documented argv shape", () => {

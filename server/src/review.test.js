@@ -483,13 +483,24 @@ describe("handleReview — finding-path sanitization", () => {
     })
     afterEach(() => cleanupStore(store))
 
-    test("drops findings with unsafe paths (../) and stores only safe ones", async () => {
-        // Codex returns a mix of safe and unsafe paths.
+    test("drops findings with unsafe paths (../) and stores only safe in-payload ones", async () => {
+        // Payload exposes "src/safe.js"; Codex returns a mix of unsafe
+        // paths and one legitimate finding.
+        const payload = makePayload({
+            files: {
+                modified: [{ path: "src/safe.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
         const r = await handleReview({
             body: { cwd: "/repo", trigger: "mcp_tool" },
             config: minimalConfig(),
             store,
             deps: makeDeps({
+                buildPayload: () => payload,
                 runAndParse: async () => ({
                     status: "ISSUES",
                     findings: [
@@ -520,11 +531,10 @@ describe("handleReview — finding-path sanitization", () => {
             }),
         })
         expect(r.body.status).toBe("ISSUES")
-        // Returned findings list contains only the safe entry.
         expect(r.body.findings).toEqual([
             expect.objectContaining({ file: "src/safe.js" }),
         ])
-        // Stored priorFindings reflect the same.
+        expect(r.body.droppedFindings.length).toBe(2)
         const persisted = store.get(happyContext)
         expect(persisted.priorFindings).toEqual([
             expect.objectContaining({ file: "src/safe.js" }),
@@ -606,6 +616,318 @@ describe("handleReview — unchanged ESCALATE short-circuit", () => {
         const persisted = store.get(happyContext)
         expect(persisted.lastResultStatus).toBe("ESCALATE")
         expect(persisted.lastEscalateReason).toBe("codex output unparseable")
+    })
+})
+
+describe("handleReview — Phase 3: status derivation", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadWith = (paths) =>
+        makePayload({
+            files: {
+                modified: paths.map((p) => ({ path: p })),
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    const finding = (over) => ({
+        file: "a.js",
+        line: 1,
+        severity: "blocker",
+        category: "bug",
+        message: "x",
+        ...over,
+    })
+
+    test("only-nit findings → GOOD_TO_GO_WITH_NOTES (terminal, counters reset)", async () => {
+        // Seed prior state with a non-zero counter to prove the reset.
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 2,
+            blockCount: 1,
+            lastReviewedAt: 1,
+            lastResultStatus: "ISSUES",
+            priorFindings: [],
+            lastBaseline: { progressHash: "OLD" },
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [finding({ severity: "nit", message: "tiny" })],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO_WITH_NOTES")
+        expect(r.body.findings).toHaveLength(1)
+        expect(r.body.blockingFindings).toEqual([])
+        expect(r.body.droppedFindings).toEqual([])
+        // Both counters reset (terminal status).
+        expect(r.body.state.codexRounds).toBe(0)
+        expect(r.body.state.blockCount).toBe(0)
+    })
+
+    test("findings with only minor severities → GOOD_TO_GO_WITH_NOTES", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [finding({ severity: "minor" })],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO_WITH_NOTES")
+    })
+
+    test("mixed blockers + nits → ISSUES with blockingFindings populated", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        finding({ severity: "blocker", line: 1 }),
+                        finding({ severity: "major", line: 2 }),
+                        finding({ severity: "nit", line: 3 }),
+                        finding({ severity: "minor", line: 4 }),
+                    ],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("ISSUES")
+        expect(r.body.findings).toHaveLength(4)
+        expect(r.body.blockingFindings).toHaveLength(2)
+        expect(r.body.blockingFindings.every(
+            (f) => f.severity === "blocker" || f.severity === "major"
+        )).toBe(true)
+        // priorFindings tracks ONLY blockers across rounds.
+        const persisted = store.get(happyContext)
+        expect(persisted.priorFindings).toHaveLength(2)
+    })
+
+    test("out-of-payload findings go to droppedFindings, do not enter priorFindings", async () => {
+        const payload = payloadWith(["a.js"])
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payload,
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        finding({ file: "a.js" }), // legit
+                        finding({ file: "unreviewed.js", line: 99 }), // outside payload
+                    ],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.findings).toHaveLength(1)
+        expect(r.body.findings[0].file).toBe("a.js")
+        expect(r.body.droppedFindings).toHaveLength(1)
+        expect(r.body.droppedFindings[0].file).toBe("unreviewed.js")
+        const persisted = store.get(happyContext)
+        expect(persisted.priorFindings).toHaveLength(1)
+        expect(persisted.priorFindings[0].file).toBe("a.js")
+    })
+
+    test("if every finding is out-of-payload the result collapses to GOOD_TO_GO", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [finding({ file: "ghost.js" })],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(r.body.findings).toEqual([])
+        expect(r.body.droppedFindings).toHaveLength(1)
+        expect(r.body.state.codexRounds).toBe(0)
+    })
+
+    test("findings against renamed file's `from` or `to` path are kept", async () => {
+        const payload = makePayload({
+            files: {
+                modified: [],
+                untracked: [],
+                deleted: [],
+                renamed: [{ from: "old.js", to: "new.js" }],
+                priorFindingContext: [],
+            },
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payload,
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        finding({ file: "old.js", line: 1 }),
+                        finding({ file: "new.js", line: 2 }),
+                    ],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.findings).toHaveLength(2)
+        expect(r.body.droppedFindings).toEqual([])
+    })
+
+    test("findings against priorFindingContext paths are kept", async () => {
+        const payload = makePayload({
+            files: {
+                modified: [],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [{ path: "untouched.js", missing: false }],
+            },
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payload,
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [finding({ file: "untouched.js" })],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.findings).toHaveLength(1)
+        expect(r.body.droppedFindings).toEqual([])
+    })
+
+    test("passes wrapped prompt (system preamble + delimiters) to codex", async () => {
+        let receivedPrompt = ""
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async ({ prompt }) => {
+                    receivedPrompt = prompt
+                    return {
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                        raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                    }
+                },
+            }),
+        })
+        expect(receivedPrompt).toContain("<<<REVIEW_SYSTEM>>>")
+        expect(receivedPrompt).toContain("UNTRUSTED DATA")
+        expect(receivedPrompt).toContain("<<<REVIEW_INPUT>>>")
+        expect(receivedPrompt).toContain("<<<END_REVIEW_INPUT>>>")
+    })
+
+    test("passes extra_instructions through to wrapped prompt", async () => {
+        let receivedPrompt = ""
+        await handleReview({
+            body: {
+                cwd: "/repo",
+                trigger: "mcp_tool",
+                extra_instructions: "Pay attention to auth.",
+            },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async ({ prompt }) => {
+                    receivedPrompt = prompt
+                    return {
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                        raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                    }
+                },
+            }),
+        })
+        expect(receivedPrompt).toContain("<<<EXTRA_INSTRUCTIONS>>>")
+        expect(receivedPrompt).toContain("Pay attention to auth.")
+    })
+
+    test("priorFindings flow into the next round's wrapped prompt", async () => {
+        // R1: produces ISSUES with one blocker.
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        finding({ severity: "blocker", message: "round-1" }),
+                    ],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        // R2: the wrapped prompt should now contain PRIOR_FINDINGS json with "round-1".
+        // Force a fresh progressHash so the unchanged short-circuit doesn't fire.
+        let r2Prompt = ""
+        const payloadR2 = makePayload({
+            files: {
+                modified: [{ path: "a.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+            progressHash: "DIFFERENT-HASH",
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => payloadR2,
+                runAndParse: async ({ prompt }) => {
+                    r2Prompt = prompt
+                    return {
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                        raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                    }
+                },
+            }),
+        })
+        expect(r2Prompt).toContain("<<<PRIOR_FINDINGS>>>")
+        expect(r2Prompt).toContain("round-1")
     })
 })
 
