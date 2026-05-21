@@ -981,20 +981,30 @@ limits are in v1 — not deferred.
 
 - [ ] `launchd/com.leo.review-orchestrator.plist` with `KeepAlive=true`,
       `RunAtLoad=true`, logs to `~/.claude/logs/review-server.{out,err}.log`.
-- [ ] `install.sh`:
+- [ ] `install.sh` — **default mode** runs the server-config + Claude-side
+      wiring only. The user is expected to `npm start` the daemon
+      themselves (foreground, terminal, tmux — whatever) while
+      iterating. Use `install.sh --launch` to also drop the launchd plist
+      and bootstrap it as a background agent.
   - Generates `authToken` (32 bytes base64url) if not present and writes
     it to `~/.config/review-orchestrator/config.json` (mode 0600).
   - Writes `~/.config/review-orchestrator/mcp-headers.sh` (mode 0700)
     that emits a JSON object `{"X-Review-Token":"<token>"}` on stdout by
     reading the config file (Claude Code's `headersHelper` contract).
-  - Copies plist to `~/Library/LaunchAgents/`, `launchctl bootstrap`.
   - Copies hook to `~/.claude/hooks/` (mode 0700).
   - Patches `~/.claude.json` to add the MCP entry with `headersHelper`
     pointing at the script (with `.bak` backup).
   - Patches `~/.claude/settings.json` to add the Stop hook (with backup).
   - Appends `claude-md-snippet.md` into `~/.claude/CLAUDE.md` between
     markers (idempotent).
-- [ ] `uninstall.sh` symmetrical.
+  - **With `--launch` only:** copies the plist to
+    `~/Library/LaunchAgents/` with placeholders filled in, runs
+    `launchctl bootstrap`, and verifies the service is up. Without
+    `--launch`, prints a one-line reminder that the daemon must be
+    started manually (`npm start` or `node server/src/index.js`) for
+    the MCP entry and Stop hook to do anything.
+- [ ] `uninstall.sh` symmetrical: `--launch` removes the launchd
+      service; without it, only the Claude-side wiring is reverted.
 
 ### Phase 9 — Polish
 
