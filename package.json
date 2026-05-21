@@ -50,7 +50,6 @@
             "!**/*.test.js",
             "!**/*.test.mjs",
             "!server/src/mcp.js",
-            "!server/src/project-config.js",
             "!server/src/status.js",
             "!hooks/stop-review.mjs"
         ],

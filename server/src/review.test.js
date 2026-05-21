@@ -1235,6 +1235,199 @@ describe("handleReview — archive integration", () => {
     })
 })
 
+describe("handleReview — project config integration", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadWith = (paths) =>
+        makePayload({
+            files: {
+                modified: paths.map((p) => ({ path: p })),
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    const niteOnly = (file) => ({
+        file,
+        line: 1,
+        severity: "nit",
+        category: "style",
+        message: "tiny",
+    })
+
+    test("project blockingSeverities widens what counts as blocking", async () => {
+        // With default global blockingSeverities ["blocker","major"], a nit
+        // would be GOOD_TO_GO_WITH_NOTES. The project widens to include nit,
+        // so the same result is ISSUES.
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                loadProjectConfig: () => ({
+                    blockingSeverities: ["blocker", "major", "minor", "nit"],
+                }),
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [niteOnly("a.js")],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("ISSUES")
+        expect(r.body.blockingFindings).toHaveLength(1)
+    })
+
+    test("project limits.maxFiles flows into buildPayload via the merged config", async () => {
+        let seenConfig = null
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                loadProjectConfig: () => ({
+                    limits: { maxFiles: 7 },
+                }),
+                buildPayload: (args) => {
+                    seenConfig = args.config
+                    return payloadWith(["a.js"])
+                },
+            }),
+        })
+        expect(seenConfig.limits.maxFiles).toBe(7)
+        // Other limit keys fall back to global.
+        expect(seenConfig.limits.maxPayloadBytes).toBe(
+            minimalConfig().limits.maxPayloadBytes
+        )
+    })
+
+    test("project extraReviewerInstructions reaches the wrapped prompt before caller extras", async () => {
+        let receivedPrompt = ""
+        await handleReview({
+            body: {
+                cwd: "/repo",
+                trigger: "mcp_tool",
+                extra_instructions: "Caller note: focus on auth.",
+            },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                loadProjectConfig: () => ({
+                    extraReviewerInstructions:
+                        "Project rule: Express 5 only.",
+                }),
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async ({ prompt }) => {
+                    receivedPrompt = prompt
+                    return {
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                        raw: {
+                            durationMs: 1,
+                            exitCode: 0,
+                            timedOut: false,
+                        },
+                    }
+                },
+            }),
+        })
+        const start = receivedPrompt.indexOf("<<<EXTRA_INSTRUCTIONS>>>")
+        const end = receivedPrompt.indexOf("<<<END_EXTRA_INSTRUCTIONS>>>")
+        expect(start).toBeGreaterThan(-1)
+        const section = receivedPrompt.slice(start, end)
+        expect(section).toMatch(/Project rule: Express 5 only\./)
+        expect(section).toMatch(/Caller note: focus on auth\./)
+        // Project comes before caller.
+        expect(section.indexOf("Project rule")).toBeLessThan(
+            section.indexOf("Caller note")
+        )
+    })
+
+    test("project extraReviewerInstructions alone (no caller extras) is wrapped", async () => {
+        let receivedPrompt = ""
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                loadProjectConfig: () => ({
+                    extraReviewerInstructions: "Project rule only.",
+                }),
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async ({ prompt }) => {
+                    receivedPrompt = prompt
+                    return {
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                        raw: {
+                            durationMs: 1,
+                            exitCode: 0,
+                            timedOut: false,
+                        },
+                    }
+                },
+            }),
+        })
+        expect(receivedPrompt).toContain("<<<EXTRA_INSTRUCTIONS>>>")
+        expect(receivedPrompt).toContain("Project rule only.")
+    })
+
+    test("when neither project nor caller supplies extras, no EXTRA section emitted", async () => {
+        let receivedPrompt = ""
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                loadProjectConfig: () => null,
+                buildPayload: () => payloadWith(["a.js"]),
+                runAndParse: async ({ prompt }) => {
+                    receivedPrompt = prompt
+                    return {
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                        raw: {
+                            durationMs: 1,
+                            exitCode: 0,
+                            timedOut: false,
+                        },
+                    }
+                },
+            }),
+        })
+        expect(receivedPrompt).not.toContain("<<<END_EXTRA_INSTRUCTIONS>>>")
+    })
+
+    test("project ignorePaths flows into buildPayload via the merged config", async () => {
+        let seenConfig = null
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                loadProjectConfig: () => ({
+                    ignorePaths: ["docs/**", "**/__snapshots__/**"],
+                }),
+                buildPayload: (args) => {
+                    seenConfig = args.config
+                    return payloadWith(["a.js"])
+                },
+            }),
+        })
+        expect(seenConfig.ignorePaths).toEqual([
+            "docs/**",
+            "**/__snapshots__/**",
+        ])
+    })
+})
+
 describe("handleReview — state persistence", () => {
     let store
     beforeEach(() => {

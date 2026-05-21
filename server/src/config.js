@@ -60,6 +60,7 @@ const ConfigSchema = z
             .default({}),
         ignorePaths: z.array(z.string()).default(DEFAULT_IGNORE_PATHS),
         blockingSeverities: z.array(Severity).default(["blocker", "major"]),
+        extraReviewerInstructions: z.string().nullable().default(null),
         reviewsDir: z.string().default("./reviews"),
         reviewsRetentionDays: z.number().int().nullable().default(null),
         logging: z

@@ -6,6 +6,23 @@
 import { resolveContext, ContextError } from "./context.js"
 import { buildPayload, sanitizeFindingPath } from "./diff.js"
 import { runAndParse, wrapPrompt } from "./codex.js"
+import { loadProjectConfig, mergeWithGlobal } from "./project-config.js"
+
+// Concatenate the project-config static directive and the per-call
+// extra_instructions, in that order. Project guidance comes first so the
+// caller's request layers on top of the project's review baseline.
+const combineExtras = (projectExtras, callerExtras) => {
+    const a =
+        typeof projectExtras === "string" && projectExtras.length > 0
+            ? projectExtras
+            : null
+    const b =
+        typeof callerExtras === "string" && callerExtras.length > 0
+            ? callerExtras
+            : null
+    if (a && b) return `${a}\n\n${b}`
+    return a ?? b ?? null
+}
 
 // The set of repo-relative paths that the current payload exposes to Codex.
 // Codex findings referencing anything outside this set are dropped.
@@ -184,6 +201,16 @@ export const handleReview = async ({
         return { httpStatus, body: errorToEscalate(err) }
     }
 
+    // Per-repo overrides via .review-orchestrator.json at the repo root.
+    // The file is optional; loadProjectConfig returns null when missing or
+    // invalid (after logging) so the loop keeps running on the global
+    // config. Project keys win on a per-key basis for limits and replace
+    // wholesale for ignorePaths / blockingSeverities / extraReviewerInstructions.
+    const projectConfig = (deps.loadProjectConfig ?? loadProjectConfig)({
+        repoRoot: context.repoRoot,
+    })
+    config = mergeWithGlobal(config, projectConfig)
+
     const trigger = body?.trigger ?? "manual"
     const state = store.get(context)
 
@@ -326,10 +353,19 @@ export const handleReview = async ({
     // Build the wrapped prompt (system preamble + delimiters + payload +
     // optional prior findings + optional extras). All of Codex's view of
     // the world goes through this single function.
-    const extraInstructions =
+    //
+    // The EXTRA_INSTRUCTIONS section gets the project-config directive
+    // (config.extraReviewerInstructions) AND the caller-supplied
+    // body.extra_instructions, in that order, separated by a blank line.
+    // Both are optional; combineExtras returns null when neither is set.
+    const callerExtras =
         typeof body?.extra_instructions === "string"
             ? body.extra_instructions
             : null
+    const extraInstructions = combineExtras(
+        config.extraReviewerInstructions,
+        callerExtras
+    )
     const wrappedPrompt = wrapPrompt({
         payloadText: payload.promptText,
         priorFindings: state.priorFindings,
