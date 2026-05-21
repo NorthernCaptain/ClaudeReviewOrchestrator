@@ -112,6 +112,18 @@ describe("loadConfig", () => {
         }
     })
 
+    test("rethrows non-ENOENT fs errors verbatim", () => {
+        const err = Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+        })
+        const read = () => {
+            throw err
+        }
+        expect(() =>
+            loadConfig({ configPath: "/nope", read })
+        ).toThrow("permission denied")
+    })
+
     test("throws CONFIG_INVALID and includes path in message", () => {
         const cfgPath = writeConfig(dir, {
             authToken: "x",

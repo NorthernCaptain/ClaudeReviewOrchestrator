@@ -145,30 +145,13 @@ export const parseCodexOutput = (rawStdout, validator = defaultValidator()) => {
     let parsed
     try {
         parsed = JSON.parse(rawStdout)
-    } catch {
-        // Fenced JSON: ```json\n{...}\n```
-        const fence = rawStdout.match(/```json\s*\n([\s\S]+?)\n```/)
-        if (fence) {
-            try {
-                parsed = JSON.parse(fence[1])
-            } catch (err2) {
-                return {
-                    ok: false,
-                    error: {
-                        code: "INVALID_JSON",
-                        message: err2.message,
-                    },
-                }
-            }
-        } else {
-            return {
-                ok: false,
-                error: {
-                    code: "INVALID_JSON",
-                    message:
-                        "Codex stdout is not JSON and contains no ```json fence",
-                },
-            }
+    } catch (err) {
+        return {
+            ok: false,
+            error: {
+                code: "INVALID_JSON",
+                message: `Codex stdout is not direct JSON: ${err.message}`,
+            },
         }
     }
 

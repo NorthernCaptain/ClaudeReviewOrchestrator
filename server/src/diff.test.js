@@ -75,6 +75,16 @@ describe("parseNameStatusZ", () => {
         const out = parseNameStatusZ("")
         expect(out.modified).toEqual([])
     })
+    test("skips rename record with missing dest", () => {
+        // Truncated input: rename status with only the source path supplied.
+        const out = parseNameStatusZ("R100\0only-source.js\0")
+        expect(out.renamed).toEqual([])
+    })
+    test("skips unknown status codes", () => {
+        const out = parseNameStatusZ("U\0weird.js\0")
+        expect(out.modified).toEqual([])
+        expect(out.added).toEqual([])
+    })
 })
 
 describe("isBinary", () => {
@@ -206,6 +216,106 @@ describe("buildPayload (integration)", () => {
         const out = buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         expect(out.totalBytes).toBeLessThanOrEqual(cfg.limits.maxPayloadBytes)
+    })
+
+    test("modified files past maxFiles get header-only entries", () => {
+        // Several committed files; modify all of them so they're in `modified`.
+        for (let i = 0; i < 4; i++) {
+            const file = path.join(dir, `m${i}.txt`)
+            writeFileSync(file, "initial\n")
+        }
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "add files"])
+        for (let i = 0; i < 4; i++) {
+            writeFileSync(path.join(dir, `m${i}.txt`), `changed ${i}\n`)
+        }
+        const cfg = baseConfig()
+        cfg.limits.maxFiles = 2
+        const out = buildPayload({ repoRoot: dir, config: cfg })
+        expect(out.truncated).toBe(true)
+        const matches =
+            out.promptText.match(/modified, omitted: maxFiles/g) || []
+        expect(matches.length).toBeGreaterThanOrEqual(1)
+    })
+
+    test("deleted files past maxFiles get header-only entries", () => {
+        for (let i = 0; i < 3; i++) {
+            writeFileSync(path.join(dir, `d${i}.txt`), "initial\n")
+        }
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "add"])
+        for (let i = 0; i < 3; i++) {
+            rmSync(path.join(dir, `d${i}.txt`))
+        }
+        const cfg = baseConfig()
+        cfg.limits.maxFiles = 1
+        const out = buildPayload({ repoRoot: dir, config: cfg })
+        expect(out.truncated).toBe(true)
+        const matches =
+            out.promptText.match(/deleted, omitted: maxFiles/g) || []
+        expect(matches.length).toBeGreaterThanOrEqual(1)
+    })
+
+    test("a large deleted file's diff gets truncated", () => {
+        const big = "x".repeat(2000) + "\n"
+        const p = path.join(dir, "big-del.txt")
+        writeFileSync(p, big)
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "big"])
+        rmSync(p)
+        const cfg = baseConfig()
+        cfg.limits.maxFileBytes = 200
+        const out = buildPayload({ repoRoot: dir, config: cfg })
+        expect(out.truncated).toBe(true)
+        expect(out.promptText).toMatch(
+            /=== FILE: big-del.txt \(deleted, truncated\) ===/
+        )
+    })
+
+    test("renamed files past maxFiles get header-only entries", () => {
+        for (let i = 0; i < 3; i++) {
+            writeFileSync(path.join(dir, `r${i}.txt`), "initial\n")
+        }
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "add"])
+        for (let i = 0; i < 3; i++) {
+            execFileSync("git", [
+                "-C",
+                dir,
+                "mv",
+                `r${i}.txt`,
+                `r${i}-new.txt`,
+            ])
+        }
+        const cfg = baseConfig()
+        cfg.limits.maxFiles = 1
+        const out = buildPayload({ repoRoot: dir, config: cfg })
+        expect(out.truncated).toBe(true)
+        const matches =
+            out.promptText.match(/renamed, omitted: maxFiles/g) || []
+        expect(matches.length).toBeGreaterThanOrEqual(1)
+    })
+
+    test("Buffer.byteLength(promptText) equals totalBytes", () => {
+        writeFileSync(path.join(dir, "ascii.txt"), "hello\n")
+        writeFileSync(path.join(dir, "utf8.txt"), "héllo 日本語\n")
+        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(Buffer.byteLength(out.promptText, "utf8")).toBe(out.totalBytes)
+    })
+
+    test("multi-byte UTF-8 content keeps promptText byte length at or under maxPayloadBytes", () => {
+        // 600 copies of a 3-byte char would be 1800 bytes if emitted in full.
+        writeFileSync(path.join(dir, "u.txt"), "あ".repeat(600) + "\n")
+        const cfg = baseConfig()
+        cfg.limits.maxPayloadBytes = 500
+        const out = buildPayload({ repoRoot: dir, config: cfg })
+        expect(out.truncated).toBe(true)
+        expect(Buffer.byteLength(out.promptText, "utf8")).toBeLessThanOrEqual(
+            cfg.limits.maxPayloadBytes
+        )
+        expect(out.totalBytes).toBe(
+            Buffer.byteLength(out.promptText, "utf8")
+        )
     })
 
     test("headSha is the current HEAD", () => {

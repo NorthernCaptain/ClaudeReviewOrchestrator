@@ -33,12 +33,12 @@ const parseNameStatusZ = (output) => {
         if (code === "R" || code === "C") {
             const from = parts[i++]
             const to = parts[i++]
-            if (from !== undefined && to !== undefined) {
+            if (from && to) {
                 result.renamed.push({ from, to })
             }
         } else {
             const file = parts[i++]
-            if (file === undefined) continue
+            if (!file) continue
             switch (code) {
                 case "M":
                     result.modified.push(file)
@@ -129,27 +129,25 @@ export const buildPayload = ({
     const room = () => limits.maxPayloadBytes - totalBytes
     const haveFileSlot = () => filesEmitted < limits.maxFiles
 
-    const pushBlock = (header, body) => {
-        const block = body ? `${header}\n${body}\n` : `${header}\n`
-        if (block.length > room()) {
-            blocks.push(`${header} (omitted: payload limit)\n`)
-            truncated = true
-            filesEmitted++
-            return
-        }
+    const tryEmit = (block) => {
+        const bytes = Buffer.byteLength(block, "utf8")
+        if (bytes > room()) return false
         blocks.push(block)
-        totalBytes += block.length
+        totalBytes += bytes
+        return true
+    }
+
+    const pushBlock = (header, body) => {
         filesEmitted++
+        const block = body ? `${header}\n${body}\n` : `${header}\n`
+        if (tryEmit(block)) return
+        // Block doesn't fit — try the smaller "omitted" header instead.
+        truncated = true
+        tryEmit(`${header} (omitted: payload limit)\n`)
     }
 
     const pushHeaderOnly = (header) => {
-        const block = `${header}\n`
-        if (block.length > room()) {
-            truncated = true
-            return
-        }
-        blocks.push(block)
-        totalBytes += block.length
+        if (!tryEmit(`${header}\n`)) truncated = true
     }
 
     for (const file of modifiedSet) {
@@ -237,7 +235,10 @@ export const buildPayload = ({
         )
     }
 
-    const promptText = blocks.join("\n")
+    // Concatenate without a separator: each block already ends in "\n" and
+    // totalBytes is computed from those exact emitted bytes, so the invariant
+    // Buffer.byteLength(promptText) === totalBytes holds.
+    const promptText = blocks.join("")
 
     return {
         headSha,

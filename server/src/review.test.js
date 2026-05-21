@@ -204,6 +204,33 @@ describe("handleReview", () => {
         expect(r.body.reason).toMatch(/codex spawn failed/)
     })
 
+    test("escalates with INTERNAL_ERROR when a non-ContextError has no message", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            deps: makeDeps({
+                resolveContext: () => {
+                    // Throw a value that's not a proper Error.
+                    throw {}
+                },
+            }),
+        })
+        expect(r.body.code).toBe("INTERNAL_ERROR")
+        expect(r.body.reason).toBe("unknown error")
+    })
+
+    test("envelope spreads extras when extra is omitted (default {})", async () => {
+        // Hit the default-argument branch of envelope() by triggering an
+        // INVALID_REQUEST without supplying any extras downstream.
+        const r = await handleReview({
+            body: undefined,
+            config: minimalConfig(),
+            deps: makeDeps(),
+        })
+        expect(r.body.status).toBe("ESCALATE")
+        expect(r.body.code).toBe("INVALID_REQUEST")
+    })
+
     test("returns 500 when buildPayload throws", async () => {
         const r = await handleReview({
             body: { cwd: "/repo" },

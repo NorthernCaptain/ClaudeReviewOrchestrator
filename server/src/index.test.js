@@ -3,9 +3,10 @@
  * Author: Leo Khramov
  */
 
-import { createApp } from "./index.js"
+import { jest } from "@jest/globals"
+import { createApp, startServer } from "./index.js"
 
-const minimalConfig = () => ({
+const minimalConfig = (over = {}) => ({
     port: 0,
     bind: "127.0.0.1",
     authToken: "secret",
@@ -27,6 +28,7 @@ const minimalConfig = () => ({
     },
     ignorePaths: [],
     blockingSeverities: ["blocker", "major"],
+    ...over,
 })
 
 const happyDeps = {
@@ -57,21 +59,57 @@ const happyDeps = {
     }),
 }
 
-const start = (config, deps) =>
-    new Promise((resolve) => {
-        const app = createApp(config, deps)
-        const server = app.listen(0, "127.0.0.1", () => {
-            const { port } = server.address()
-            resolve({
-                server,
-                url: `http://127.0.0.1:${port}`,
-                close: () =>
-                    new Promise((r) => {
-                        server.close(() => r())
-                    }),
-            })
-        })
+const silentLog = { info: jest.fn(), error: jest.fn(), warn: jest.fn() }
+
+const start = async (config, deps = happyDeps) => {
+    const r = await startServer({ config, deps, log: silentLog })
+    if (!r.ok) throw r.error
+    return {
+        server: r.server,
+        url: `http://127.0.0.1:${r.address.port}`,
+        port: r.address.port,
+        close: () =>
+            new Promise((res) => {
+                r.server.close(() => res())
+            }),
+    }
+}
+
+describe("startServer", () => {
+    test("resolves with ok:true and a real address on success", async () => {
+        const { url, port, close } = await start(minimalConfig())
+        try {
+            expect(typeof port).toBe("number")
+            expect(port).toBeGreaterThan(0)
+            const r = await fetch(`${url}/healthz`)
+            expect(r.status).toBe(200)
+        } finally {
+            await close()
+        }
     })
+
+    test("resolves with ok:false when bind fails (port already in use)", async () => {
+        // First, take a known port.
+        const first = await start(minimalConfig())
+        try {
+            const cfg = minimalConfig({
+                port: first.port,
+                bind: "127.0.0.1",
+            })
+            const result = await startServer({
+                config: cfg,
+                deps: happyDeps,
+                log: silentLog,
+            })
+            expect(result.ok).toBe(false)
+            expect(result.error).toBeDefined()
+            // Common codes: EADDRINUSE on macOS/Linux.
+            expect(["EADDRINUSE", "EACCES"]).toContain(result.error.code)
+        } finally {
+            await first.close()
+        }
+    })
+})
 
 describe("createApp wiring", () => {
     test("/healthz is open and returns ok:true without a token", async () => {

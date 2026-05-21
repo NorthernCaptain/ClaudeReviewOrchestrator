@@ -143,6 +143,66 @@ describe("resolveContext", () => {
         expect(ctx.branch).toMatch(/^detached:[0-9a-f]+$/)
     })
 
+    test("rejects when git reports a repo root outside allowedRoots", () => {
+        // Inject fake git so the pre-check passes (cwd inside tmp) but the
+        // resolved repo root lies elsewhere.
+        const fakeGit = (cwd, args) => {
+            if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+                return "/somewhere/else"
+            }
+            return "main"
+        }
+        const fakeRealpath = (p) => p
+        try {
+            resolveContext({
+                cwd: tmp,
+                allowedRoots: [tmp],
+                git: fakeGit,
+                realpath: fakeRealpath,
+            })
+            throw new Error("expected throw")
+        } catch (err) {
+            expect(err.code).toBe("NOT_IN_ALLOWED_ROOT")
+        }
+    })
+
+    test("rejects when realpath fails for the resolved repo root", () => {
+        // git claims a repo root that realpath cannot resolve.
+        const fakeGit = (cwd, args) => {
+            if (args[0] === "rev-parse" && args[1] === "--show-toplevel") {
+                return "/gone"
+            }
+            return "main"
+        }
+        let calls = 0
+        const fakeRealpath = (p) => {
+            calls++
+            if (p === "/gone") throw new Error("ENOENT")
+            return p
+        }
+        try {
+            resolveContext({
+                cwd: tmp,
+                allowedRoots: [tmp],
+                git: fakeGit,
+                realpath: fakeRealpath,
+            })
+            throw new Error("expected throw")
+        } catch (err) {
+            expect(err.code).toBe("NOT_A_GIT_REPO")
+        }
+        expect(calls).toBeGreaterThan(0)
+    })
+
+    test("tolerates a non-existent path in allowedRoots when another root matches", () => {
+        initRepo(tmp)
+        const ctx = resolveContext({
+            cwd: tmp,
+            allowedRoots: ["/does-not-exist", tmp],
+        })
+        expect(ctx.repoRoot).toBe(realpathSync(tmp))
+    })
+
     test("resolves through symlinks", () => {
         initRepo(tmp)
         const linkParent = makeTmpDir("ctx-link-")

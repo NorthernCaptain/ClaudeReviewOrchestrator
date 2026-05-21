@@ -128,13 +128,14 @@ describe("parseCodexOutput", () => {
         expect(out.value.findings).toHaveLength(1)
     })
 
-    test("extracts JSON from a ```json fenced block", () => {
+    test("rejects fenced JSON (contract is direct JSON only)", () => {
         const fenced =
             "preamble\n```json\n" +
             JSON.stringify({ status: "GOOD_TO_GO", findings: [] }) +
             "\n```\ntrailing"
         const out = parseCodexOutput(fenced, validator)
-        expect(out.ok).toBe(true)
+        expect(out.ok).toBe(false)
+        expect(out.error.code).toBe("INVALID_JSON")
     })
 
     test("returns SCHEMA_INVALID when status is wrong", () => {
@@ -243,6 +244,31 @@ describe("runCodex (mocked spawn)", () => {
                 spawn,
             })
         ).rejects.toThrow("nope")
+    })
+})
+
+describe("runAndParse — timeout path", () => {
+    test("returns ESCALATE when the child times out", async () => {
+        const spawn = fakeSpawn((child) => {
+            // Never close; the timeout kill simulates SIGTERM via re-emit.
+            child.kill = () => {
+                setImmediate(() => {
+                    child.stdout.end()
+                    child.stderr.end()
+                    child.emit("close", null, "SIGTERM")
+                })
+            }
+        })
+        const cfg = baseConfig()
+        cfg.limits.codexTimeoutSeconds = 0.05
+        const r = await runAndParse({
+            repoRoot: "/r",
+            prompt: "x",
+            config: cfg,
+            spawn,
+        })
+        expect(r.status).toBe("ESCALATE")
+        expect(r.reason).toMatch(/timed out/)
     })
 })
 
