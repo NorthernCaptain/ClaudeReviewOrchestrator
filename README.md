@@ -986,25 +986,55 @@ limits are in v1 — not deferred.
       themselves (foreground, terminal, tmux — whatever) while
       iterating. Use `install.sh --launch` to also drop the launchd plist
       and bootstrap it as a background agent.
-  - Generates `authToken` (32 bytes base64url) if not present and writes
-    it to `~/.config/review-orchestrator/config.json` (mode 0600).
+
+      **Every step must be idempotent.** Running `install.sh` again
+      after a successful install must leave the system in the same
+      state and exit 0; running it after a partial install must finish
+      whatever's missing without re-doing the parts that already
+      landed. Every config edit must back up to `<path>.bak.<ts>`
+      before mutating, only when the file changes. Reruns must also be
+      safe when the user has hand-edited some of the target files —
+      never overwrite hand edits silently.
+
+  - Generates `authToken` (32 bytes base64url) **only if** the config
+    file is missing the `authToken` key. Existing tokens are preserved
+    on rerun. Writes `~/.config/review-orchestrator/config.json` (mode
+    0600).
   - Writes `~/.config/review-orchestrator/mcp-headers.sh` (mode 0700)
     that emits a JSON object `{"X-Review-Token":"<token>"}` on stdout by
     reading the config file (Claude Code's `headersHelper` contract).
-  - Copies hook to `~/.claude/hooks/` (mode 0700).
-  - Patches `~/.claude.json` to add the MCP entry with `headersHelper`
-    pointing at the script (with `.bak` backup).
-  - Patches `~/.claude/settings.json` to add the Stop hook (with backup).
+    Overwrites on rerun (deterministic content; safe).
+  - Copies hook to `~/.claude/hooks/stop-review.mjs` (mode 0700).
+    Overwrites only if the source content differs from what's already
+    installed (skip-and-log on rerun when bytes match).
+  - Patches `~/.claude.json` to add the MCP `review` entry with
+    `headersHelper` pointing at the script. On rerun, replaces just
+    the `mcpServers.review` subtree if it's already present; leaves
+    other servers untouched. Backup `~/.claude.json.bak.<ts>` only when
+    bytes change.
+  - Patches `~/.claude/settings.json` to add the Stop hook entry. On
+    rerun, matches by command path and skips if already present;
+    otherwise appends. Same `<ts>` backup rule.
   - Appends `claude-md-snippet.md` into `~/.claude/CLAUDE.md` between
-    markers (idempotent).
+    `<!-- review-orchestrator:begin -->` / `<!-- review-orchestrator:end -->`
+    markers. On rerun: if markers exist, replaces the block in place;
+    if absent, appends. Same backup rule.
   - **With `--launch` only:** copies the plist to
     `~/Library/LaunchAgents/` with placeholders filled in, runs
-    `launchctl bootstrap`, and verifies the service is up. Without
-    `--launch`, prints a one-line reminder that the daemon must be
-    started manually (`npm start` or `node server/src/index.js`) for
-    the MCP entry and Stop hook to do anything.
-- [ ] `uninstall.sh` symmetrical: `--launch` removes the launchd
-      service; without it, only the Claude-side wiring is reverted.
+    `launchctl bootstrap`, and verifies the service is up. On rerun,
+    if the agent is already bootstrapped under the same Label, runs
+    `launchctl bootout` + `bootstrap` to pick up any plist changes
+    (e.g., new REPO_ROOT). Without `--launch`, prints a one-line
+    reminder that the daemon must be started manually (`npm start` or
+    `node server/src/index.js`) for the MCP entry and Stop hook to do
+    anything.
+  - Final step prints a summary of "installed / already present /
+    skipped" lines per artifact so the user can confirm what changed.
+- [ ] `uninstall.sh` symmetrical and also idempotent: removes only the
+      review-orchestrator block from `~/.claude.json` /
+      `~/.claude/settings.json` / `~/.claude/CLAUDE.md` (leaves other
+      entries intact), deletes the hook + headers script + plist (when
+      `--launch`), and tolerates already-removed pieces.
 
 ### Phase 9 — Polish
 
