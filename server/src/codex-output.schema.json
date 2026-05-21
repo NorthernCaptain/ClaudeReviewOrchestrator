@@ -1,0 +1,59 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://github.com/leokhramov/review-orchestrator/codex-output.schema.json",
+    "title": "Codex Review Output",
+    "description": "The unified JSON object Codex must emit on stdout. Validated by ajv on the server; schema-invalid output is ESCALATE.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["status", "findings"],
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["GOOD_TO_GO", "ISSUES"],
+            "description": "GOOD_TO_GO when findings is empty; ISSUES when findings has at least one entry. The server maps these (plus its own change-detection state) to the public statuses GOOD_TO_GO / GOOD_TO_GO_WITH_NOTES / ISSUES / NO_CHANGES / NO_PROGRESS_WITH_OPEN_ISSUES / ESCALATE."
+        },
+        "findings": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/finding" }
+        }
+    },
+    "allOf": [
+        {
+            "if": { "properties": { "status": { "const": "GOOD_TO_GO" } } },
+            "then": { "properties": { "findings": { "maxItems": 0 } } }
+        },
+        {
+            "if": { "properties": { "status": { "const": "ISSUES" } } },
+            "then": { "properties": { "findings": { "minItems": 1 } } }
+        }
+    ],
+    "$defs": {
+        "finding": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file", "line", "severity", "category", "message"],
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Repo-relative path of the file the finding targets. Must be present in the current review payload's file set; the server drops findings referencing files outside the payload."
+                },
+                "line": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "1-based line number; use 0 when the finding is file-wide and no specific line applies."
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": ["blocker", "major", "minor", "nit"]
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["bug", "security", "perf", "style", "test", "other"]
+                },
+                "message": { "type": "string", "minLength": 1 },
+                "suggestion": { "type": "string" }
+            }
+        }
+    }
+}

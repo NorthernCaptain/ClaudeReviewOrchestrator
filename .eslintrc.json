@@ -20,7 +20,8 @@
     "parser": "@typescript-eslint/parser",
     "parserOptions": {
         "requireConfigFile": false,
-        "sourceType": "commonjs"
+        "sourceType": "module",
+        "ecmaVersion": 2024
     },
     "plugins": [
         "prettier",
@@ -31,8 +32,9 @@
     "rules": {
         "prettier/prettier": "error",
         "linebreak-style": ["warn", "unix"],
-        "no-warning-comments": "warn",
+        "no-warning-comments": "off",
         "no-console": "off",
+        "node/shebang": "off",
         "no-case-declarations": "warn",
         "eqeqeq": "warn",
         "no-unused-vars": "off",
@@ -57,6 +59,7 @@
         "*.config.js",
         "src/generated/*",
         "node_modules/*",
-        "reviews/*"
+        "reviews/*",
+        "coverage/*"
     ]
 }
