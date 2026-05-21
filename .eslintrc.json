@@ -29,6 +29,7 @@
         "no-warning-comments": "off",
         "no-console": "off",
         "node/shebang": "off",
+        "node/no-missing-import": "off",
         "no-case-declarations": "warn",
         "eqeqeq": "warn",
         "no-unused-vars": "off",

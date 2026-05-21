@@ -23,7 +23,7 @@ const defaultGit = (cwd, args) =>
 
 const defaultRealpath = (p) => realpathSync(p)
 
-const isContainedIn = (parent, child) => {
+export const isContainedIn = (parent, child) => {
     const rel = path.relative(parent, child)
     if (rel === "") return true
     if (rel.startsWith("..")) return false

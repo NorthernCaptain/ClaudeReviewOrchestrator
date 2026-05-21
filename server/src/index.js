@@ -8,6 +8,7 @@ import { loadConfig, defaultConfigPath } from "./config.js"
 import { authMiddleware } from "./auth.js"
 import { mountReviewRoute } from "./review.js"
 import { mountResetRoute } from "./reset.js"
+import { mountMcpRoute } from "./mcp.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { logger } from "./logger.js"
@@ -30,6 +31,7 @@ export const createApp = ({
     app.use(authMiddleware({ token: config.authToken }))
     mountReviewRoute(app, { config, store, archive, logger: log, deps })
     mountResetRoute(app, { config, store, deps })
+    mountMcpRoute(app, { config, store, archive, logger: log, deps })
 
     return app
 }

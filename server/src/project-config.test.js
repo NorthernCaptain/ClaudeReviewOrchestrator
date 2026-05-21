@@ -4,11 +4,7 @@
  */
 
 import { jest } from "@jest/globals"
-import {
-    mkdtempSync,
-    rmSync,
-    writeFileSync,
-} from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -58,11 +54,7 @@ describe("loadProjectConfig", () => {
         expect(r.ignorePaths).toEqual(["docs/**", "**/__snapshots__/**"])
         expect(r.limits.maxPayloadBytes).toBe(524288)
         expect(r.limits.maxFiles).toBe(80)
-        expect(r.blockingSeverities).toEqual([
-            "blocker",
-            "major",
-            "minor",
-        ])
+        expect(r.blockingSeverities).toEqual(["blocker", "major", "minor"])
         expect(r.extraReviewerInstructions).toMatch(/Express-4/)
     })
 
@@ -260,9 +252,7 @@ describe("mergeWithGlobal", () => {
         const out = mergeWithGlobal(global(), {
             extraReviewerInstructions: "Flag Express-4 patterns.",
         })
-        expect(out.extraReviewerInstructions).toBe(
-            "Flag Express-4 patterns."
-        )
+        expect(out.extraReviewerInstructions).toBe("Flag Express-4 patterns.")
     })
 
     test("preserves global fields not addressed by project", () => {

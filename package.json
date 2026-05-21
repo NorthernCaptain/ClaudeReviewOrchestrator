@@ -49,7 +49,6 @@
             "hooks/**/*.mjs",
             "!**/*.test.js",
             "!**/*.test.mjs",
-            "!server/src/mcp.js",
             "!server/src/status.js",
             "!hooks/stop-review.mjs"
         ],

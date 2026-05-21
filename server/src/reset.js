@@ -31,7 +31,9 @@ export const handleReset = ({ body, config, store, deps = {} }) => {
         })
     } catch (err) {
         const httpStatus =
-            err instanceof ContextError && err.code === "NOT_IN_ALLOWED_ROOT"
+            err instanceof ContextError &&
+            (err.code === "NOT_IN_ALLOWED_ROOT" ||
+                err.code === "NOT_IN_CLIENT_ROOT")
                 ? 403
                 : 400
         return {

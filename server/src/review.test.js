@@ -1213,7 +1213,10 @@ describe("handleReview — archive integration", () => {
     test("archive receives the configured codex.model", async () => {
         await handleReview({
             body: { cwd: "/repo", trigger: "stop_hook" },
-            config: { ...minimalConfig(), codex: { ...minimalConfig().codex, model: "gpt-5-codex" } },
+            config: {
+                ...minimalConfig(),
+                codex: { ...minimalConfig().codex, model: "gpt-5-codex" },
+            },
             store,
             archive,
             deps: makeDeps({
@@ -1500,8 +1503,7 @@ describe("handleReview — project config integration", () => {
             store,
             deps: makeDeps({
                 loadProjectConfig: () => ({
-                    extraReviewerInstructions:
-                        "Project rule: Express 5 only.",
+                    extraReviewerInstructions: "Project rule: Express 5 only.",
                 }),
                 buildPayload: () => payloadWith(["a.js"]),
                 runAndParse: async ({ prompt }) => {
