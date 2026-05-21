@@ -3,10 +3,12 @@
  * Author: Leo Khramov
  */
 
+import { randomUUID } from "node:crypto"
 import { realpathSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
 import { handleReview } from "./review.js"
 import { handleReset } from "./reset.js"
@@ -45,10 +47,14 @@ const realpathOrNull = (p) => {
 }
 
 // True iff `repoRoot` (already realpath'd) lies inside at least one of the
-// client-advertised roots. Returns true when `roots` is null/empty so the
-// caller can skip the check when no roots capability is in play.
+// client-advertised roots. The caller is expected to invoke this ONLY when
+// the client advertised a roots capability — in which case an empty
+// `roots` array means "no roots are allowed" and we must reject.
+// (Compare with the old contract where empty was treated as "skip"; the
+// failure-mode split lives in the caller now via maybeListClientRoots.)
 export const repoInClientRoots = (repoRoot, roots) => {
-    if (!Array.isArray(roots) || roots.length === 0) return true
+    if (!Array.isArray(roots)) return false
+    if (roots.length === 0) return false
     for (const r of roots) {
         const p = rootUriToPath(r?.uri)
         if (p === null) continue
@@ -74,27 +80,40 @@ const wrapResolveWithClientRoots = (resolveImpl, clientRoots) => (args) => {
     return ctx
 }
 
-// Returns the client-advertised roots if the client supports the roots
-// capability, or null when no roots check should be applied. Failures
-// (transport errors, missing capability) collapse to null so the review
-// path falls back to allowedRoots-only enforcement.
-const maybeListClientRoots = async (mcpServer, logger) => {
-    if (!mcpServer) return null
+// Three-way result for the roots probe. Failure modes are distinct so the
+// caller can fail closed when the client claims a roots capability but the
+// list cannot be retrieved.
+//
+//   { advertised: false }
+//     The client never advertised a roots capability. Skip the check.
+//
+//   { advertised: true, roots: Root[] }
+//     Roots successfully fetched. The handler MUST apply the membership
+//     check; an empty array means "no roots allowed" → repo is rejected.
+//
+//   { advertised: true, error: string }
+//     listRoots() threw. Fail CLOSED: the handler returns ESCALATE
+//     ROOTS_FETCH_FAILED instead of silently relaxing back to
+//     allowedRoots-only enforcement.
+export const maybeListClientRoots = async (mcpServer, logger) => {
+    if (!mcpServer) return { advertised: false }
     const lowLevel = mcpServer.server
     if (!lowLevel || typeof lowLevel.getClientCapabilities !== "function") {
-        return null
+        return { advertised: false }
     }
     const caps = lowLevel.getClientCapabilities()
-    if (!caps?.roots) return null
+    if (!caps?.roots) return { advertised: false }
     try {
         const result = await lowLevel.listRoots()
-        return Array.isArray(result?.roots) ? result.roots : null
+        const roots = Array.isArray(result?.roots) ? result.roots : []
+        return { advertised: true, roots }
     } catch (err) {
+        const message = err?.message ?? String(err)
         logger?.warn?.(
-            { err: err?.message ?? String(err) },
-            "MCP: client advertised roots capability but listRoots failed"
+            { err: message },
+            "MCP: client advertised roots capability but listRoots failed; failing closed"
         )
-        return null
+        return { advertised: true, error: message }
     }
 }
 
@@ -175,21 +194,47 @@ const asContent = (summary, structured) => ({
  * Tool handler for `request_review`. Pure function over { args, ctx } where
  * ctx contains all server-side dependencies. Returns an MCP CallToolResult.
  */
+// Returns either { ok: true, deps } with deps possibly wrapped, or
+// { ok: false, body } where body is a ready-to-return escalate envelope.
+const applyRootsPolicy = async ({ mcpServer, logger, deps }) => {
+    const probe = await maybeListClientRoots(mcpServer, logger)
+    if (!probe.advertised) {
+        return { ok: true, deps }
+    }
+    if (probe.error) {
+        return {
+            ok: false,
+            body: {
+                status: "ESCALATE",
+                findings: [],
+                blockingFindings: [],
+                droppedFindings: [],
+                reason: `MCP roots/list failed: ${probe.error}`,
+                code: "ROOTS_FETCH_FAILED",
+            },
+        }
+    }
+    const baseResolve = deps.resolveContext ?? defaultResolveContext
+    return {
+        ok: true,
+        deps: {
+            ...deps,
+            resolveContext: wrapResolveWithClientRoots(
+                baseResolve,
+                probe.roots
+            ),
+        },
+    }
+}
+
 export const reviewRequestHandler = async ({
     args,
     ctx: { config, store, archive, logger, deps = {}, now, mcpServer },
 }) => {
-    const clientRoots = await maybeListClientRoots(mcpServer, logger)
-    const baseResolve = deps.resolveContext ?? defaultResolveContext
-    const wrappedDeps = clientRoots
-        ? {
-              ...deps,
-              resolveContext: wrapResolveWithClientRoots(
-                  baseResolve,
-                  clientRoots
-              ),
-          }
-        : deps
+    const policy = await applyRootsPolicy({ mcpServer, logger, deps })
+    if (!policy.ok) {
+        return asContent(summarizeReview(policy.body), policy.body)
+    }
     const result = await handleReview({
         body: {
             cwd: args?.cwd,
@@ -200,7 +245,7 @@ export const reviewRequestHandler = async ({
         store,
         archive,
         logger,
-        deps: wrappedDeps,
+        deps: policy.deps,
         now,
     })
     return asContent(summarizeReview(result.body), result.body)
@@ -213,22 +258,15 @@ export const resetRequestHandler = async ({
     args,
     ctx: { config, store, logger, deps = {}, mcpServer },
 }) => {
-    const clientRoots = await maybeListClientRoots(mcpServer, logger)
-    const baseResolve = deps.resolveContext ?? defaultResolveContext
-    const wrappedDeps = clientRoots
-        ? {
-              ...deps,
-              resolveContext: wrapResolveWithClientRoots(
-                  baseResolve,
-                  clientRoots
-              ),
-          }
-        : deps
+    const policy = await applyRootsPolicy({ mcpServer, logger, deps })
+    if (!policy.ok) {
+        return asContent(summarizeReset(policy.body), policy.body)
+    }
     const result = handleReset({
         body: { cwd: args?.cwd },
         config,
         store,
-        deps: wrappedDeps,
+        deps: policy.deps,
     })
     return asContent(summarizeReset(result.body), result.body)
 }
@@ -281,38 +319,103 @@ export const buildMcpServer = (ctx) => {
 }
 
 /**
- * Mount the MCP route on the given Express app.
+ * Mount the MCP route on the given Express app — STATEFUL mode.
  *
- * Per the SDK's stateless-streamable-http reference example, every POST
- * /mcp invocation gets its own McpServer + StreamableHTTPServerTransport
- * pair. The transport's internal state machine (`_initialized` flag,
- * stream registry, etc.) is per-request in stateless mode; reusing a
- * single instance across requests leaves stale state that breaks the
- * second and subsequent calls (initialize → 200, then notifications/
- * initialized → 500 from the same transport).
+ * Stateful is required (not just nicer) because the SDK's MCP `Server`
+ * object only knows about the client's advertised capabilities (e.g.
+ * `roots`) AFTER it has processed an `initialize` request from that
+ * client. A fresh per-request server has empty capabilities on every
+ * tools/call, which silently disables our roots-membership check. To
+ * enforce it, the same server has to handle initialize through the
+ * subsequent tool calls in the same logical session.
  *
- * GET and DELETE return 405 — there's no long-lived session to stream
- * notifications down or to terminate.
+ * The protocol carries this binding via the `Mcp-Session-Id` header.
+ * On initialize, a new sessionId is minted and returned in the
+ * response headers; the client echoes it on every subsequent request.
+ * We keep an in-memory map of sessionId → { server, transport }.
+ * Transport.onclose evicts the entry.
+ *
+ * GET /mcp and DELETE /mcp also route through the same map — clients
+ * use GET to subscribe to server-initiated notifications and DELETE
+ * to terminate the session explicitly.
  */
 export const mountMcpRoute = (app, ctx) => {
-    const handle = async (req, res) => {
-        const server = buildMcpServer(ctx)
-        const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: undefined, // stateless mode
+    // sessionId → { server: McpServer, transport: StreamableHTTPServerTransport }
+    const sessions = new Map()
+
+    const replyBadRequest = (res, message) => {
+        if (res.headersSent) return
+        res.status(400).json({
+            jsonrpc: "2.0",
+            error: { code: -32000, message },
+            id: null,
         })
-        try {
-            await server.connect(transport)
-            await transport.handleRequest(req, res, req.body)
-            res.on("close", () => {
-                transport.close().catch(() => {})
-                server.close().catch(() => {})
+    }
+
+    const handle = async (req, res) => {
+        const sessionId = req.headers["mcp-session-id"]
+        let session = sessionId ? sessions.get(sessionId) : null
+
+        if (!session) {
+            // New session: only an initialize POST is allowed here.
+            if (req.method !== "POST" || !isInitializeRequest(req.body)) {
+                replyBadRequest(
+                    res,
+                    sessionId
+                        ? "Unknown Mcp-Session-Id"
+                        : "Mcp-Session-Id missing and request is not an initialize"
+                )
+                return
+            }
+            const server = buildMcpServer(ctx)
+            const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(),
+                onsessioninitialized: (sid) => {
+                    sessions.set(sid, { server, transport })
+                },
             })
+            transport.onclose = () => {
+                const sid = transport.sessionId
+                if (sid && sessions.has(sid)) sessions.delete(sid)
+            }
+            try {
+                await server.connect(transport)
+                await transport.handleRequest(req, res, req.body)
+            } catch (err) {
+                ctx.logger?.error?.(
+                    {
+                        err: err?.message ?? String(err),
+                        stack: err?.stack,
+                        method: req.method,
+                    },
+                    "MCP: transport handleRequest threw on initialize"
+                )
+                if (!res.headersSent) {
+                    res.status(500).json({
+                        jsonrpc: "2.0",
+                        error: {
+                            code: -32603,
+                            message:
+                                "internal MCP error: " +
+                                (err?.message ?? "unknown"),
+                        },
+                        id: null,
+                    })
+                }
+            }
+            return
+        }
+
+        // Existing session — hand the request to its transport.
+        try {
+            await session.transport.handleRequest(req, res, req.body)
         } catch (err) {
             ctx.logger?.error?.(
                 {
                     err: err?.message ?? String(err),
                     stack: err?.stack,
                     method: req.method,
+                    sessionId,
                 },
                 "MCP: transport handleRequest threw"
             )
@@ -331,17 +434,11 @@ export const mountMcpRoute = (app, ctx) => {
         }
     }
 
-    const notAllowed = (_req, res) => {
-        res.status(405).json({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Method not allowed." },
-            id: null,
-        })
-    }
-
     app.post("/mcp", handle)
-    app.get("/mcp", notAllowed)
-    app.delete("/mcp", notAllowed)
+    app.get("/mcp", handle)
+    app.delete("/mcp", handle)
+
+    return { sessions }
 }
 
 export const __test__ = {

@@ -353,9 +353,7 @@ describe("repoInClientRoots — edge cases", () => {
         const tmp = mkdtempSync(path.join(tmpdir(), "roots-"))
         const tmpReal = realpathSync(tmp)
         try {
-            expect(
-                repoInClientRoots(tmpReal, [{ uri: tmpReal }])
-            ).toBe(true)
+            expect(repoInClientRoots(tmpReal, [{ uri: tmpReal }])).toBe(true)
         } finally {
             rmSync(tmp, { recursive: true, force: true })
         }
@@ -371,9 +369,14 @@ describe("repoInClientRoots — edge cases", () => {
 })
 
 describe("repoInClientRoots", () => {
-    test("returns true when roots is null/empty (no check)", () => {
-        expect(repoInClientRoots("/repo", null)).toBe(true)
-        expect(repoInClientRoots("/repo", [])).toBe(true)
+    test("returns false when roots is null or non-array", () => {
+        expect(repoInClientRoots("/repo", null)).toBe(false)
+        expect(repoInClientRoots("/repo", undefined)).toBe(false)
+        expect(repoInClientRoots("/repo", "nope")).toBe(false)
+    })
+
+    test("returns false when roots is empty (advertised but nothing allowed)", () => {
+        expect(repoInClientRoots("/repo", [])).toBe(false)
     })
 
     test("accepts repo inside an advertised root (file:// URI)", () => {
@@ -428,13 +431,15 @@ describe("maybeListClientRoots edge cases (via reviewRequestHandler)", () => {
                 config: minimalConfig(),
                 store,
                 deps: happyDeps(),
-                mcpServer: { /* no `.server` */ },
+                mcpServer: {
+                    /* no `.server` */
+                },
             },
         })
         expect(out.structuredContent.status).toBe("GOOD_TO_GO")
     })
 
-    test("when listRoots returns a non-array, fall back to allowedRoots-only", async () => {
+    test("when listRoots returns a non-array, treats it as empty → ESCALATE NOT_IN_CLIENT_ROOT", async () => {
         const mcpServer = {
             server: {
                 getClientCapabilities: () => ({ roots: {} }),
@@ -450,7 +455,8 @@ describe("maybeListClientRoots edge cases (via reviewRequestHandler)", () => {
                 mcpServer,
             },
         })
-        expect(out.structuredContent.status).toBe("GOOD_TO_GO")
+        expect(out.structuredContent.status).toBe("ESCALATE")
+        expect(out.structuredContent.code).toBe("NOT_IN_CLIENT_ROOT")
     })
 })
 
@@ -485,7 +491,7 @@ describe("reviewRequestHandler — MCP roots check", () => {
         expect(out.structuredContent.code).toBe("NOT_IN_CLIENT_ROOT")
     })
 
-    test("when listRoots throws, handler falls back to allowedRoots-only and the call succeeds", async () => {
+    test("when listRoots throws, handler FAILS CLOSED with ESCALATE ROOTS_FETCH_FAILED", async () => {
         const mcpServer = {
             server: {
                 getClientCapabilities: () => ({ roots: {} }),
@@ -494,17 +500,21 @@ describe("reviewRequestHandler — MCP roots check", () => {
                 },
             },
         }
+        const logger = { warn: jest.fn(), error: jest.fn() }
         const out = await reviewRequestHandler({
             args: { cwd: "/repo" },
             ctx: {
                 config: minimalConfig(),
                 store,
                 deps: happyDeps(),
-                logger: { warn: jest.fn() },
+                logger,
                 mcpServer,
             },
         })
-        expect(out.structuredContent.status).toBe("GOOD_TO_GO")
+        expect(out.structuredContent.status).toBe("ESCALATE")
+        expect(out.structuredContent.code).toBe("ROOTS_FETCH_FAILED")
+        expect(out.structuredContent.reason).toMatch(/not supported/)
+        expect(logger.warn).toHaveBeenCalled()
     })
 
     test("when client doesn't advertise roots capability, no listRoots call is made", async () => {
