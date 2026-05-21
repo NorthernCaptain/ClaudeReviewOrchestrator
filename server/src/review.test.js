@@ -291,11 +291,54 @@ describe("handleReview — change detection", () => {
         })
         expect(r.body.status).toBe("NO_PROGRESS_WITH_OPEN_ISSUES")
         expect(r.body.findings).toEqual(issueFindings)
+        // Phase 3 contract: priorFindings is the blocker subset, so
+        // blockingFindings mirrors findings on NO_PROGRESS.
+        expect(r.body.blockingFindings).toEqual(issueFindings)
         expect(codexSpy).not.toHaveBeenCalled()
         // blockCount consumed (stop_hook trigger).
         expect(r.body.state.blockCount).toBe(1)
         // codexRounds NOT consumed.
         expect(r.body.state.codexRounds).toBe(1)
+    })
+
+    test("NO_PROGRESS resanitizes cached priorFindings (drops unsafe paths)", async () => {
+        // Simulate legacy/corrupt state that still has an unsafe path
+        // from a pre-sanitization run.
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: { progressHash: "g-hash-1" },
+            priorFindings: [
+                {
+                    file: "../../secret.txt",
+                    line: 1,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "legacy unsafe",
+                },
+                {
+                    file: "a.js",
+                    line: 2,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "legit",
+                },
+            ],
+            lastReviewedAt: 1,
+            lastResultStatus: "ISSUES",
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps(),
+        })
+        expect(r.body.status).toBe("NO_PROGRESS_WITH_OPEN_ISSUES")
+        expect(r.body.findings).toEqual([
+            expect.objectContaining({ file: "a.js" }),
+        ])
+        expect(r.body.blockingFindings).toEqual(r.body.findings)
     })
 
     test("NO_PROGRESS via mcp_tool does NOT increment blockCount", async () => {

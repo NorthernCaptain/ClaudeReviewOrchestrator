@@ -129,8 +129,50 @@ describe("wrapPrompt", () => {
         expect(prior).toBeLessThan(extra)
     })
 
-    test("preamble explicitly labels input as UNTRUSTED DATA", () => {
+    test("preamble explicitly labels REVIEW_INPUT and disk reads as UNTRUSTED DATA", () => {
         expect(SYSTEM_PREAMBLE).toMatch(/UNTRUSTED DATA/)
+        expect(SYSTEM_PREAMBLE).toMatch(/REVIEW_INPUT/)
+        expect(SYSTEM_PREAMBLE).toMatch(/disk/)
+    })
+
+    test("preamble flags PRIOR_FINDINGS and EXTRA_INSTRUCTIONS as trusted (not untrusted)", () => {
+        // Both should be described in the trust model section but not as
+        // "untrusted data" — they're server-generated / caller-supplied.
+        expect(SYSTEM_PREAMBLE).toMatch(/PRIOR_FINDINGS/)
+        expect(SYSTEM_PREAMBLE).toMatch(/EXTRA_INSTRUCTIONS/)
+        expect(SYSTEM_PREAMBLE).toMatch(/trusted/i)
+    })
+
+    test("PRIOR_FINDINGS block carries a trusted verify-each directive", () => {
+        const out = wrapPrompt({
+            payloadText: "x",
+            priorFindings: [
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "y",
+                },
+            ],
+        })
+        // The directive precedes the JSON array.
+        expect(out).toMatch(/Trusted directive[\s\S]+blocker or major/)
+        // And it appears between the begin/end markers.
+        const start = out.indexOf("<<<PRIOR_FINDINGS>>>")
+        const end = out.indexOf("<<<END_PRIOR_FINDINGS>>>")
+        expect(out.slice(start, end)).toMatch(/Trusted directive/)
+    })
+
+    test("EXTRA_INSTRUCTIONS block carries a trusted-guidance directive", () => {
+        const out = wrapPrompt({
+            payloadText: "x",
+            extraInstructions: "Check the auth flow.",
+        })
+        const start = out.indexOf("<<<EXTRA_INSTRUCTIONS>>>")
+        const end = out.indexOf("<<<END_EXTRA_INSTRUCTIONS>>>")
+        expect(out.slice(start, end)).toMatch(/Trusted directive/)
+        expect(out.slice(start, end)).toMatch(/Check the auth flow\./)
     })
 })
 
@@ -248,6 +290,65 @@ describe("parseCodexOutput", () => {
         expect(out.ok).toBe(false)
         expect(out.error.code).toBe("EMPTY_OUTPUT")
     })
+
+    test("schema rejects findings arrays larger than maxItems", () => {
+        const findings = []
+        for (let i = 0; i < 201; i++) {
+            findings.push({
+                file: "a.js",
+                line: i + 1,
+                severity: "blocker",
+                category: "bug",
+                message: "x",
+            })
+        }
+        const out = parseCodexOutput(
+            JSON.stringify({ status: "ISSUES", findings }),
+            validator
+        )
+        expect(out.ok).toBe(false)
+        expect(out.error.code).toBe("SCHEMA_INVALID")
+    })
+
+    test("schema rejects message strings longer than 2000 chars", () => {
+        const out = parseCodexOutput(
+            JSON.stringify({
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "x".repeat(2001),
+                    },
+                ],
+            }),
+            validator
+        )
+        expect(out.ok).toBe(false)
+        expect(out.error.code).toBe("SCHEMA_INVALID")
+    })
+
+    test("schema rejects file paths longer than 1024 chars", () => {
+        const out = parseCodexOutput(
+            JSON.stringify({
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a".repeat(1025),
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "x",
+                    },
+                ],
+            }),
+            validator
+        )
+        expect(out.ok).toBe(false)
+        expect(out.error.code).toBe("SCHEMA_INVALID")
+    })
 })
 
 describe("runCodex (mocked spawn)", () => {
@@ -311,6 +412,55 @@ describe("runCodex (mocked spawn)", () => {
                 spawn,
             })
         ).rejects.toThrow("ENOENT")
+    })
+
+    test("kills child + reports oversize=true when stdout exceeds the byte cap", async () => {
+        const cfg = baseConfig()
+        cfg.limits.maxCodexOutputBytes = 100
+        let killed = false
+        const spawn = fakeSpawn((child) => {
+            child.kill = () => {
+                killed = true
+                setImmediate(() => {
+                    child.stdout.end()
+                    child.stderr.end()
+                    child.emit("close", null, "SIGTERM")
+                })
+            }
+            // Push more than the cap.
+            child.stdout.write("x".repeat(200))
+        })
+        const out = await runCodex({
+            repoRoot: "/r",
+            prompt: "p",
+            config: cfg,
+            spawn,
+        })
+        expect(out.oversize).toBe(true)
+        expect(killed).toBe(true)
+    })
+
+    test("runAndParse maps oversize → ESCALATE with the byte cap in the reason", async () => {
+        const cfg = baseConfig()
+        cfg.limits.maxCodexOutputBytes = 100
+        const spawn = fakeSpawn((child) => {
+            child.kill = () => {
+                setImmediate(() => {
+                    child.stdout.end()
+                    child.stderr.end()
+                    child.emit("close", null, "SIGTERM")
+                })
+            }
+            child.stdout.write("x".repeat(200))
+        })
+        const r = await runAndParse({
+            repoRoot: "/r",
+            prompt: "p",
+            config: cfg,
+            spawn,
+        })
+        expect(r.status).toBe("ESCALATE")
+        expect(r.reason).toMatch(/exceeded 100 bytes/)
     })
 
     test("rejects when child emits error", async () => {

@@ -14,6 +14,7 @@
         },
         "findings": {
             "type": "array",
+            "maxItems": 200,
             "items": { "$ref": "#/$defs/finding" }
         }
     },
@@ -36,11 +37,13 @@
                 "file": {
                     "type": "string",
                     "minLength": 1,
+                    "maxLength": 1024,
                     "description": "Repo-relative path of the file the finding targets. Must be present in the current review payload's file set; the server drops findings referencing files outside the payload."
                 },
                 "line": {
                     "type": "integer",
                     "minimum": 0,
+                    "maximum": 10000000,
                     "description": "1-based line number; use 0 when the finding is file-wide and no specific line applies."
                 },
                 "severity": {
@@ -58,8 +61,15 @@
                         "other"
                     ]
                 },
-                "message": { "type": "string", "minLength": 1 },
-                "suggestion": { "type": "string" }
+                "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000
+                },
+                "suggestion": {
+                    "type": "string",
+                    "maxLength": 4000
+                }
             }
         }
     }

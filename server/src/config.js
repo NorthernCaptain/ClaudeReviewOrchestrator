@@ -48,6 +48,11 @@ const ConfigSchema = z
                 maxBlocks: z.number().int().min(1).default(6),
                 idleResetMinutes: z.number().int().min(1).default(10),
                 codexTimeoutSeconds: z.number().int().min(1).default(240),
+                maxCodexOutputBytes: z
+                    .number()
+                    .int()
+                    .min(4096)
+                    .default(1024 * 1024),
                 maxPayloadBytes: z.number().int().min(1024).default(262144),
                 maxFileBytes: z.number().int().min(512).default(65536),
                 maxFiles: z.number().int().min(1).default(40),

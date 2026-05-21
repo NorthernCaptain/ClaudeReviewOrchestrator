@@ -53,6 +53,22 @@ const partitionFindings = (findings, payloadPaths, repoRoot) => {
     return { kept, dropped }
 }
 
+// Re-validate cached state findings before they leave the server. Legacy
+// or corrupt state could carry unsafe paths; this is the defensive read
+// counterpart to the storage-side sanitization. No payload-membership
+// check here — cached findings already passed it when they entered state
+// and the same files are force-included in this round's payload.
+const resanitizeCached = (findings, repoRoot) => {
+    const out = []
+    for (const f of findings ?? []) {
+        if (!f || typeof f.file !== "string") continue
+        const safe = sanitizeFindingPath(f.file, repoRoot)
+        if (safe === null) continue
+        out.push({ ...f, file: safe })
+    }
+    return out
+}
+
 const computeBlocking = (findings, blockingSeverities) => {
     const set = new Set(blockingSeverities)
     return findings.filter((f) => set.has(f.severity))
@@ -217,7 +233,14 @@ export const handleReview = async ({
         }
         if (state.lastResultStatus === "ISSUES") {
             // Same on-disk state as last review, blocking findings still open.
-            // Block-cap accounting: only stop-hook calls consume budget.
+            // Re-sanitize the cached priors so legacy/corrupt state can't
+            // leak unsafe paths back to callers. priorFindings is the
+            // blocker subset by construction (Phase 3), so the same array
+            // serves as both `findings` and `blockingFindings`.
+            const cachedBlocking = resanitizeCached(
+                state.priorFindings,
+                context.repoRoot
+            )
             let nextState = state
             if (isStopHook(trigger)) {
                 nextState = store.save(context.key, {
@@ -230,8 +253,8 @@ export const handleReview = async ({
                 httpStatus: 200,
                 body: {
                     status: "NO_PROGRESS_WITH_OPEN_ISSUES",
-                    findings: state.priorFindings,
-                    blockingFindings: [],
+                    findings: cachedBlocking,
+                    blockingFindings: cachedBlocking,
                     droppedFindings: [],
                     reason: "No on-disk progress on flagged files since the last review.",
                     context: contextSummary(context),
