@@ -87,6 +87,57 @@ describe("parseNameStatusZ", () => {
     })
 })
 
+describe("sanitizeFindingPath", () => {
+    const { sanitizeFindingPath } = __test__
+    const root = "/repo"
+
+    test("accepts a plain repo-relative path", () => {
+        expect(sanitizeFindingPath("src/foo.js", root)).toBe("src/foo.js")
+    })
+
+    test("normalizes redundant segments", () => {
+        expect(sanitizeFindingPath("src/./foo.js", root)).toBe("src/foo.js")
+        expect(sanitizeFindingPath("src/bar/../foo.js", root)).toBe(
+            "src/foo.js"
+        )
+    })
+
+    test("rejects absolute paths", () => {
+        expect(sanitizeFindingPath("/etc/passwd", root)).toBeNull()
+    })
+
+    test("rejects parent-directory escapes", () => {
+        expect(sanitizeFindingPath("../secret.txt", root)).toBeNull()
+        expect(sanitizeFindingPath("../../secret.txt", root)).toBeNull()
+        expect(
+            sanitizeFindingPath("src/../../escape.txt", root)
+        ).toBeNull()
+    })
+
+    test("rejects backslash traversal", () => {
+        expect(sanitizeFindingPath("..\\secret.txt", root)).toBeNull()
+        expect(
+            sanitizeFindingPath("src\\foo.js", root)
+        ).toBeNull()
+    })
+
+    test("rejects null bytes", () => {
+        expect(sanitizeFindingPath("src/foo\0.js", root)).toBeNull()
+    })
+
+    test("rejects empty / dotty paths", () => {
+        expect(sanitizeFindingPath("", root)).toBeNull()
+        expect(sanitizeFindingPath(".", root)).toBeNull()
+        expect(sanitizeFindingPath("..", root)).toBeNull()
+    })
+
+    test("rejects non-string input", () => {
+        expect(sanitizeFindingPath(null, root)).toBeNull()
+        expect(sanitizeFindingPath(undefined, root)).toBeNull()
+        expect(sanitizeFindingPath(123, root)).toBeNull()
+    })
+})
+
 describe("isBinary", () => {
     test("returns true for buffer containing a null byte in first 8KB", () => {
         expect(isBinary(Buffer.from([1, 2, 0, 3, 4]))).toBe(true)
@@ -479,6 +530,35 @@ describe("buildPayload (integration)", () => {
             ],
         })
         expect(out.promptText).toMatch(/node_modules\/foo.js/)
+    })
+
+    test("a malicious priorFinding path (../../) is silently dropped", () => {
+        // Place a file outside the repo. If sanitization were broken,
+        // buildPayload would join repoRoot + "../" and read it.
+        const parent = path.dirname(dir)
+        const secretAbs = path.join(parent, "outside-secret.txt")
+        writeFileSync(secretAbs, "SECRET\n")
+        try {
+            const out = buildPayload({
+                repoRoot: dir,
+                config: baseConfig(),
+                priorFindings: [
+                    {
+                        file: "../outside-secret.txt",
+                        line: 1,
+                        severity: "blocker",
+                    },
+                ],
+            })
+            // No SECRET content in the prompt.
+            expect(out.promptText).not.toMatch(/SECRET/)
+            // No prior-finding-context entry for the bad path.
+            expect(out.files.priorFindingContext).toEqual([])
+            // The path doesn't appear in priorFindingPaths either.
+            expect(out.priorFindingPaths).toEqual([])
+        } finally {
+            rmSync(secretAbs)
+        }
     })
 
     test("force-include: deleted prior-finding file emits a 'deleted on disk' marker", () => {

@@ -476,6 +476,139 @@ describe("handleReview — codex errors", () => {
     })
 })
 
+describe("handleReview — finding-path sanitization", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("drops findings with unsafe paths (../) and stores only safe ones", async () => {
+        // Codex returns a mix of safe and unsafe paths.
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        {
+                            file: "../../secret.txt",
+                            line: 1,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "evil",
+                        },
+                        {
+                            file: "src/safe.js",
+                            line: 2,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "real issue",
+                        },
+                        {
+                            file: "/etc/passwd",
+                            line: 3,
+                            severity: "major",
+                            category: "security",
+                            message: "absolute path",
+                        },
+                    ],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("ISSUES")
+        // Returned findings list contains only the safe entry.
+        expect(r.body.findings).toEqual([
+            expect.objectContaining({ file: "src/safe.js" }),
+        ])
+        // Stored priorFindings reflect the same.
+        const persisted = store.get(happyContext)
+        expect(persisted.priorFindings).toEqual([
+            expect.objectContaining({ file: "src/safe.js" }),
+        ])
+    })
+})
+
+describe("handleReview — unchanged ESCALATE short-circuit", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("unchanged baseline + last status ESCALATE returns cached CODEX_ERROR_CACHED without spawning codex", async () => {
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: { progressHash: "g-hash-1" },
+            lastReviewedAt: 1,
+            lastResultStatus: "ESCALATE",
+            lastEscalateReason: "codex output failed schema",
+            priorFindings: [],
+        })
+        const codexSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ runAndParse: codexSpy }),
+        })
+        expect(codexSpy).not.toHaveBeenCalled()
+        expect(r.body.status).toBe("ESCALATE")
+        expect(r.body.code).toBe("CODEX_ERROR_CACHED")
+        expect(r.body.reason).toMatch(/failed schema/)
+        // codexRounds did NOT increment because codex didn't run.
+        expect(r.body.state.codexRounds).toBe(1)
+        // blockCount DID increment because this was a stop_hook.
+        expect(r.body.state.blockCount).toBe(1)
+    })
+
+    test("unchanged ESCALATE via mcp_tool does not consume blockCount", async () => {
+        store.save(happyContext.key, {
+            ...happyContext,
+            codexRounds: 1,
+            blockCount: 0,
+            lastBaseline: { progressHash: "g-hash-1" },
+            lastReviewedAt: 1,
+            lastResultStatus: "ESCALATE",
+            lastEscalateReason: "codex output failed schema",
+            priorFindings: [],
+        })
+        const codexSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ runAndParse: codexSpy }),
+        })
+        expect(codexSpy).not.toHaveBeenCalled()
+        expect(r.body.status).toBe("ESCALATE")
+        expect(r.body.state.blockCount).toBe(0)
+    })
+
+    test("ESCALATE persists lastEscalateReason so the next call can surface it", async () => {
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                runAndParse: async () => ({
+                    status: "ESCALATE",
+                    reason: "codex output unparseable",
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }),
+            }),
+        })
+        const persisted = store.get(happyContext)
+        expect(persisted.lastResultStatus).toBe("ESCALATE")
+        expect(persisted.lastEscalateReason).toBe("codex output unparseable")
+    })
+})
+
 describe("handleReview — state persistence", () => {
     let store
     beforeEach(() => {

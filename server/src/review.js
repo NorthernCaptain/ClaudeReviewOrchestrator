@@ -4,8 +4,30 @@
  */
 
 import { resolveContext, ContextError } from "./context.js"
-import { buildPayload } from "./diff.js"
+import { buildPayload, sanitizeFindingPath } from "./diff.js"
 import { runAndParse } from "./codex.js"
+
+// Drop findings whose file path is unsafe (absolute, escapes repoRoot via
+// "..", backslashes, null bytes). The dropped paths are visible to the
+// caller via the dropped count; Phase 3 will surface them as
+// result.droppedFindings.
+const safeFindingsOnly = (findings, repoRoot) => {
+    const safe = []
+    let droppedForPath = 0
+    for (const f of findings ?? []) {
+        if (!f || typeof f.file !== "string") {
+            droppedForPath++
+            continue
+        }
+        const sanitized = sanitizeFindingPath(f.file, repoRoot)
+        if (sanitized === null) {
+            droppedForPath++
+            continue
+        }
+        safe.push({ ...f, file: sanitized })
+    }
+    return { safe, droppedForPath }
+}
 
 const envelope = (status, extra = {}) => ({
     status,
@@ -180,6 +202,33 @@ export const handleReview = async ({
                 },
             }
         }
+        if (state.lastResultStatus === "ESCALATE") {
+            // The last Codex run failed (schema error, timeout, etc.). The
+            // user hasn't edited anything; spawning Codex again with the same
+            // prompt isn't going to help and would burn codexRounds for free.
+            // Return the cached ESCALATE; stop_hook still consumes blockCount
+            // so the loop eventually exits hard.
+            let nextState = state
+            if (isStopHook(trigger)) {
+                nextState = store.save(context.key, {
+                    ...state,
+                    blockCount: state.blockCount + 1,
+                    lastReviewedAt: now(),
+                })
+            }
+            return {
+                httpStatus: 200,
+                body: envelope("ESCALATE", {
+                    reason:
+                        state.lastEscalateReason ??
+                        "previous codex run failed and the on-disk state has not changed",
+                    code: "CODEX_ERROR_CACHED",
+                    context: contextSummary(context),
+                    baseline: baselineSummary(payload),
+                    state: stateSummary(nextState),
+                }),
+            }
+        }
     }
 
     // Cap check on Codex rounds before spawning. The counter increments
@@ -209,14 +258,16 @@ export const handleReview = async ({
     }
 
     if (codexResult.status === "ESCALATE") {
-        // Persist the baseline so a follow-up call without any edits still
-        // returns NO_CHANGES instead of re-spinning Codex.
+        // Persist the baseline + the reason so a follow-up call without any
+        // edits short-circuits to the cached ESCALATE instead of re-spinning
+        // Codex (see the unchanged+ESCALATE branch above).
         const nextState = store.save(context.key, {
             ...state,
             codexRounds: state.codexRounds + 1,
             lastBaseline: baselineSummary(payload),
             lastReviewedAt: now(),
             lastResultStatus: "ESCALATE",
+            lastEscalateReason: codexResult.reason,
         })
         return {
             httpStatus: 200,
@@ -231,19 +282,25 @@ export const handleReview = async ({
         }
     }
 
-    // Codex returned a structured result. In Phase 2 we still pass through
-    // findings as-is (blockingFindings / droppedFindings are wired in
-    // Phase 3). The result-status mapping is also simpler than Phase 3 —
-    // GOOD_TO_GO_WITH_NOTES is not yet derived here.
+    // Codex returned a structured result. Sanitize finding paths before
+    // they enter state — Codex output is untrusted and a path like
+    // "../../secret.txt" would otherwise be hashed and read on the next
+    // round. In Phase 2 we still surface the sanitized list as `findings`
+    // (blockingFindings / droppedFindings get wired in Phase 3).
     const status = codexResult.status === "ISSUES" ? "ISSUES" : "GOOD_TO_GO"
+    const { safe: safeFindings } = safeFindingsOnly(
+        codexResult.findings,
+        context.repoRoot
+    )
 
     const nextState = {
         ...state,
         codexRounds: state.codexRounds + 1,
         lastBaseline: baselineSummary(payload),
         lastReviewedAt: now(),
+        lastEscalateReason: null,
         lastResultStatus: status,
-        priorFindings: status === "ISSUES" ? codexResult.findings : [],
+        priorFindings: status === "ISSUES" ? safeFindings : [],
         // Only stop-hook ISSUES results consume block budget.
         blockCount:
             isStopHook(trigger) && status === "ISSUES"
@@ -266,7 +323,7 @@ export const handleReview = async ({
         httpStatus: 200,
         body: {
             status,
-            findings: codexResult.findings,
+            findings: safeFindings,
             blockingFindings: [],
             droppedFindings: [],
             context: contextSummary(context),

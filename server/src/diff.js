@@ -91,10 +91,34 @@ const sha256Hex = (input) => {
     return h.digest("hex")
 }
 
-const collectPriorFindingPaths = (priorFindings) => {
+// Validate a Codex-supplied file path so it cannot escape repoRoot via
+// "..", absolute paths, backslash traversal, or null bytes. Returns the
+// normalized POSIX path on success, or null if the input is unsafe.
+//
+// This is a security boundary — Codex output is untrusted data. Callers
+// MUST drop any finding for which this returns null, both when storing
+// findings into state and when re-reading those findings on the next
+// round. Belt-and-braces validation at both sites is intentional.
+export const sanitizeFindingPath = (file, repoRoot) => {
+    if (typeof file !== "string" || file.length === 0) return null
+    if (file.includes("\0") || file.includes("\\")) return null
+    if (path.isAbsolute(file)) return null
+    const norm = path.posix.normalize(file)
+    if (norm === "." || norm === "" || norm.startsWith("/")) return null
+    if (norm === ".." || norm.startsWith("../")) return null
+    // Resolve against repoRoot and require the result to stay inside.
+    const resolved = path.resolve(repoRoot, norm)
+    const rel = path.relative(repoRoot, resolved)
+    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null
+    return norm
+}
+
+const collectPriorFindingPaths = (priorFindings, repoRoot) => {
     const set = new Set()
     for (const f of priorFindings) {
-        if (f && typeof f.file === "string" && f.file) set.add(f.file)
+        if (!f || typeof f.file !== "string") continue
+        const safe = sanitizeFindingPath(f.file, repoRoot)
+        if (safe !== null) set.add(safe)
     }
     return set
 }
@@ -116,7 +140,7 @@ export const buildPayload = ({
     readFile = readFileSync,
 }) => {
     const headSha = git(repoRoot, ["rev-parse", "HEAD"]).trim()
-    const priorFindingPaths = collectPriorFindingPaths(priorFindings)
+    const priorFindingPaths = collectPriorFindingPaths(priorFindings, repoRoot)
     const isPrior = (p) => priorFindingPaths.has(p)
 
     const nameStatusOut = git(repoRoot, ["diff", "HEAD", "--name-status", "-z"])
@@ -379,4 +403,5 @@ export const __test__ = {
     truncateText,
     sha256Hex,
     collectPriorFindingPaths,
+    sanitizeFindingPath,
 }
