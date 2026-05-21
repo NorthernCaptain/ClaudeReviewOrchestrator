@@ -4,7 +4,11 @@
  */
 
 import { jest } from "@jest/globals"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import { createApp, startServer } from "./index.js"
+import { createStateStore } from "./state.js"
 
 const minimalConfig = (over = {}) => ({
     port: 0,
@@ -45,10 +49,14 @@ const happyDeps = {
             untracked: [],
             deleted: [],
             renamed: [],
+            priorFindingContext: [],
         },
         totalBytes: 100,
         truncated: false,
         promptText: "payload",
+        promptHash: "p",
+        progressHash: "g",
+        priorFindingPaths: [],
         empty: false,
         nonBinaryFileCount: 1,
     }),
@@ -59,18 +67,42 @@ const happyDeps = {
     }),
 }
 
+const makeStore = () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "index-store-"))
+    const store = createStateStore({
+        filePath: path.join(dir, "state.json"),
+        now: () => 0,
+    })
+    store.__dir = dir
+    return store
+}
+
 const silentLog = { info: jest.fn(), error: jest.fn(), warn: jest.fn() }
 
-const start = async (config, deps = happyDeps) => {
-    const r = await startServer({ config, deps, log: silentLog })
-    if (!r.ok) throw r.error
+const start = async (config, deps = happyDeps, providedStore = null) => {
+    const store = providedStore ?? makeStore()
+    const r = await startServer({ config, store, deps, log: silentLog })
+    if (!r.ok) {
+        if (!providedStore)
+            rmSync(store.__dir, { recursive: true, force: true })
+        throw r.error
+    }
     return {
         server: r.server,
+        store,
         url: `http://127.0.0.1:${r.address.port}`,
         port: r.address.port,
         close: () =>
             new Promise((res) => {
-                r.server.close(() => res())
+                r.server.close(() => {
+                    if (!providedStore) {
+                        rmSync(store.__dir, {
+                            recursive: true,
+                            force: true,
+                        })
+                    }
+                    res()
+                })
             }),
     }
 }
@@ -98,6 +130,7 @@ describe("startServer", () => {
             })
             const result = await startServer({
                 config: cfg,
+                store: makeStore(),
                 deps: happyDeps,
                 log: silentLog,
             })

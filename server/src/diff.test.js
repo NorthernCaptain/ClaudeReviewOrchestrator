@@ -4,13 +4,13 @@
  */
 
 import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import {
     mkdtempSync,
     rmSync,
     writeFileSync,
     mkdirSync,
     realpathSync,
-    chmodSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -315,6 +315,186 @@ describe("buildPayload (integration)", () => {
         )
         expect(out.totalBytes).toBe(
             Buffer.byteLength(out.promptText, "utf8")
+        )
+    })
+
+    test("promptHash is sha256 of promptText bytes", () => {
+        writeFileSync(path.join(dir, "x.txt"), "hello\n")
+        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const expected = createHash("sha256")
+            .update(out.promptText)
+            .digest("hex")
+        expect(out.promptHash).toBe(expected)
+    })
+
+    test("progressHash equals sha256(promptHash + '|') when there are no prior findings", () => {
+        writeFileSync(path.join(dir, "x.txt"), "hello\n")
+        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const expected = createHash("sha256")
+            .update(`${out.promptHash}|`)
+            .digest("hex")
+        expect(out.progressHash).toBe(expected)
+    })
+
+    test("progressHash changes when a prior-finding file is edited", () => {
+        const flagged = path.join(dir, "flagged.txt")
+        writeFileSync(flagged, "before\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "add"])
+
+        const priorFindings = [
+            { file: "flagged.txt", line: 1, severity: "blocker" },
+        ]
+        const before = buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            priorFindings,
+        })
+        writeFileSync(flagged, "after\n")
+        const after = buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            priorFindings,
+        })
+        expect(after.progressHash).not.toBe(before.progressHash)
+    })
+
+    test("progressHash flips even when the edit is PAST maxFileBytes truncation", () => {
+        // The flagged file is large. We change a byte far past maxFileBytes.
+        // promptHash may stay the same (the truncated prompt prefix is
+        // identical) but progressHash uses the FULL file content, so it must
+        // change.
+        const flagged = path.join(dir, "big.txt")
+        const initial = "a".repeat(2000) + "X"
+        writeFileSync(flagged, initial + "\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "init"])
+
+        const priorFindings = [
+            { file: "big.txt", line: 1, severity: "blocker" },
+        ]
+        const cfg = baseConfig()
+        cfg.limits.maxFileBytes = 200 // truncate well before our edit point.
+
+        const before = buildPayload({
+            repoRoot: dir,
+            config: cfg,
+            priorFindings,
+        })
+
+        // Mutate the file far past the prompt's truncation point.
+        writeFileSync(flagged, initial.replace(/X$/, "Y") + "\n")
+
+        const after = buildPayload({
+            repoRoot: dir,
+            config: cfg,
+            priorFindings,
+        })
+
+        // Sanity: the prompt itself was indeed truncated.
+        expect(before.truncated).toBe(true)
+        expect(after.truncated).toBe(true)
+        // Either promptHash flipped too (because the modified diff also
+        // changed) or it stayed identical because we haven't staged the
+        // change against HEAD. Either way the progress hash MUST flip.
+        expect(after.progressHash).not.toBe(before.progressHash)
+    })
+
+    test("progressHash treats a deleted prior-finding file as MISSING", () => {
+        const flagged = path.join(dir, "f.txt")
+        writeFileSync(flagged, "content\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "add"])
+
+        const priorFindings = [
+            { file: "f.txt", line: 1, severity: "blocker" },
+        ]
+        const before = buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            priorFindings,
+        })
+        rmSync(flagged)
+        const after = buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            priorFindings,
+        })
+        expect(after.progressHash).not.toBe(before.progressHash)
+    })
+
+    test("force-include: prior-finding file in ignorePaths is still in the prompt", () => {
+        mkdirSync(path.join(dir, "node_modules"), { recursive: true })
+        const flagged = "node_modules/foo.js"
+        writeFileSync(path.join(dir, flagged), "x = 1\n")
+        const out = buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            priorFindings: [
+                { file: flagged, line: 1, severity: "blocker" },
+            ],
+        })
+        // Without prior-findings this file would be filtered by ignorePaths.
+        expect(out.promptText).toMatch(/node_modules\/foo.js/)
+    })
+
+    test("force-include: a prior-finding file that the user hasn't touched gets a 'prior-finding' block", () => {
+        const flagged = path.join(dir, "untouched.txt")
+        writeFileSync(flagged, "still here\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "init"])
+        const out = buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            priorFindings: [
+                { file: "untouched.txt", line: 1, severity: "blocker" },
+            ],
+        })
+        expect(out.promptText).toMatch(
+            /=== FILE: untouched.txt \(prior-finding, full content\) ===/
+        )
+        expect(out.files.priorFindingContext).toContainEqual(
+            expect.objectContaining({ path: "untouched.txt", missing: false })
+        )
+    })
+
+    test("force-include: prior-finding files don't consume the maxFiles budget", () => {
+        // 3 untracked files + 1 prior-finding file flagged in node_modules.
+        // maxFiles=2: untracked files take both slots; the prior-finding file
+        // still gets included.
+        for (let i = 0; i < 3; i++) {
+            writeFileSync(path.join(dir, `u${i}.txt`), "x\n")
+        }
+        mkdirSync(path.join(dir, "node_modules"), { recursive: true })
+        const flagged = "node_modules/foo.js"
+        writeFileSync(path.join(dir, flagged), "y = 2\n")
+        const cfg = baseConfig()
+        cfg.limits.maxFiles = 2
+
+        const out = buildPayload({
+            repoRoot: dir,
+            config: cfg,
+            priorFindings: [
+                { file: flagged, line: 1, severity: "blocker" },
+            ],
+        })
+        expect(out.promptText).toMatch(/node_modules\/foo.js/)
+    })
+
+    test("force-include: deleted prior-finding file emits a 'deleted on disk' marker", () => {
+        // File is in priorFindings but never existed at HEAD or on disk.
+        const out = buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            priorFindings: [
+                { file: "ghost.txt", line: 1, severity: "blocker" },
+            ],
+        })
+        expect(out.promptText).toMatch(
+            /=== FILE: ghost.txt \(prior-finding, deleted on disk\) ===/
+        )
+        expect(out.files.priorFindingContext).toContainEqual(
+            expect.objectContaining({ path: "ghost.txt", missing: true })
         )
     })
 

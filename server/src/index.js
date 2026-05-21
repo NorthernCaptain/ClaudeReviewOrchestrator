@@ -7,9 +7,11 @@ import express from "express"
 import { loadConfig, defaultConfigPath } from "./config.js"
 import { authMiddleware } from "./auth.js"
 import { mountReviewRoute } from "./review.js"
+import { mountResetRoute } from "./reset.js"
+import { createStateStore } from "./state.js"
 import { logger } from "./logger.js"
 
-export const createApp = (config, deps = {}) => {
+export const createApp = ({ config, store, deps = {} }) => {
     const app = express()
     app.disable("x-powered-by")
     app.use(express.json({ limit: "1mb" }))
@@ -19,14 +21,15 @@ export const createApp = (config, deps = {}) => {
     })
 
     app.use(authMiddleware({ token: config.authToken }))
-    mountReviewRoute(app, { config, deps })
+    mountReviewRoute(app, { config, store, deps })
+    mountResetRoute(app, { config, store, deps })
 
     return app
 }
 
-export const startServer = ({ config, deps = {}, log = logger } = {}) =>
+export const startServer = ({ config, store, deps = {}, log = logger } = {}) =>
     new Promise((resolve) => {
-        const app = createApp(config, deps)
+        const app = createApp({ config, store, deps })
         const server = app.listen(config.port, config.bind)
         let settled = false
 
@@ -87,7 +90,11 @@ const main = async () => {
         return
     }
 
-    const result = await startServer({ config })
+    const store = createStateStore({
+        idleResetMs: config.limits.idleResetMinutes * 60 * 1000,
+    })
+
+    const result = await startServer({ config, store })
     if (!result.ok) {
         process.exitCode = 1
         return

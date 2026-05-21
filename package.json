@@ -52,8 +52,6 @@
             "!server/src/archive.js",
             "!server/src/mcp.js",
             "!server/src/project-config.js",
-            "!server/src/reset.js",
-            "!server/src/state.js",
             "!server/src/status.js",
             "!hooks/stop-review.mjs"
         ],

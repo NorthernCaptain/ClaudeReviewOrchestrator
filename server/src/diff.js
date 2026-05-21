@@ -4,6 +4,7 @@
  */
 
 import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { minimatch } from "minimatch"
@@ -84,13 +85,39 @@ const truncateText = (text, max) => {
 
 const makeHeader = (file, label) => `=== FILE: ${file} (${label}) ===`
 
+const sha256Hex = (input) => {
+    const h = createHash("sha256")
+    h.update(input)
+    return h.digest("hex")
+}
+
+const collectPriorFindingPaths = (priorFindings) => {
+    const set = new Set()
+    for (const f of priorFindings) {
+        if (f && typeof f.file === "string" && f.file) set.add(f.file)
+    }
+    return set
+}
+
+// Reads a file as raw bytes for hashing. Returns null on missing.
+const readBytesOrNull = (readFile, abs) => {
+    try {
+        return readFile(abs)
+    } catch {
+        return null
+    }
+}
+
 export const buildPayload = ({
     repoRoot,
     config,
+    priorFindings = [],
     git = defaultGit,
     readFile = readFileSync,
 }) => {
     const headSha = git(repoRoot, ["rev-parse", "HEAD"]).trim()
+    const priorFindingPaths = collectPriorFindingPaths(priorFindings)
+    const isPrior = (p) => priorFindingPaths.has(p)
 
     const nameStatusOut = git(repoRoot, ["diff", "HEAD", "--name-status", "-z"])
     const changed = parseNameStatusZ(nameStatusOut)
@@ -104,30 +131,37 @@ export const buildPayload = ({
     const untrackedAll = untrackedOut.split("\0").filter(Boolean)
 
     const ignorePaths = config.ignorePaths
-    const modifiedSet = filterIgnored(
-        [...changed.modified, ...changed.added, ...changed.typeChanged],
-        ignorePaths
-    )
-    const deletedSet = filterIgnored(changed.deleted, ignorePaths)
+    const keepOrPrior = (p) => isPrior(p) || !matchesAny(p, ignorePaths)
+
+    const modifiedSet = [
+        ...changed.modified,
+        ...changed.added,
+        ...changed.typeChanged,
+    ].filter(keepOrPrior)
+    const deletedSet = changed.deleted.filter(keepOrPrior)
     const renamedSet = changed.renamed.filter(
-        (r) => !matchesAny(r.to, ignorePaths)
+        (r) =>
+            isPrior(r.to) || isPrior(r.from) || !matchesAny(r.to, ignorePaths)
     )
-    const untrackedSet = filterIgnored(untrackedAll, ignorePaths)
+    const untrackedSet = untrackedAll.filter(keepOrPrior)
 
     const { limits } = config
     let totalBytes = 0
     let truncated = false
     let filesEmitted = 0
     const blocks = []
+    const emittedPaths = new Set()
     const filesMeta = {
         modified: [],
         untracked: [],
         deleted: [],
         renamed: [],
+        priorFindingContext: [],
     }
 
     const room = () => limits.maxPayloadBytes - totalBytes
-    const haveFileSlot = () => filesEmitted < limits.maxFiles
+    const haveFileSlot = (path) =>
+        isPrior(path) || filesEmitted < limits.maxFiles
 
     const tryEmit = (block) => {
         const bytes = Buffer.byteLength(block, "utf8")
@@ -137,11 +171,11 @@ export const buildPayload = ({
         return true
     }
 
-    const pushBlock = (header, body) => {
-        filesEmitted++
+    const pushBlock = (header, body, file) => {
+        if (!isPrior(file)) filesEmitted++
+        emittedPaths.add(file)
         const block = body ? `${header}\n${body}\n` : `${header}\n`
         if (tryEmit(block)) return
-        // Block doesn't fit — try the smaller "omitted" header instead.
         truncated = true
         tryEmit(`${header} (omitted: payload limit)\n`)
     }
@@ -152,46 +186,53 @@ export const buildPayload = ({
 
     for (const file of modifiedSet) {
         filesMeta.modified.push({ path: file })
-        if (!haveFileSlot()) {
+        if (!haveFileSlot(file)) {
             pushHeaderOnly(makeHeader(file, "modified, omitted: maxFiles"))
             truncated = true
             continue
         }
-        let diff = git(repoRoot, ["diff", "HEAD", "--", file])
+        const diff = git(repoRoot, ["diff", "HEAD", "--", file])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
-        diff = text
         if (t) truncated = true
         pushBlock(
             makeHeader(file, t ? "modified, truncated" : "modified"),
-            diff
+            text,
+            file
         )
     }
 
     for (const r of renamedSet) {
         filesMeta.renamed.push({ from: r.from, to: r.to })
-        if (!haveFileSlot()) {
+        // If either endpoint was flagged, treat the rename as a prior-finding
+        // for slot/cap purposes so it never gets dropped to a header-only.
+        const slotKey = isPrior(r.from) ? r.from : r.to
+        if (!haveFileSlot(slotKey)) {
             pushHeaderOnly(
                 makeHeader(`${r.from} -> ${r.to}`, "renamed, omitted: maxFiles")
             )
             truncated = true
             continue
         }
-        let diff = git(repoRoot, ["diff", "HEAD", "--", r.to])
+        const diff = git(repoRoot, ["diff", "HEAD", "--", r.to])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
-        diff = text
         if (t) truncated = true
         pushBlock(
             makeHeader(
                 `${r.from} -> ${r.to}`,
                 t ? "renamed, truncated" : "renamed"
             ),
-            diff
+            text,
+            slotKey
         )
+        // Mark both endpoints as emitted so a follow-up standalone pass
+        // doesn't duplicate.
+        emittedPaths.add(r.from)
+        emittedPaths.add(r.to)
     }
 
     for (const file of deletedSet) {
         filesMeta.deleted.push(file)
-        if (!haveFileSlot()) {
+        if (!haveFileSlot(file)) {
             pushHeaderOnly(makeHeader(file, "deleted, omitted: maxFiles"))
             truncated = true
             continue
@@ -199,20 +240,20 @@ export const buildPayload = ({
         const diff = git(repoRoot, ["diff", "HEAD", "--", file])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
         if (t) truncated = true
-        pushBlock(makeHeader(file, t ? "deleted, truncated" : "deleted"), text)
+        pushBlock(
+            makeHeader(file, t ? "deleted, truncated" : "deleted"),
+            text,
+            file
+        )
     }
 
     for (const file of untrackedSet) {
         const abs = path.join(repoRoot, file)
-        let buf
-        try {
-            buf = readFile(abs)
-        } catch {
-            continue
-        }
+        const buf = readBytesOrNull(readFile, abs)
+        if (buf === null) continue
         const binary = isBinary(buf)
         filesMeta.untracked.push({ path: file, binary })
-        if (!haveFileSlot()) {
+        if (!haveFileSlot(file)) {
             pushHeaderOnly(makeHeader(file, "untracked, omitted: maxFiles"))
             truncated = true
             continue
@@ -221,6 +262,7 @@ export const buildPayload = ({
             pushHeaderOnly(
                 makeHeader(file, `untracked, binary, ${buf.length}B, omitted`)
             )
+            emittedPaths.add(file)
             continue
         }
         const text = buf.toString("utf8")
@@ -231,7 +273,59 @@ export const buildPayload = ({
         if (t) truncated = true
         pushBlock(
             makeHeader(file, t ? "untracked, truncated" : "untracked"),
-            truncatedText
+            truncatedText,
+            file
+        )
+    }
+
+    // Standalone prior-finding files: a previous round flagged something in
+    // these paths but the user has not touched them this round (so they are
+    // not in modified/untracked/deleted/renamed). Force-include their current
+    // full content so Codex can verify-or-re-flag. These bypass ignorePaths
+    // and maxFiles by construction (isPrior short-circuits both checks).
+    for (const file of priorFindingPaths) {
+        if (emittedPaths.has(file)) continue
+        const abs = path.join(repoRoot, file)
+        const buf = readBytesOrNull(readFile, abs)
+        if (buf === null) {
+            // File is gone — the deletion is already implicit; emit a marker
+            // so Codex sees it and the prompt records the state.
+            pushHeaderOnly(makeHeader(file, "prior-finding, deleted on disk"))
+            filesMeta.priorFindingContext.push({ path: file, missing: true })
+            emittedPaths.add(file)
+            continue
+        }
+        const binary = isBinary(buf)
+        filesMeta.priorFindingContext.push({
+            path: file,
+            missing: false,
+            binary,
+        })
+        if (binary) {
+            pushHeaderOnly(
+                makeHeader(
+                    file,
+                    `prior-finding, binary, ${buf.length}B, omitted`
+                )
+            )
+            emittedPaths.add(file)
+            continue
+        }
+        const text = buf.toString("utf8")
+        const { text: truncatedText, truncated: t } = truncateText(
+            text,
+            limits.maxFileBytes
+        )
+        if (t) truncated = true
+        pushBlock(
+            makeHeader(
+                file,
+                t
+                    ? "prior-finding, full content, truncated"
+                    : "prior-finding, full content"
+            ),
+            truncatedText,
+            file
         )
     }
 
@@ -240,26 +334,49 @@ export const buildPayload = ({
     // Buffer.byteLength(promptText) === totalBytes holds.
     const promptText = blocks.join("")
 
+    const promptHash = sha256Hex(promptText)
+
+    // progressHash: incorporates the FULL on-disk content of every prior-
+    // finding file (regardless of any prompt truncation), so an edit past
+    // maxFileBytes still flips the hash and the no-progress check sees
+    // forward motion. Sort by path for stability.
+    const sortedPriorPaths = [...priorFindingPaths].sort()
+    const priorContentParts = sortedPriorPaths.map((p) => {
+        const buf = readBytesOrNull(readFile, path.join(repoRoot, p))
+        const h = buf === null ? "MISSING" : sha256Hex(buf)
+        return `${p}:${h}`
+    })
+    const progressHash = sha256Hex(
+        `${promptHash}|${priorContentParts.join("\n")}`
+    )
+
     return {
         headSha,
         files: filesMeta,
         totalBytes,
         truncated,
         promptText,
+        promptHash,
+        progressHash,
+        priorFindingPaths: sortedPriorPaths,
         empty: blocks.length === 0,
         nonBinaryFileCount:
             filesMeta.modified.length +
             filesMeta.renamed.length +
             filesMeta.deleted.length +
-            filesMeta.untracked.filter((u) => !u.binary).length,
+            filesMeta.untracked.filter((u) => !u.binary).length +
+            filesMeta.priorFindingContext.filter((p) => !p.missing && !p.binary)
+                .length,
     }
 }
 
 export const __defaults__ = { defaultGit }
 export const __test__ = {
     parseNameStatusZ,
-    filterIgnored,
     matchesAny,
+    filterIgnored,
     isBinary,
     truncateText,
+    sha256Hex,
+    collectPriorFindingPaths,
 }
