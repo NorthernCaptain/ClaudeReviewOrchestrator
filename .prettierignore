@@ -1,0 +1,7 @@
+**/.git
+**/.svn
+**/.hg
+**/*.yml
+**/node_modules
+reviews
+coverage

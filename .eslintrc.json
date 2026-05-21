@@ -1,0 +1,62 @@
+{
+    "root": true,
+    "env": {
+        "node": true,
+        "commonjs": true,
+        "browser": true,
+        "es2022": true
+    },
+    "settings": {
+    },
+    "extends": [
+        "eslint:recommended",
+        "plugin:node/recommended",
+        "plugin:@typescript-eslint/recommended"
+    ],
+    "globals": {
+        "Atomics": "readonly",
+        "SharedArrayBuffer": "readonly"
+    },
+    "parser": "@typescript-eslint/parser",
+    "parserOptions": {
+        "requireConfigFile": false,
+        "sourceType": "commonjs"
+    },
+    "plugins": [
+        "prettier",
+        "@typescript-eslint",
+        "unused-imports",
+        "node"
+    ],
+    "rules": {
+        "prettier/prettier": "error",
+        "linebreak-style": ["warn", "unix"],
+        "no-warning-comments": "warn",
+        "no-console": "off",
+        "no-case-declarations": "warn",
+        "eqeqeq": "warn",
+        "no-unused-vars": "off",
+        "node/no-unpublished-require": "warn",
+        "@typescript-eslint/no-var-requires": "off",
+        "@typescript-eslint/no-unused-vars": "off",
+        "unused-imports/no-unused-imports": "error",
+        "unused-imports/no-unused-vars": [
+            "warn",
+            {
+                "vars": "all",
+                "varsIgnorePattern": "^_",
+                "args": "after-used",
+                "argsIgnorePattern": "^_"
+            }
+        ]
+    },
+    "ignorePatterns": [
+        "*.test.ts",
+        "*.test.js",
+        "dist/*",
+        "*.config.js",
+        "src/generated/*",
+        "node_modules/*",
+        "reviews/*"
+    ]
+}
