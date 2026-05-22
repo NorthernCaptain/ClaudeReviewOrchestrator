@@ -15,6 +15,7 @@ import { mountReviewRoute } from "./review.js"
 import { mountResetRoute } from "./reset.js"
 import { mountMcpRoute } from "./mcp.js"
 import { mountStatusRoute } from "./status.js"
+import { mountDashboardRoute } from "./dashboard.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { logger } from "./logger.js"
@@ -85,6 +86,18 @@ export const createApp = ({
 
     app.get("/healthz", (_req, res) => {
         res.json({ ok: true })
+    })
+
+    // GET / — public dashboard. Mounted BEFORE the auth middleware so
+    // it's reachable without the x-review-token. Safe because the
+    // server binds 127.0.0.1 by default — the trust boundary is the
+    // network bind, not an HTTP secret.
+    mountDashboardRoute(app, {
+        archive,
+        config,
+        summarize: summarizeStartup,
+        version: VERSION,
+        startedAt,
     })
 
     app.use(authMiddleware({ token: config.authToken }))

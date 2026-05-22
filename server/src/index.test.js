@@ -637,3 +637,33 @@ describe("/status surfaces the version", () => {
         }
     })
 })
+
+describe("GET / dashboard route", () => {
+    test("is reachable WITHOUT x-review-token (localhost-only trust boundary)", async () => {
+        const { url, close } = await start(minimalConfig(), happyDeps)
+        try {
+            const r = await fetch(`${url}/`)
+            expect(r.status).toBe(200)
+            expect(r.headers.get("content-type")).toMatch(/text\/html/)
+            const body = await r.text()
+            expect(body).toMatch(/^<!doctype html>/)
+            expect(body).toContain(VERSION)
+            expect(body).toContain("review-orchestrator")
+        } finally {
+            await close()
+        }
+    })
+
+    test("does not leak the auth token into the rendered HTML", async () => {
+        const { url, close } = await start(minimalConfig(), happyDeps)
+        try {
+            const r = await fetch(`${url}/`)
+            const body = await r.text()
+            // Whatever the auth token is in config, it must not appear
+            // in the public dashboard.
+            expect(body).not.toContain("secret")
+        } finally {
+            await close()
+        }
+    })
+})

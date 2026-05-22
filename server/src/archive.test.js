@@ -731,3 +731,131 @@ describe("createArchive.list", () => {
         expect(all[0].name).toMatch(/\.json$/)
     })
 })
+
+describe("createArchive.readRecent", () => {
+    let tmp
+    beforeEach(() => {
+        tmp = mkdtempSync(path.join(tmpdir(), "rev-recent-"))
+    })
+    afterEach(() => {
+        rmSync(tmp, { recursive: true, force: true })
+    })
+
+    // We tick the injected clock between writes so each gets a unique
+    // archive filename (write() uses `now()` for the basename).
+    let clock = 0
+    const tickArchive = (start = 1779000000000) => {
+        clock = start
+        return createArchive({
+            reviewsDir: tmp,
+            now: () => {
+                const t = clock
+                clock += 1000
+                return t
+            },
+        })
+    }
+
+    const writeOne = (archive, ts, repo, branch, status, findings = []) =>
+        archive.write({
+            context: { repo, branch },
+            payload: {
+                headSha: "abc",
+                files: {
+                    modified: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
+                totalBytes: 0,
+                truncated: false,
+                promptHash: "p",
+                progressHash: "g",
+            },
+            codexRaw: {
+                argv: ["codex", "exec"],
+                model: "gpt-5.5",
+                provider: "codex",
+                durationMs: 1234,
+                exitCode: status === "ESCALATE" ? 1 : 0,
+                rawStdout: "",
+                rawStderr: status === "ESCALATE" ? "boom" : "",
+            },
+            result: {
+                status,
+                findings,
+                blockingFindings: findings.filter((f) =>
+                    ["blocker", "major"].includes(f.severity)
+                ),
+                droppedFindings: [],
+                reason: status === "ESCALATE" ? "test boom" : undefined,
+            },
+            state: { codexRounds: 1, blockCount: 0 },
+            round: 1,
+            blockCount: 0,
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: ts,
+        })
+
+    test("returns newest-first across multiple context folders", () => {
+        const archive = tickArchive()
+        writeOne(archive, 0, "a", "main", "GOOD_TO_GO")
+        writeOne(archive, 0, "b", "feature", "ISSUES", [
+            {
+                file: "x.js",
+                line: 1,
+                severity: "blocker",
+                category: "bug",
+                message: "y",
+            },
+        ])
+        writeOne(archive, 0, "a", "main", "ESCALATE")
+        const recent = archive.readRecent({ limit: 10 })
+        expect(recent).toHaveLength(3)
+        expect(recent[0].status).toBe("ESCALATE")
+        expect(recent[1].status).toBe("ISSUES")
+        expect(recent[2].status).toBe("GOOD_TO_GO")
+        // Cross-context order honored by mtime, not directory traversal.
+        expect(recent[1].context).toBe("b:feature")
+    })
+
+    test("respects the limit", () => {
+        const archive = tickArchive()
+        for (let i = 0; i < 5; i += 1) {
+            writeOne(archive, 0, "r", "main", "GOOD_TO_GO")
+        }
+        expect(archive.readRecent({ limit: 2 })).toHaveLength(2)
+    })
+
+    test("populates failureDetail only for ESCALATE records", () => {
+        const archive = tickArchive()
+        writeOne(archive, 0, "a", "main", "GOOD_TO_GO")
+        writeOne(archive, 0, "a", "main", "ESCALATE")
+        const recent = archive.readRecent({ limit: 10 })
+        expect(recent).toHaveLength(2)
+        expect(recent[0].status).toBe("ESCALATE")
+        expect(recent[0].failureDetail).not.toBeNull()
+        expect(recent[0].failureDetail.exitCode).toBe(1)
+        expect(recent[1].failureDetail).toBeNull()
+    })
+
+    test("returns [] when reviewsDir doesn't exist", () => {
+        const archive = createArchive({
+            reviewsDir: path.join(tmp, "missing"),
+        })
+        expect(archive.readRecent({ limit: 10 })).toEqual([])
+    })
+
+    test("skips unreadable / malformed JSON files silently", () => {
+        const archive = tickArchive()
+        writeOne(archive, 0, "a", "main", "GOOD_TO_GO")
+        // Drop a malformed sibling so the scan has to skip it.
+        const ctxDir = path.join(tmp, "a:main")
+        writeFileSync(path.join(ctxDir, "2026-99-99T99-99-99-999Z.json"), "{")
+        const recent = archive.readRecent({ limit: 10 })
+        // The valid record still surfaces.
+        expect(recent.some((r) => r.status === "GOOD_TO_GO")).toBe(true)
+    })
+})

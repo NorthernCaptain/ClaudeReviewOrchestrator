@@ -6,6 +6,7 @@
 import {
     mkdirSync,
     readdirSync,
+    readFileSync,
     renameSync,
     statSync,
     unlinkSync,
@@ -377,10 +378,76 @@ export const createArchive = ({
         return out
     }
 
+    // Powers the dashboard at GET /. Lists every archived record across
+    // all contexts, sorts newest-first by file mtime, reads up to
+    // `limit` records, and normalizes each into the minimal shape the
+    // dashboard renderer needs. Files that fail to read / parse are
+    // skipped silently so a single bad file can't break the dashboard.
+    const readRecent = ({ limit = 200 } = {}) => {
+        const all = list()
+            .slice()
+            .sort((a, b) => b.mtimeMs - a.mtimeMs)
+            .slice(0, Math.max(0, limit))
+        const out = []
+        for (const entry of all) {
+            const filePath = path.join(reviewsDir, entry.context, entry.name)
+            let record
+            try {
+                record = JSON.parse(readFileSync(filePath, "utf8"))
+            } catch {
+                continue
+            }
+            const result = record.result ?? {}
+            const codex = record.codex ?? {}
+            const context = record.context ?? {}
+            const findings = Array.isArray(result.findings)
+                ? result.findings
+                : []
+            const blocking = Array.isArray(result.blockingFindings)
+                ? result.blockingFindings
+                : []
+            out.push({
+                ts: record.timestamp ?? null,
+                mtimeMs: entry.mtimeMs,
+                context: entry.context,
+                repo: context.repo ?? entry.context.split(":")[0] ?? null,
+                branch: context.branch ?? entry.context.split(":")[1] ?? null,
+                status: result.status ?? null,
+                durationMs: codex.durationMs ?? null,
+                findingsCount: findings.length,
+                blockingCount: blocking.length,
+                droppedCount: Array.isArray(result.droppedFindings)
+                    ? result.droppedFindings.length
+                    : 0,
+                reason: result.reason ?? null,
+                code: result.code ?? null,
+                provider: codex.provider ?? null,
+                model: codex.model ?? null,
+                round: record.round ?? null,
+                blockCount: record.blockCount ?? null,
+                trigger: record.trigger ?? null,
+                findings,
+                failureDetail:
+                    result.status === "ESCALATE"
+                        ? {
+                              exitCode: codex.exitCode ?? null,
+                              stderrTail: codex.rawStderrTail ?? "",
+                              stdoutTail: (codex.rawStdout ?? "").slice(-800),
+                              schemaError: result.schemaError ?? null,
+                              argv: codex.argv ?? null,
+                          }
+                        : null,
+                file: path.relative(reviewsDir, filePath),
+            })
+        }
+        return out
+    }
+
     return {
         write,
         pruneOnStartup,
         list,
+        readRecent,
         renderMarkdown: (r) => renderMarkdown(r, blockingSeverities),
     }
 }
