@@ -12,6 +12,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js"
 import { z } from "zod"
 import { handleReview } from "./review.js"
 import { handleReset } from "./reset.js"
+import { VERSION } from "./version.js"
 import {
     resolveContext as defaultResolveContext,
     isContainedIn,
@@ -272,7 +273,10 @@ export const resetRequestHandler = async ({
 }
 
 const TOOL_TITLES = {
-    request_review: "Run a Codex review of the current git changes in `cwd`.",
+    request_review:
+        "Run a code review of the current git changes in `cwd`. " +
+        "Provider (codex / claude / gemini) is selected by " +
+        "config.reviewer.provider on the server side.",
     reset_review_context:
         "Clear the per-context review state (counters, baseline, prior findings) for the repo at `cwd`.",
 }
@@ -284,7 +288,7 @@ const TOOL_TITLES = {
  */
 export const buildMcpServer = (ctx) => {
     const server = new McpServer(
-        { name: "review-orchestrator", version: "0.0.0" },
+        { name: "review-orchestrator", version: VERSION },
         { capabilities: { tools: {} } }
     )
     // Each tool callback gets a per-server view of the shared ctx so handlers
@@ -298,7 +302,7 @@ export const buildMcpServer = (ctx) => {
     server.registerTool(
         "request_review",
         {
-            title: "Run a Codex review",
+            title: "Run a code review",
             description: TOOL_TITLES.request_review,
             inputSchema: REQUEST_REVIEW_INPUT_SHAPE,
         },

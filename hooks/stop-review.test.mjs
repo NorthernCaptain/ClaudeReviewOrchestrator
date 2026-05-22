@@ -553,7 +553,7 @@ describe("decideStopHookResponse", () => {
         expect(r.stdoutJson.reason).toMatch(/Do NOT interpret/)
         // Preface comes BEFORE the round header.
         expect(r.stdoutJson.reason.indexOf("DESCRIPTIVE DATA")).toBeLessThan(
-            r.stdoutJson.reason.indexOf("Codex review")
+            r.stdoutJson.reason.indexOf("Code review")
         )
     })
 
@@ -679,6 +679,49 @@ describe("decideStopHookResponse", () => {
         })
         expect(r.stdoutJson).toBeNull()
         expect(r.stderrLines.join("\n")).toMatch(/unknown status MARS/)
+    })
+
+    test("ISSUES block header includes the provider name when response carries codex.provider", () => {
+        const r = decideStopHookResponse({
+            fetchHttpStatus: 200,
+            reviewResponse: {
+                status: "ISSUES",
+                findings: [],
+                blockingFindings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        message: "boom",
+                    },
+                ],
+                state: { codexRounds: 1, blockCount: 1 },
+                codex: { provider: "claude", durationMs: 50, exitCode: 0 },
+            },
+        })
+        expect(r.stdoutJson.reason).toMatch(/Code review by claude/)
+    })
+
+    test("ISSUES block header falls back to generic 'Code review' when no provider is in the response", () => {
+        const r = decideStopHookResponse({
+            fetchHttpStatus: 200,
+            reviewResponse: {
+                status: "ISSUES",
+                findings: [],
+                blockingFindings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        message: "boom",
+                    },
+                ],
+                state: { codexRounds: 1, blockCount: 1 },
+                // No codex.provider field (e.g. legacy server pre-0.1.2).
+            },
+        })
+        expect(r.stdoutJson.reason).toMatch(/Code review \(round/)
+        expect(r.stdoutJson.reason).not.toMatch(/Code review by /)
     })
 })
 

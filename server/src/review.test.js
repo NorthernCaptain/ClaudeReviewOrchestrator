@@ -1544,7 +1544,7 @@ describe("handleReview — pipeline log emissions", () => {
         })
         expect(runSpy).not.toHaveBeenCalled()
         const warnMsgs = messagesFor(logger.warn)
-        expect(warnMsgs).toContain("EMPTY_PAYLOAD — skipping codex")
+        expect(warnMsgs).toContain("EMPTY_PAYLOAD — skipping reviewer")
     })
 
     test("dispatches via pickReviewer; log records the provider", async () => {
@@ -1592,6 +1592,47 @@ describe("handleReview — pipeline log emissions", () => {
             (c) => c[1] === "spawning reviewer"
         )
         expect(spawnCall?.[0].provider).toBe("claude")
+    })
+
+    test("/review response body's codex sub-object carries provider so the hook can render a provider-aware header", async () => {
+        // Confirm the contract that hooks/stop-review.mjs depends on:
+        // response.codex.provider names the reviewer that actually ran.
+        const adapterRun = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: {
+                exitCode: 0,
+                durationMs: 5,
+                rawStdout: "{}",
+                rawStderr: "",
+            },
+        }))
+        const pickReviewer = jest.fn(() => ({
+            name: "gemini",
+            binary: "gemini",
+            runAndParse: adapterRun,
+            buildArgs: () => ["-p"],
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "manual" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                pickReviewer,
+                runAndParse: undefined,
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+            }),
+        })
+        expect(r.body.codex.provider).toBe("gemini")
     })
 })
 

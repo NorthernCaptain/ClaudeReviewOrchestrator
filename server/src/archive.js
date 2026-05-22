@@ -17,7 +17,7 @@ const RAW_STDERR_TAIL_BYTES = 4096
 
 // Filesystem-safe filename for a UTC ISO-8601 instant.
 // 2026-05-21T14:30:45.123Z → 2026-05-21T14-30-45-123Z.
-// Milliseconds are preserved deliberately so two Codex rounds in the same
+// Milliseconds are preserved deliberately so two reviewer rounds in the same
 // second do not collide on the same filename.
 export const tsForFilename = (epochMs) => {
     const iso = new Date(epochMs).toISOString()
@@ -98,7 +98,14 @@ const renderMarkdown = (record, blockingSeverities) => {
             typeof codex.durationMs === "number"
                 ? ` (${(codex.durationMs / 1000).toFixed(1)}s)`
                 : ""
-        out.push(`- **Model:** ${codex.model}${dur}`)
+        // `codex` is the archive blob's name for the raw reviewer
+        // record (kept for back-compat); `provider` inside it is the
+        // actual reviewer that ran. Fall back to the legacy label
+        // when reviewing a pre-multi-provider archive.
+        const providerLabel = codex.provider
+            ? `${codex.provider} (${codex.model})`
+            : codex.model
+        out.push(`- **Reviewer:** ${providerLabel}${dur}`)
     }
     if (typeof baseline.totalBytes === "number") {
         out.push(
@@ -139,7 +146,7 @@ const renderMarkdown = (record, blockingSeverities) => {
 
     if (priorFed.length > 0) {
         out.push("---")
-        out.push(`## Prior findings fed to Codex this round`)
+        out.push(`## Prior findings fed to the reviewer this round`)
         for (const f of priorFed) {
             out.push(
                 `- \`${f.file ?? "(unknown)"}:${f.line ?? 0}\` — ${(f.message ?? "").trim()}`
@@ -187,6 +194,11 @@ const buildRecord = ({
     codex: codexRaw
         ? {
               binary: (codexRaw.argv ?? [])[0] ?? null,
+              // `provider` is the actual reviewer that ran (codex,
+              // claude, gemini). The archive blob's outer field stays
+              // named "codex" for back-compat with archived records
+              // from before the multi-provider switch.
+              provider: codexRaw.provider ?? null,
               model: codexRaw.model ?? null,
               argv: codexRaw.argv ?? null,
               durationMs: codexRaw.durationMs ?? null,

@@ -302,7 +302,13 @@ const formatRoundHeader = (envelope) => {
     const state = envelope?.state ?? {}
     const rounds = state.codexRounds ?? "?"
     const blocks = state.blockCount ?? "?"
-    return `Codex review (round ${rounds}, block ${blocks})`
+    // The /review response embeds the actual provider that just ran in
+    // `body.codex.provider` (new in 0.1.2). Use it for the header when
+    // present; fall back to the generic "Code review" wording for
+    // older responses or when the provider field is missing.
+    const provider = envelope?.codex?.provider
+    const label = provider ? `Code review by ${provider}` : "Code review"
+    return `${label} (round ${rounds}, block ${blocks})`
 }
 
 // Decide what the hook should emit based on the /review response (or an
@@ -552,7 +558,7 @@ export const main = async ({
     const effectiveTimeoutMs =
         timeoutMs ?? config.fetchTimeoutMs ?? DEFAULT_TIMEOUT_MS
 
-    stderr.write("review-orchestrator: reviewing changes with Codex…\n")
+    stderr.write("review-orchestrator: reviewing changes…\n")
 
     const requestBody = { cwd, session_id, trigger: "stop_hook" }
     const controller = new AbortController()

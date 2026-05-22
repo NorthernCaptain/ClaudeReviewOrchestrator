@@ -160,7 +160,7 @@ describe("renderMarkdown", () => {
         expect(md).toMatch(/\*\*Status:\*\* ISSUES/)
         expect(md).toMatch(/\*\*Trigger:\*\* stop_hook/)
         expect(md).toMatch(/\*\*HEAD:\*\* abc1234/)
-        expect(md).toMatch(/\*\*Model:\*\* gpt-5-codex \(1\.2s\)/)
+        expect(md).toMatch(/\*\*Reviewer:\*\* gpt-5-codex \(1\.2s\)/)
         expect(md).toMatch(/## Blockers \(blocking\)/)
         expect(md).toMatch(/`a\.js:42` — boom/)
         expect(md).toMatch(/Suggestion:\* fix it/)
@@ -267,7 +267,7 @@ describe("renderMarkdown", () => {
             timestampMs: Date.parse("2026-05-21T14:30:45Z"),
         })
         const md = renderMarkdown(record, ["blocker", "major"])
-        expect(md).toMatch(/## Prior findings fed to Codex this round/)
+        expect(md).toMatch(/## Prior findings fed to the reviewer this round/)
         expect(md).toMatch(/`a\.js:5` — first round/)
     })
 
@@ -381,11 +381,11 @@ describe("renderMarkdown — edges", () => {
         }
         const md = renderMarkdown(record, ["blocker", "major"])
         expect(md).not.toMatch(/\*\*HEAD:/)
-        expect(md).not.toMatch(/\*\*Model:/)
+        expect(md).not.toMatch(/\*\*Reviewer:/)
         expect(md).not.toMatch(/\*\*Payload:/)
     })
 
-    test("renders codex Model bullet without duration when durationMs missing", () => {
+    test("renders reviewer bullet without duration when durationMs missing", () => {
         const record = buildRecord({
             context: happyContext,
             payload: happyPayload,
@@ -402,7 +402,31 @@ describe("renderMarkdown — edges", () => {
             timestampMs: Date.parse("2026-05-21T14:30:45Z"),
         })
         const md = renderMarkdown(record, ["blocker", "major"])
-        expect(md).toMatch(/\*\*Model:\*\* gpt-5-codex(?!\s*\()/)
+        expect(md).toMatch(/\*\*Reviewer:\*\* gpt-5-codex(?!\s*\()/)
+    })
+
+    test("renders the reviewer bullet with provider + model when archive has provider field", () => {
+        // After 0.1.2 the archive's `codex` blob carries `provider`
+        // alongside the model. The markdown should show "claude
+        // (claude-opus-4-7)" not just "claude-opus-4-7".
+        const record = buildRecord({
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: {
+                ...happyCodexRaw,
+                provider: "claude",
+                model: "claude-opus-4-7",
+            },
+            result: { status: "GOOD_TO_GO", findings: [] },
+            state: { codexRounds: 1, blockCount: 0 },
+            round: 1,
+            blockCount: 0,
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+        })
+        const md = renderMarkdown(record, ["blocker", "major"])
+        expect(md).toMatch(/\*\*Reviewer:\*\* claude \(claude-opus-4-7\)/)
     })
 
     test("handles a finding with no suggestion gracefully", () => {

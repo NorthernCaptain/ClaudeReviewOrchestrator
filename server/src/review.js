@@ -9,10 +9,10 @@ import { buildPayload, sanitizeFindingPath } from "./diff.js"
 import { pickReviewer, providerCfg, wrapPrompt } from "./reviewer.js"
 import { loadProjectConfig, mergeWithGlobal } from "./project-config.js"
 
-// Tail a string buffer for log lines — codex stderr is the gold for
-// debugging Codex auth/quota/network failures and we want it in the
-// pipeline log without overflowing it. 800 bytes is enough for the
-// "ERROR: ..." line + a bit of surrounding context.
+// Tail a string buffer for log lines — the reviewer's stderr is the
+// gold for debugging auth/quota/network failures and we want it in
+// the pipeline log without overflowing it. 800 bytes is enough for
+// the "ERROR: ..." line + a bit of surrounding context.
 const tailBytes = (s, n = 800) => {
     if (typeof s !== "string") return ""
     if (s.length <= n) return s
@@ -178,9 +178,15 @@ const baselineSummary = (payload, reviewConfigHash = null) => ({
     truncated: payload.truncated,
 })
 
-const codexSummary = (codexResult) => {
+// Compact reviewer summary embedded in the /review response body.
+// Field stays named "codex" in the envelope for back-compat with
+// existing hook + MCP clients; the `provider` sub-field is the new
+// way for callers to render provider-aware messages (e.g. the Stop
+// hook's block-reason header).
+const codexSummary = (codexResult, providerName = null) => {
     const raw = codexResult.raw ?? {}
     return {
+        provider: providerName,
         durationMs: raw.durationMs,
         exitCode: raw.exitCode,
         timedOut: raw.timedOut,
@@ -423,7 +429,7 @@ export const handleReview = async ({
                     empty: payload.empty,
                     nonBinaryFileCount: payload.nonBinaryFileCount,
                 },
-                "EMPTY_PAYLOAD — skipping codex"
+                "EMPTY_PAYLOAD — skipping reviewer"
             )
             return {
                 httpStatus: 200,
@@ -529,7 +535,9 @@ export const handleReview = async ({
                     body: envelope("ESCALATE", {
                         reason:
                             state.lastEscalateReason ??
-                            "previous codex run failed and the on-disk state has not changed",
+                            "previous reviewer run failed and the on-disk state has not changed",
+                        // code stays CODEX_ERROR_CACHED for back-compat
+                        // with hook + MCP clients that key on this symbol.
                         code: "CODEX_ERROR_CACHED",
                         context: contextSummary(context),
                         baseline: baselineSummary(payload, reviewConfigHash),
@@ -539,21 +547,24 @@ export const handleReview = async ({
             }
         }
 
-        // Cap check on Codex rounds before spawning. The counter increments
-        // before the spawn so a misbehaving codex can't burn extra rounds via
-        // retries.
+        // Cap check on reviewer rounds before spawning. The counter
+        // increments before the spawn so a misbehaving reviewer can't
+        // burn extra rounds via retries. (Internal state/config field
+        // names keep the historic "codex" prefix for back-compat.)
         if (state.codexRounds >= config.limits.maxCodexRounds) {
             log.warn(
                 {
-                    codexRounds: state.codexRounds,
+                    rounds: state.codexRounds,
                     cap: config.limits.maxCodexRounds,
                 },
-                "MAX_CODEX_ROUNDS — refusing to spawn"
+                "reviewer round cap reached — refusing to spawn"
             )
             return {
                 httpStatus: 200,
                 body: envelope("ESCALATE", {
-                    reason: `codex round cap (${config.limits.maxCodexRounds}) reached for this context`,
+                    reason: `reviewer round cap (${config.limits.maxCodexRounds}) reached for this context`,
+                    // code stays MAX_CODEX_ROUNDS for back-compat with
+                    // hook + MCP clients that key on this symbol.
                     code: "MAX_CODEX_ROUNDS",
                     context: contextSummary(context),
                     state: stateSummary(state),
@@ -753,10 +764,12 @@ export const handleReview = async ({
                 httpStatus: 200,
                 body: envelope("ESCALATE", {
                     reason: codexResult.reason,
+                    // code stays CODEX_ERROR for back-compat with hook
+                    // + MCP clients that key on this symbol.
                     code: "CODEX_ERROR",
                     context: contextSummary(context),
                     baseline: baselineSummary(payload, reviewConfigHash),
-                    codex: codexSummary(codexResult),
+                    codex: codexSummary(codexResult, providerName),
                     state: stateSummary(nextState),
                 }),
             }
@@ -863,7 +876,7 @@ export const handleReview = async ({
                 droppedFindings: dropped,
                 context: contextSummary(context),
                 baseline: baselineSummary(payload, reviewConfigHash),
-                codex: codexSummary(codexResult),
+                codex: codexSummary(codexResult, providerName),
                 state: stateSummary(saved),
             },
         }
