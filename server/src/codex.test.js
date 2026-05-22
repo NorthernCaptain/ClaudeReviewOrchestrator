@@ -22,6 +22,7 @@ const baseConfig = () => ({
     codex: {
         binary: "codex",
         model: "gpt-5-codex",
+        reasoningEffort: "high",
         ignoreProjectRules: true,
         extraArgs: [],
     },
@@ -194,9 +195,41 @@ describe("buildCodexArgs", () => {
             "gpt-5-codex",
             "--output-schema",
             "/sch.json",
+            "-c",
+            "model_reasoning_effort=high",
             "--ignore-rules",
             "-",
         ])
+    })
+    test("passes the configured reasoning effort verbatim through -c", () => {
+        const cfg = baseConfig()
+        cfg.codex.reasoningEffort = "medium"
+        const args = buildCodexArgs({
+            repoRoot: "/r",
+            config: cfg,
+            schemaPath: "/s",
+        })
+        const idx = args.indexOf("-c")
+        expect(idx).toBeGreaterThan(0)
+        expect(args[idx + 1]).toBe("model_reasoning_effort=medium")
+    })
+    test("skips the -c flag when reasoningEffort is missing or unknown", () => {
+        const cfg = baseConfig()
+        delete cfg.codex.reasoningEffort
+        const a1 = buildCodexArgs({
+            repoRoot: "/r",
+            config: cfg,
+            schemaPath: "/s",
+        })
+        expect(a1).not.toContain("-c")
+
+        cfg.codex.reasoningEffort = "WAT"
+        const a2 = buildCodexArgs({
+            repoRoot: "/r",
+            config: cfg,
+            schemaPath: "/s",
+        })
+        expect(a2).not.toContain("-c")
     })
     test("omits --ignore-rules when ignoreProjectRules is false", () => {
         const cfg = baseConfig()

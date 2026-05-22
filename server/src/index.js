@@ -3,8 +3,25 @@
  * Author: Leo Khramov
  */
 
+import { readFileSync } from "node:fs"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
 import express from "express"
 import { loadConfig, defaultConfigPath } from "./config.js"
+
+// Read the package version once at module load. `npm version` and any
+// manual edit of package.json reflects on the next server restart. This
+// is the single source of truth for the version logged at startup and
+// returned by /status.
+const here = path.dirname(fileURLToPath(import.meta.url))
+const pkgPath = path.join(here, "..", "..", "package.json")
+export const VERSION = (() => {
+    try {
+        return JSON.parse(readFileSync(pkgPath, "utf8")).version ?? "unknown"
+    } catch {
+        return "unknown"
+    }
+})()
 import { authMiddleware } from "./auth.js"
 import { mountReviewRoute } from "./review.js"
 import { mountResetRoute } from "./reset.js"
@@ -13,6 +30,52 @@ import { mountStatusRoute } from "./status.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { logger } from "./logger.js"
+import { createHttpAccessLog, createHttpErrorHandler } from "./http-log.js"
+
+// Build the structured "ready" log line emitted right after the server
+// starts accepting connections. Includes the version and the
+// non-sensitive subset of config the operator needs to verify the
+// daemon picked up the right knobs after a config change. Pure
+// function — exported for unit testing.
+export const summarizeStartup = (config, version = VERSION) => {
+    const provider = config?.reviewer?.provider ?? "codex"
+    const providerCfg =
+        provider === "claude"
+            ? config?.reviewer?.claude
+            : provider === "gemini"
+              ? config?.reviewer?.gemini
+              : config?.codex
+    const effortOrMode =
+        provider === "claude"
+            ? (providerCfg?.effort ?? null)
+            : provider === "gemini"
+              ? (providerCfg?.approvalMode ?? null)
+              : (providerCfg?.reasoningEffort ?? null)
+    const hookCfg = config?.hook?.fetchTimeoutSeconds
+    return {
+        version,
+        port: config?.port,
+        bind: config?.bind,
+        provider,
+        model: providerCfg?.model ?? null,
+        effortOrMode,
+        reviewerTimeoutSeconds:
+            providerCfg?.timeoutSeconds ??
+            config?.limits?.codexTimeoutSeconds ??
+            null,
+        hookFetchTimeoutSeconds:
+            // null in config → auto-derive in stop-review.mjs; surface
+            // that intent here rather than papering over it with a
+            // recomputed number that may drift if logic changes.
+            hookCfg === undefined ? null : hookCfg,
+        maxCodexRounds: config?.limits?.maxCodexRounds ?? null,
+        maxBlocks: config?.limits?.maxBlocks ?? null,
+        allowedRootsCount: Array.isArray(config?.allowedRoots)
+            ? config.allowedRoots.length
+            : 0,
+        blockingSeverities: config?.blockingSeverities ?? [],
+    }
+}
 
 export const createApp = ({
     config,
@@ -24,6 +87,12 @@ export const createApp = ({
 }) => {
     const app = express()
     app.disable("x-powered-by")
+
+    // Access log runs before body parsing so we see every incoming
+    // request including ones rejected by JSON parsing or auth. It logs
+    // on response finish/close so the line carries the final status and
+    // duration.
+    app.use(createHttpAccessLog({ logger: log }))
     app.use(express.json({ limit: "1mb" }))
 
     app.get("/healthz", (_req, res) => {
@@ -33,8 +102,28 @@ export const createApp = ({
     app.use(authMiddleware({ token: config.authToken }))
     mountReviewRoute(app, { config, store, archive, logger: log, deps })
     mountResetRoute(app, { config, store, deps })
-    mountMcpRoute(app, { config, store, archive, logger: log, deps })
-    mountStatusRoute(app, { config, store, archive, startedAt })
+    // Capture the MCP route's closeAllSessions so shutdown can drain
+    // long-poll GETs (otherwise server.close() never resolves).
+    const mcp = mountMcpRoute(app, {
+        config,
+        store,
+        archive,
+        logger: log,
+        deps,
+    })
+    app.locals.mcp = mcp
+    mountStatusRoute(app, {
+        config,
+        store,
+        archive,
+        startedAt,
+        version: VERSION,
+    })
+
+    // Last middleware: catches errors from next(err) / async route
+    // handlers. Logs with stack and returns a sanitized 500 to the
+    // caller — never leaks the stack over the wire.
+    app.use(createHttpErrorHandler({ logger: log }))
 
     return app
 }
@@ -58,6 +147,17 @@ export const startServer = ({
         })
         const server = app.listen(config.port, config.bind)
         let settled = false
+
+        // Track every accepted socket so a forced shutdown can destroy
+        // any that are still open (e.g. an MCP long-poll GET that's
+        // parked waiting for a server-initiated notification). Without
+        // this, server.close() waits indefinitely on draining and
+        // SIGINT looks like a hang to the operator.
+        const sockets = new Set()
+        server.on("connection", (socket) => {
+            sockets.add(socket)
+            socket.once("close", () => sockets.delete(socket))
+        })
 
         const settle = (result) => {
             if (settled) return
@@ -97,9 +197,186 @@ export const startServer = ({
                 { port: addr.port, bind: addr.address },
                 "review-orchestrator listening"
             )
-            settle({ ok: true, server, address: addr })
+            // Followed immediately by a structured config summary so
+            // the operator can verify the daemon picked up the right
+            // version + provider + timeouts without curling /status.
+            log.info(summarizeStartup(config), "active config")
+            settle({ ok: true, server, address: addr, sockets, app })
         })
     })
+
+// Shut down the HTTP server cleanly. The contract:
+//   1. Stop accepting new connections (server.close()).
+//   2. Close MCP transports so SSE long-polls exit and stop pinning
+//      sockets (without this, close() hangs).
+//   3. Destroy any sockets that are still open after `socketDrainMs`.
+//   4. Hard-exit via process.exit after `forceExitMs` if close() still
+//      hasn't resolved (last-resort guard).
+//
+// Idempotent — calling twice is a no-op (in fact the second call is
+// what hard-exits, matching the conventional "Ctrl-C twice to force"
+// pattern).
+//
+// Returns a promise that resolves when server.close() completes (or
+// rejects when the timeout hard-exits the process).
+export const gracefulShutdown = ({
+    server,
+    sockets,
+    mcp,
+    logger: log = logger,
+    socketDrainMs = 1500,
+    forceExitMs = 5000,
+    exit = (code) => process.exit(code),
+    state = { stopping: false },
+}) => {
+    if (state.stopping) {
+        log.warn({}, "shutdown re-entered — forcing exit")
+        exit(1)
+        return Promise.resolve()
+    }
+    state.stopping = true
+
+    return new Promise((resolve, reject) => {
+        let resolved = false
+        const finish = (err) => {
+            if (resolved) return
+            resolved = true
+            clearTimeout(drainTimer)
+            clearTimeout(forceTimer)
+            if (err) reject(err)
+            else resolve()
+        }
+
+        // Track whether each side has settled so we resolve only after
+        // both complete. Declared before either branch starts so the
+        // server.close callback can read mcpSettled without TDZ issues.
+        let serverCloseSettled = false
+        let serverCloseErr = null
+        let mcpSettled = false
+        const maybeFinish = () => {
+            if (serverCloseSettled && mcpSettled) finish(serverCloseErr)
+        }
+
+        // Stop accepting new connections IMMEDIATELY. server.close()
+        // returns synchronously; the callback fires only when every
+        // open connection has closed. We don't await it before kicking
+        // off MCP cleanup — both phases run concurrently so a new GET
+        // /mcp can't sneak in during the MCP-shutdown window.
+        try {
+            server.close((err) => {
+                serverCloseSettled = true
+                serverCloseErr = err ?? null
+                if (err) {
+                    log.error({ err: err.message }, "server.close errored")
+                }
+                maybeFinish()
+            })
+        } catch (err) {
+            finish(err)
+            return
+        }
+
+        // Run MCP shutdown concurrently. It releases the SSE long-poll
+        // sockets that pin server.close, so without it close would
+        // hang forever.
+        const mcpClose = mcp?.closeAllSessions
+            ? Promise.resolve()
+                  .then(() => mcp.closeAllSessions())
+                  .catch(() => null)
+            : Promise.resolve()
+        mcpClose.finally(() => {
+            mcpSettled = true
+            maybeFinish()
+        })
+
+        // Drain timer destroys lingering sockets after socketDrainMs.
+        // Counts from gracefulShutdown entry (i.e. from when we called
+        // server.close), which is the right reference point: server is
+        // already not accepting new, and any sockets still open are
+        // genuinely lingering.
+        const drainTimer = setTimeout(() => {
+            if (!sockets || sockets.size === 0) return
+            log.warn(
+                { lingering: sockets.size },
+                "destroying lingering sockets to complete shutdown"
+            )
+            for (const s of sockets) {
+                try {
+                    s.destroy()
+                } catch {
+                    // ignore
+                }
+            }
+        }, socketDrainMs).unref?.()
+
+        // Last-resort force exit — covers the whole shutdown.
+        const forceTimer = setTimeout(() => {
+            log.error(
+                { forceExitMs },
+                "shutdown timed out — forcing process.exit(1)"
+            )
+            exit(1)
+        }, forceExitMs).unref?.()
+    })
+}
+
+// Pre-flight check: when reviewer.provider is "gemini" we want to fail
+// loudly at startup rather than have every Stop hook ESCALATE in ~1s
+// with an opaque exit code. But we only fail if BOTH of the following
+// are true:
+//   1. GEMINI_API_KEY is missing/empty in env.
+//   2. The user's `~/.gemini/settings.json` says they're using the
+//      `gemini-api-key` auth method (so a missing key really is fatal).
+//      If selectedType is anything else (oauth-personal, vertex,
+//      workload-identity, …) we trust the gemini CLI's filesystem-
+//      cached credentials and let it run.
+//
+// Other providers handle their own auth gracefully (claude uses OAuth
+// keychain by default; codex uses CODEX_HOME credentials or its own
+// login flow), so no check is needed unless gemini is selected.
+//
+// Returns null when env is fine, or `{ message, hint }` describing the
+// problem. Pure function — `env`, `home`, and `read` injectable for
+// testability.
+export const checkReviewerEnv = (
+    config,
+    env = process.env,
+    { home = process.env.HOME ?? "", read = readFileSync } = {}
+) => {
+    const provider = config?.reviewer?.provider
+    if (provider !== "gemini") return null
+    const key = env?.GEMINI_API_KEY
+    if (typeof key === "string" && key.length > 0) return null
+
+    // No env key — see if the user has configured a non-api-key auth
+    // method. If we can't read the file (missing / unreadable / not
+    // JSON), assume the worst (api-key mode) and require the env var.
+    let selectedType = "gemini-api-key"
+    try {
+        const settingsPath = path.join(home, ".gemini", "settings.json")
+        const raw = read(settingsPath, "utf8")
+        const parsed = JSON.parse(raw)
+        const t = parsed?.security?.auth?.selectedType
+        if (typeof t === "string" && t.length > 0) selectedType = t
+    } catch {
+        // file missing / not JSON / not readable — fall through with
+        // the default "gemini-api-key" assumption.
+    }
+    if (selectedType !== "gemini-api-key") {
+        // OAuth or another non-key auth path is configured. The gemini
+        // CLI handles credential lookup itself; nothing for us to check.
+        return null
+    }
+    return {
+        message:
+            "reviewer.provider is 'gemini' and gemini auth is set to 'gemini-api-key', " +
+            "but GEMINI_API_KEY is not in env. Either set the env var in the shell " +
+            "that launches the server (or in the launchd plist's " +
+            "EnvironmentVariables), or run `gemini auth login` to switch to OAuth " +
+            "(which the orchestrator will then accept without an env var).",
+        hint: "GEMINI_API_KEY missing and gemini auth.selectedType is gemini-api-key",
+    }
+}
 
 /* istanbul ignore next -- process entry, exercised by smoke test only */
 const main = async () => {
@@ -111,6 +388,19 @@ const main = async () => {
         logger.error(
             { err: err.message, code: err.code, configPath },
             "failed to load config"
+        )
+        process.exitCode = 1
+        return
+    }
+
+    const envProblem = checkReviewerEnv(config)
+    if (envProblem) {
+        logger.error(
+            {
+                provider: config.reviewer?.provider,
+                hint: envProblem.hint,
+            },
+            envProblem.message
         )
         process.exitCode = 1
         return
@@ -138,13 +428,32 @@ const main = async () => {
         process.exitCode = 1
         return
     }
-    const { server } = result
+    const { server, sockets, app } = result
 
+    // One-shot graceful shutdown. The second SIGINT/SIGTERM hard-exits
+    // so a wedged close() never leaves the operator stuck — matches the
+    // "Ctrl-C twice to force" convention shells use.
+    const shutdownState = { stopping: false }
     const shutdown = (signal) => {
+        if (shutdownState.stopping) {
+            logger.warn({ signal }, "second signal received — forcing exit")
+            process.exit(1)
+            return
+        }
         logger.info({ signal }, "shutting down")
-        server.close(() => {
-            process.exitCode = 0
+        gracefulShutdown({
+            server,
+            sockets,
+            mcp: app.locals?.mcp,
+            logger,
+            state: shutdownState,
         })
+            .then(() => {
+                process.exitCode = 0
+            })
+            .catch(() => {
+                process.exitCode = 1
+            })
     }
     process.on("SIGINT", () => shutdown("SIGINT"))
     process.on("SIGTERM", () => shutdown("SIGTERM"))

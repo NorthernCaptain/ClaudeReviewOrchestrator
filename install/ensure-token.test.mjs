@@ -42,7 +42,15 @@ describe("ensureToken", () => {
         expect(cfg.authToken).toBe("GENERATED-TOKEN-AAA")
         // Defaults landed.
         expect(cfg.port).toBe(7777)
-        expect(cfg.codex.model).toBe("gpt-5-codex")
+        expect(cfg.codex.model).toBe("gpt-5.5")
+        expect(cfg.codex.reasoningEffort).toBe("high")
+        // Reviewer block ships with provider=codex (existing behavior) and
+        // Claude sub-config preloaded so flipping the provider needs no
+        // hand-edits beyond the one key.
+        expect(cfg.reviewer.provider).toBe("codex")
+        expect(cfg.reviewer.claude.model).toBe("claude-opus-4-7")
+        expect(cfg.reviewer.claude.effort).toBe("high")
+        expect(cfg.reviewer.claude.permissionMode).toBe("bypassPermissions")
     })
 
     test("seeds allowedRoots with HOME when defaults.allowedRoots is empty", () => {

@@ -34,9 +34,50 @@ const DEFAULTS = {
     allowedRoots: [],
     codex: {
         binary: "codex",
-        model: "gpt-5-codex",
+        // gpt-5.5 is the Codex CLI's default model name that's accepted by
+        // both ChatGPT-account auth and API-key auth. gpt-5-codex is API-
+        // key-only (the ChatGPT subscription rejects it with HTTP 400),
+        // so we default to gpt-5.5 to work for both auth modes.
+        model: "gpt-5.5",
+        reasoningEffort: "high",
         ignoreProjectRules: true,
         extraArgs: [],
+    },
+    // Reviewer provider selector. Default "codex" preserves existing
+    // behavior; users with a working Claude Code install can switch by
+    // setting reviewer.provider="claude" (or "gemini") without any
+    // other changes — both sub-configs ship pre-populated below.
+    reviewer: {
+        provider: "codex",
+        claude: {
+            binary: "claude",
+            model: "claude-opus-4-7",
+            effort: "high",
+            permissionMode: "bypassPermissions",
+            disallowedTools: [
+                "Bash",
+                "Edit",
+                "Write",
+                "NotebookEdit",
+                "WebFetch",
+                "WebSearch",
+                "Task",
+            ],
+            timeoutSeconds: 240,
+            extraArgs: [],
+        },
+        gemini: {
+            binary: "gemini",
+            // "auto" is the router alias — same as the CLI's interactive
+            // "Auto (Gemini 3)" picker, routing between gemini-3.1-pro
+            // and gemini-3-flash per task. Pin to a specific ID like
+            // "gemini-2.5-pro" if you want reproducible per-model
+            // behavior across machines.
+            model: "auto",
+            approvalMode: "plan",
+            timeoutSeconds: 240,
+            extraArgs: [],
+        },
     },
     limits: {
         maxCodexRounds: 5,
@@ -67,6 +108,9 @@ const DEFAULTS = {
     reviewsDir: "./reviews",
     reviewsRetentionDays: null,
     logging: { dir: "~/.claude/logs", level: "info" },
+    // Stop-hook tunables. fetchTimeoutSeconds=null means "auto-derive
+    // from the reviewer timeout + 60s buffer" — see stop-review.mjs.
+    hook: { fetchTimeoutSeconds: null },
 }
 
 const genToken = () => randomBytes(32).toString("base64url")

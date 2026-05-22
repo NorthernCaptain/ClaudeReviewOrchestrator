@@ -37,9 +37,91 @@ const ConfigSchema = z
         codex: z
             .object({
                 binary: z.string().default("codex"),
-                model: z.string().default("gpt-5-codex"),
+                model: z.string().default("gpt-5.5"),
+                // Maps to `-c model_reasoning_effort=<value>`. Explicit so
+                // review behavior doesn't drift with the user's interactive
+                // ~/.codex/config.toml. "high" is the orchestrator default
+                // because reviews are infrequent and worth the latency.
+                reasoningEffort: z
+                    .enum(["minimal", "low", "medium", "high"])
+                    .default("high"),
                 ignoreProjectRules: z.boolean().default(true),
                 extraArgs: z.array(z.string()).default([]),
+            })
+            .default({}),
+        // Reviewer provider selector. Defaults to "codex" for
+        // backwards-compatibility with installs predating this block;
+        // flip to "claude" or "gemini" to use the respective CLI
+        // adapter. Provider-specific knobs live under their own
+        // sub-keys.
+        reviewer: z
+            .object({
+                provider: z
+                    .enum(["codex", "claude", "gemini"])
+                    .default("codex"),
+                claude: z
+                    .object({
+                        binary: z.string().default("claude"),
+                        model: z.string().default("claude-opus-4-7"),
+                        // Maps to `--effort <level>` on the Claude CLI.
+                        effort: z
+                            .enum(["low", "medium", "high", "xhigh", "max"])
+                            .default("high"),
+                        // bypassPermissions paired with disallowedTools
+                        // is the only mode that returns a clean
+                        // assistant response in non-interactive `-p`
+                        // mode. The disallowed list below is the real
+                        // safety boundary.
+                        permissionMode: z
+                            .enum([
+                                "acceptEdits",
+                                "auto",
+                                "bypassPermissions",
+                                "default",
+                                "dontAsk",
+                                "plan",
+                            ])
+                            .default("bypassPermissions"),
+                        disallowedTools: z
+                            .array(z.string())
+                            .default([
+                                "Bash",
+                                "Edit",
+                                "Write",
+                                "NotebookEdit",
+                                "WebFetch",
+                                "WebSearch",
+                                "Task",
+                            ]),
+                        timeoutSeconds: z.number().int().min(1).default(240),
+                        extraArgs: z.array(z.string()).default([]),
+                    })
+                    .default({}),
+                gemini: z
+                    .object({
+                        binary: z.string().default("gemini"),
+                        // "auto" is the router alias — same mode the
+                        // CLI's interactive picker calls "Auto (Gemini
+                        // 3)". The router picks between gemini-3.1-pro
+                        // and gemini-3-flash per task. Pinning a
+                        // specific model (e.g. "gemini-2.5-pro") is
+                        // fine for reproducibility; the router is the
+                        // right default for quality + cost balance on
+                        // a mix of large and small diffs.
+                        model: z.string().default("auto"),
+                        // gemini CLI offers: default, auto_edit, yolo,
+                        // plan. We default to "plan" — it's the only
+                        // non-interactive mode that's also read-only,
+                        // which is exactly what a code reviewer needs.
+                        // "yolo" is available for users who want a fully
+                        // unsandboxed run.
+                        approvalMode: z
+                            .enum(["default", "auto_edit", "yolo", "plan"])
+                            .default("plan"),
+                        timeoutSeconds: z.number().int().min(1).default(240),
+                        extraArgs: z.array(z.string()).default([]),
+                    })
+                    .default({}),
             })
             .default({}),
         limits: z
@@ -67,6 +149,22 @@ const ConfigSchema = z
             .object({
                 dir: z.string().default("~/.claude/logs"),
                 level: z.string().default("info"),
+            })
+            .default({}),
+        // Stop-hook configuration. fetchTimeoutSeconds is the cap the
+        // hook applies to its POST /review call. When null (default),
+        // the hook auto-derives a value from the reviewer timeout plus
+        // a 60-second buffer — so bumping the reviewer timeout is the
+        // only edit needed in normal use. Override to a specific number
+        // to pin it independently of the reviewer.
+        hook: z
+            .object({
+                fetchTimeoutSeconds: z
+                    .number()
+                    .int()
+                    .min(1)
+                    .nullable()
+                    .default(null),
             })
             .default({}),
     })

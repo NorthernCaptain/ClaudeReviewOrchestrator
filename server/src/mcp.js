@@ -438,7 +438,31 @@ export const mountMcpRoute = (app, ctx) => {
     app.get("/mcp", handle)
     app.delete("/mcp", handle)
 
-    return { sessions }
+    // Closer for graceful shutdown. Walks every live session, calls
+    // transport.close() (which the SDK uses to end SSE long-polls and
+    // notify the client), and clears the map. Without this, GET /mcp
+    // long-poll connections keep the HTTP server alive forever and
+    // `server.close()` never resolves on SIGINT/SIGTERM.
+    const closeAllSessions = async () => {
+        const entries = Array.from(sessions.values())
+        sessions.clear()
+        await Promise.all(
+            entries.map(async ({ transport, server }) => {
+                try {
+                    await transport?.close?.()
+                } catch {
+                    // ignore — best-effort
+                }
+                try {
+                    await server?.close?.()
+                } catch {
+                    // ignore
+                }
+            })
+        )
+    }
+
+    return { sessions, closeAllSessions }
 }
 
 export const __test__ = {

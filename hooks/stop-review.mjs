@@ -12,7 +12,15 @@
 // 0 with an optional stderr summary. Failures are caught and surfaced as
 // exit 0 + a log line — the hook MUST never break the user's CLI session.
 
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs"
+import {
+    appendFileSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    renameSync,
+    unlinkSync,
+    writeFileSync,
+} from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 
@@ -20,9 +28,21 @@ const DEFAULT_CONFIG_PATH = () =>
     path.join(homedir(), ".config", "review-orchestrator", "config.json")
 const DEFAULT_LOG_FILE = () =>
     path.join(homedir(), ".claude", "logs", "review-hook.log")
+const DEFAULT_CALLS_DIR = () =>
+    path.join(homedir(), ".claude", "logs", "review-hook-calls")
+// How many per-call snapshot files to retain. New invocations prune the
+// oldest beyond this cap so the directory doesn't grow forever.
+const CALLS_RETAIN = 50
 const DEFAULT_PORT = 7777
 const DEFAULT_BIND = "127.0.0.1"
+// Fallback when no config value and no reviewer timeout can be read.
+// Slightly larger than the orchestrator's historical 240s reviewer cap
+// to preserve the prior behavior for callers that don't pass either.
 const DEFAULT_TIMEOUT_MS = 280 * 1000
+// Buffer added to the reviewer's own timeout when auto-deriving the
+// hook's fetch timeout. Gives the server enough time to kill the
+// subprocess and write the ESCALATE response before the hook gives up.
+const AUTO_BUFFER_MS = 60 * 1000
 
 // Map a server `config.bind` value to the host portion of a CLIENT URL.
 // Wildcard binds (0.0.0.0, ::) are translated to their loopback
@@ -39,10 +59,34 @@ export const clientHostFromBind = (bind) => {
     return bind
 }
 
+// Resolve the hook's fetch timeout from a parsed config object.
+// Precedence:
+//   1. hook.fetchTimeoutSeconds (when set to a positive integer) — pin
+//      the hook timeout independent of the reviewer.
+//   2. Auto-derived: max(reviewer.claude.timeoutSeconds,
+//      limits.codexTimeoutSeconds) + AUTO_BUFFER_MS — one knob (the
+//      reviewer timeout) controls both. The buffer covers the time the
+//      server needs to kill a runaway subprocess and serialize the
+//      ESCALATE response after the kill.
+//   3. DEFAULT_TIMEOUT_MS — last-resort fallback for malformed configs.
+export const resolveFetchTimeoutMs = (parsed) => {
+    const explicit = parsed?.hook?.fetchTimeoutSeconds
+    if (Number.isInteger(explicit) && explicit > 0) return explicit * 1000
+
+    const claudeSec = parsed?.reviewer?.claude?.timeoutSeconds
+    const geminiSec = parsed?.reviewer?.gemini?.timeoutSeconds
+    const codexSec = parsed?.limits?.codexTimeoutSeconds
+    const candidates = [claudeSec, geminiSec, codexSec].filter(
+        (v) => Number.isInteger(v) && v > 0
+    )
+    if (candidates.length === 0) return DEFAULT_TIMEOUT_MS
+    return Math.max(...candidates) * 1000 + AUTO_BUFFER_MS
+}
+
 // Read the local server's connection info from the config file. Both the
 // token AND the URL come from the same file so a custom port set in
 // config.json automatically reaches the hook. Returns
-//   { token: string, url: string } on success, or null on any error /
+//   { token, url, fetchTimeoutMs } on success, or null on any error /
 // missing fields — every error becomes a fail-open signal so the calling
 // hook can exit 0 without spamming the user.
 export const readToken = ({
@@ -66,7 +110,11 @@ export const readToken = ({
                 : DEFAULT_BIND
         const host = clientHostFromBind(bind)
         const url = `http://${host}:${port}/review`
-        return { token: parsed.authToken, url }
+        return {
+            token: parsed.authToken,
+            url,
+            fetchTimeoutMs: resolveFetchTimeoutMs(parsed),
+        }
     } catch {
         return null
     }
@@ -88,6 +136,73 @@ export const appendLogLine = (
         appendFileSync(logFile, line)
     } catch {
         // best-effort
+    }
+}
+
+// Build a filename-safe timestamp like 2026-05-22T16-15-30-123Z so the
+// per-call snapshot files sort lexically by time.
+const tsForFilename = (now) => new Date(now).toISOString().replace(/[:.]/g, "-")
+
+// Prune snapshot files in dir down to `keep` most recent.
+const pruneCalls = (dir, keep) => {
+    try {
+        const files = readdirSync(dir)
+            .filter((f) => f.endsWith(".json"))
+            .sort()
+        const drop = files.slice(0, Math.max(0, files.length - keep))
+        for (const f of drop) {
+            try {
+                unlinkSync(path.join(dir, f))
+            } catch {
+                // ignore
+            }
+        }
+    } catch {
+        // ignore
+    }
+}
+
+// Write a per-call snapshot file capturing the full inputs and outputs
+// of this hook invocation. Lets the user `scripts/replay-review.sh` the
+// most recent call (or any prior call) without re-triggering Claude.
+//
+// Snapshot fields:
+//   ts             ISO8601 timestamp
+//   claudeInput    raw JSON Claude Code sent on stdin (parsed)
+//   serverRequest  { url, headers (auth redacted), body }
+//   serverResponse { status, requestId, body } or null
+//   fetchError     string when the call failed before any response
+//   decision       what the hook returned to Claude Code
+//
+// Atomic write via .tmp + rename so a reader never sees a half-written
+// file. Old snapshots beyond CALLS_RETAIN are deleted.
+export const writeCallSnapshot = (
+    entry,
+    {
+        callsDir = DEFAULT_CALLS_DIR(),
+        now = Date.now,
+        retain = CALLS_RETAIN,
+    } = {}
+) => {
+    try {
+        mkdirSync(callsDir, { recursive: true })
+        const filename = `${tsForFilename(now())}.json`
+        const filePath = path.join(callsDir, filename)
+        const tmp = filePath + ".tmp"
+        writeFileSync(
+            tmp,
+            JSON.stringify(
+                { ts: new Date(now()).toISOString(), ...entry },
+                null,
+                2
+            ) + "\n",
+            { mode: 0o600 }
+        )
+        renameSync(tmp, filePath)
+        pruneCalls(callsDir, retain)
+        return filePath
+    } catch {
+        return null
     }
 }
 
@@ -341,8 +456,20 @@ const payloadShape = (payload) => {
     }
 }
 
+// Jest worker IDs are set in test runs. When they are, default the
+// per-call snapshot to a no-op so tests never write to ~/.claude/ (per
+// project policy). Production callers — the actual hook invocation —
+// see the real writer.
+/* istanbul ignore next -- environment guard, not test-meaningful */
+const defaultSnapshotForEnv = () =>
+    process.env.JEST_WORKER_ID !== undefined ? () => null : writeCallSnapshot
+
 // Main hook entrypoint. Dependencies injected so the integration test
 // can drive it with fake streams + fetch + token reader + clock.
+// timeoutMs: when omitted, defer to the value the token reader pulled
+// from config (so a user bump of reviewer.claude.timeoutSeconds tracks
+// through to the hook without a second edit). Pass an explicit value
+// only when the caller wants to pin the timeout regardless of config.
 export const main = async ({
     stdin = process.stdin,
     stdout = process.stdout,
@@ -350,9 +477,10 @@ export const main = async ({
     fetchFn = globalThis.fetch,
     now = Date.now,
     log = appendLogLine,
+    snapshot = defaultSnapshotForEnv(),
     tokenReader = readToken,
     urlOverride = null,
-    timeoutMs = DEFAULT_TIMEOUT_MS,
+    timeoutMs = null,
 } = {}) => {
     let payload
     try {
@@ -362,6 +490,17 @@ export const main = async ({
             `review-orchestrator: failed to parse Stop payload: ${err.message}\n`
         )
         log({ event: "bad_stdin", error: err.message }, { now })
+        snapshot(
+            {
+                claudeInput: null,
+                claudeInputParseError: err.message,
+                serverRequest: null,
+                serverResponse: null,
+                fetchError: null,
+                decision: null,
+            },
+            { now }
+        )
         return 0
     }
 
@@ -370,6 +509,16 @@ export const main = async ({
     if (!cwd || typeof cwd !== "string") {
         log(
             { event: "no_cwd_in_payload", payload: payloadShape(payload) },
+            { now }
+        )
+        snapshot(
+            {
+                claudeInput: payload,
+                serverRequest: null,
+                serverResponse: null,
+                fetchError: null,
+                decision: { event: "no_cwd_in_payload" },
+            },
             { now }
         )
         return 0
@@ -381,19 +530,37 @@ export const main = async ({
             "review-orchestrator: no auth token found in config; skipping review.\n"
         )
         log({ event: "no_token" }, { now })
+        snapshot(
+            {
+                claudeInput: payload,
+                serverRequest: null,
+                serverResponse: null,
+                fetchError: "no auth token found in config",
+                decision: { event: "no_token" },
+            },
+            { now }
+        )
         return 0
     }
     // urlOverride lets tests target a fake server; in production the URL
     // is derived from the same config file as the token.
     const targetUrl = urlOverride ?? config.url
 
+    // Caller override > config-derived > legacy default. The config-
+    // derived value tracks the reviewer's own timeout so a single edit
+    // to reviewer.claude.timeoutSeconds widens both ends of the chain.
+    const effectiveTimeoutMs =
+        timeoutMs ?? config.fetchTimeoutMs ?? DEFAULT_TIMEOUT_MS
+
     stderr.write("review-orchestrator: reviewing changes with Codex…\n")
 
+    const requestBody = { cwd, session_id, trigger: "stop_hook" }
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs)
     let httpStatus = null
     let body = null
     let fetchError = null
+    let serverRequestId = null
     try {
         const res = await fetchFn(targetUrl, {
             method: "POST",
@@ -401,10 +568,17 @@ export const main = async ({
                 "content-type": "application/json",
                 "x-review-token": config.token,
             },
-            body: JSON.stringify({ cwd, session_id, trigger: "stop_hook" }),
+            body: JSON.stringify(requestBody),
             signal: controller.signal,
         })
         httpStatus = res.status
+        // Capture the server's request id so the user can grep the server
+        // log for the matching pipeline trace.
+        try {
+            serverRequestId = res.headers?.get?.("x-request-id") ?? null
+        } catch {
+            serverRequestId = null
+        }
         try {
             body = await res.json()
         } catch {
@@ -413,7 +587,7 @@ export const main = async ({
     } catch (err) {
         fetchError =
             err?.name === "AbortError"
-                ? `request timed out after ${timeoutMs}ms`
+                ? `request timed out after ${effectiveTimeoutMs}ms`
                 : (err?.message ?? String(err))
     } finally {
         clearTimeout(timer)
@@ -430,7 +604,39 @@ export const main = async ({
     for (const line of decision.stderrLines) {
         stderr.write(line + "\n")
     }
-    log(decision.logEntry, { now })
+    const snapshotPath = snapshot(
+        {
+            claudeInput: payload,
+            serverRequest: {
+                url: targetUrl,
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    "x-review-token": "<redacted>",
+                },
+                body: requestBody,
+            },
+            serverResponse: {
+                status: httpStatus,
+                requestId: serverRequestId,
+                body,
+            },
+            fetchError,
+            decision: decision.logEntry,
+        },
+        { now }
+    )
+    // Stick the snapshot path into the compact log line so a user
+    // tailing review-hook.log can find the full inputs/outputs file
+    // for any given event without grepping.
+    log(
+        {
+            ...decision.logEntry,
+            serverRequestId,
+            snapshot: snapshotPath,
+        },
+        { now }
+    )
     return 0
 }
 

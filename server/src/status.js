@@ -25,8 +25,38 @@ const redactConfig = (config) => {
             ? {
                   binary: config.codex.binary,
                   model: config.codex.model,
+                  reasoningEffort: config.codex.reasoningEffort,
                   ignoreProjectRules: config.codex.ignoreProjectRules,
                   extraArgs: config.codex.extraArgs,
+              }
+            : null,
+        reviewer: config.reviewer
+            ? {
+                  provider: config.reviewer.provider,
+                  claude: config.reviewer.claude
+                      ? {
+                            binary: config.reviewer.claude.binary,
+                            model: config.reviewer.claude.model,
+                            effort: config.reviewer.claude.effort,
+                            permissionMode:
+                                config.reviewer.claude.permissionMode,
+                            disallowedTools:
+                                config.reviewer.claude.disallowedTools,
+                            timeoutSeconds:
+                                config.reviewer.claude.timeoutSeconds,
+                            extraArgs: config.reviewer.claude.extraArgs,
+                        }
+                      : null,
+                  gemini: config.reviewer.gemini
+                      ? {
+                            binary: config.reviewer.gemini.binary,
+                            model: config.reviewer.gemini.model,
+                            approvalMode: config.reviewer.gemini.approvalMode,
+                            timeoutSeconds:
+                                config.reviewer.gemini.timeoutSeconds,
+                            extraArgs: config.reviewer.gemini.extraArgs,
+                        }
+                      : null,
               }
             : null,
         limits: config.limits,
@@ -38,6 +68,9 @@ const redactConfig = (config) => {
         reviewsDir: config.reviewsDir,
         reviewsRetentionDays: config.reviewsRetentionDays,
         logging: config.logging,
+        hook: config.hook
+            ? { fetchTimeoutSeconds: config.hook.fetchTimeoutSeconds }
+            : null,
     }
 }
 
@@ -87,6 +120,7 @@ export const handleStatus = ({
     archive,
     config,
     startedAt,
+    version = null,
     now = Date.now,
 }) => {
     const uptimeMs = Math.max(0, now() - (startedAt ?? now()))
@@ -94,6 +128,7 @@ export const handleStatus = ({
     const archiveList = archive?.list?.() ?? []
     return {
         ok: true,
+        version,
         startedAt: new Date(startedAt ?? now()).toISOString(),
         uptimeSeconds: Math.round(uptimeMs / 1000),
         contexts: contexts.map(summarizeContext),
@@ -104,7 +139,7 @@ export const handleStatus = ({
 
 export const mountStatusRoute = (
     app,
-    { store, archive, config, startedAt, now } = {}
+    { store, archive, config, startedAt, version, now } = {}
 ) => {
     app.get("/status", (_req, res) => {
         const body = handleStatus({
@@ -112,6 +147,7 @@ export const mountStatusRoute = (
             archive,
             config,
             startedAt,
+            version,
             now,
         })
         res.json(body)

@@ -113,6 +113,11 @@ const defaultValidator = () => {
     return cachedValidator
 }
 
+// Whitelist the reasoning-effort values codex actually accepts. Anything
+// else falls through silently — config-schema validation already rejected
+// unknown values, so reaching the `else` here means a future config bug.
+const REASONING_EFFORT_VALUES = new Set(["minimal", "low", "medium", "high"])
+
 export const buildCodexArgs = ({ repoRoot, config, schemaPath }) => {
     const args = [
         "exec",
@@ -126,6 +131,10 @@ export const buildCodexArgs = ({ repoRoot, config, schemaPath }) => {
         "--output-schema",
         schemaPath,
     ]
+    const effort = config.codex.reasoningEffort
+    if (effort && REASONING_EFFORT_VALUES.has(effort)) {
+        args.push("-c", `model_reasoning_effort=${effort}`)
+    }
     if (config.codex.ignoreProjectRules) args.push("--ignore-rules")
     for (const extra of config.codex.extraArgs) args.push(extra)
     args.push("-")

@@ -7,7 +7,11 @@ import { jest } from "@jest/globals"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { handleReview, computeReviewConfigHash } from "./review.js"
+import {
+    handleReview,
+    computeReviewConfigHash,
+    defaultInflight,
+} from "./review.js"
 import { ContextError } from "./context.js"
 import { createStateStore } from "./state.js"
 
@@ -1418,6 +1422,179 @@ describe("handleReview — logger plumbing for project config", () => {
     })
 })
 
+describe("handleReview — pipeline log emissions", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const messagesFor = (spy) =>
+        spy.mock.calls.map((c) => (typeof c[1] === "string" ? c[1] : c[0]))
+
+    test("emits structured info lines through the full happy path", async () => {
+        const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            logger,
+            requestId: "RID-PIPE-1",
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 12,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
+                }),
+            }),
+        })
+        const msgs = messagesFor(logger.info)
+        // The cardinal sequence — request received → context resolved →
+        // config resolved → state loaded → payload built → cache decision
+        // → spawning codex → codex finished → review result.
+        const want = [
+            "review request received",
+            "context resolved",
+            "config resolved",
+            "state loaded",
+            "payload built",
+            "cache decision",
+            "spawning reviewer",
+            "reviewer finished",
+            "review result",
+        ]
+        for (const phrase of want) {
+            expect(msgs).toContain(phrase)
+        }
+    })
+
+    test("emits a stderr-tail warning when codex fails", async () => {
+        const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            logger,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    status: "ESCALATE",
+                    reason: "codex exited with code 1",
+                    raw: {
+                        exitCode: 1,
+                        durationMs: 100,
+                        rawStdout: "",
+                        rawStderr:
+                            "ERROR: You've hit your usage limit. Try again later.",
+                    },
+                }),
+            }),
+        })
+        const warnMsgs = messagesFor(logger.warn)
+        expect(warnMsgs).toContain("reviewer stderr/stdout tail")
+        // The tail field must contain the actual error text so a user
+        // tailing the log can see WHY the reviewer failed without
+        // grepping the archive directory.
+        const tailCall = logger.warn.mock.calls.find(
+            (c) => c[1] === "reviewer stderr/stdout tail"
+        )
+        expect(tailCall[0].stderrTail).toMatch(/usage limit/i)
+    })
+
+    test("emits EMPTY_PAYLOAD warning and skips spawn", async () => {
+        const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+        const runSpy = jest.fn()
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            logger,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        empty: true,
+                        nonBinaryFileCount: 0,
+                    }),
+                runAndParse: runSpy,
+            }),
+        })
+        expect(runSpy).not.toHaveBeenCalled()
+        const warnMsgs = messagesFor(logger.warn)
+        expect(warnMsgs).toContain("EMPTY_PAYLOAD — skipping codex")
+    })
+
+    test("dispatches via pickReviewer; log records the provider", async () => {
+        const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+        // Inject a custom picker so we know exactly which adapter the
+        // pipeline reached for.
+        const adapterRun = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { exitCode: 0, durationMs: 5, rawStdout: "{}", rawStderr: "" },
+        }))
+        const pickReviewer = jest.fn(() => ({
+            name: "claude",
+            binary: "claude",
+            runAndParse: adapterRun,
+            buildArgs: () => ["-p", "--bare"],
+        }))
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            logger,
+            deps: makeDeps({
+                pickReviewer,
+                // Force the picker's adapter to be reached — otherwise
+                // the makeDeps default runAndParse would shadow it.
+                runAndParse: undefined,
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+            }),
+        })
+        expect(pickReviewer).toHaveBeenCalled()
+        expect(adapterRun).toHaveBeenCalled()
+        // The pipeline records which provider ran in the "spawning
+        // reviewer" line so the log is unambiguous.
+        const spawnCall = logger.info.mock.calls.find(
+            (c) => c[1] === "spawning reviewer"
+        )
+        expect(spawnCall?.[0].provider).toBe("claude")
+    })
+})
+
 describe("handleReview — project config integration", () => {
     let store
     beforeEach(() => {
@@ -1661,5 +1838,219 @@ describe("handleReview — state persistence", () => {
             }),
         })
         expect(seenPriorFindings).toEqual(findings)
+    })
+})
+
+describe("handleReview — in-flight dedup", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadFor = (path = "a.js") =>
+        makePayload({
+            files: {
+                modified: [{ path }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    test("concurrent requests for the same context attach to one pipeline", async () => {
+        // The shared runAndParse stub blocks until release() is called.
+        // Without dedup, two parallel handleReview calls would each
+        // invoke runAndParse once. With dedup, only the first does and
+        // the second attaches to the first's promise.
+        let release
+        const gate = new Promise((r) => {
+            release = r
+        })
+        const runAndParse = jest.fn(async () => {
+            await gate
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+            }
+        })
+
+        const inflight = new Map()
+        const deps = makeDeps({
+            buildPayload: () => payloadFor(),
+            runAndParse,
+            inflight,
+        })
+
+        const p1 = handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        const p2 = handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+
+        // Let microtasks settle so p2 has had a chance to enter
+        // handleReview, resolve context, and either attach or spawn.
+        await Promise.resolve()
+        await Promise.resolve()
+
+        // Map should hold the in-flight promise for the context.
+        expect(inflight.size).toBe(1)
+
+        release()
+        const [r1, r2] = await Promise.all([p1, p2])
+
+        expect(r1.body.status).toBe("GOOD_TO_GO")
+        expect(r2.body.status).toBe("GOOD_TO_GO")
+        // The same response is handed to both attachers.
+        expect(r1).toBe(r2)
+        // Only one reviewer spawn even though there were two callers.
+        expect(runAndParse).toHaveBeenCalledTimes(1)
+        // Map is empty after both resolved.
+        expect(inflight.size).toBe(0)
+    })
+
+    test("sequential requests do not share a promise (inflight cleared between calls)", async () => {
+        const runAndParse = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+        }))
+        const inflight = new Map()
+        // Vary the progressHash per call so the NO_CHANGES short-circuit
+        // doesn't kick in — this test is about inflight bookkeeping, not
+        // about the cache.
+        let i = 0
+        const deps = makeDeps({
+            buildPayload: () =>
+                makePayload({
+                    files: {
+                        modified: [{ path: "a.js" }],
+                        untracked: [],
+                        deleted: [],
+                        renamed: [],
+                        priorFindingContext: [],
+                    },
+                    progressHash: `seq-${++i}`,
+                }),
+            runAndParse,
+            inflight,
+        })
+
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        expect(inflight.size).toBe(0)
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        expect(runAndParse).toHaveBeenCalledTimes(2)
+        expect(inflight.size).toBe(0)
+    })
+
+    test("map slot is cleared even when the pipeline throws", async () => {
+        const runAndParse = jest.fn(async () => {
+            throw new Error("reviewer exploded")
+        })
+        const inflight = new Map()
+        const deps = makeDeps({
+            buildPayload: () => payloadFor(),
+            runAndParse,
+            inflight,
+        })
+
+        // The error path is caught inside handleReview and surfaced as
+        // an ESCALATE envelope, so this resolves rather than throws.
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        expect(r.body.status).toBe("ESCALATE")
+        expect(inflight.size).toBe(0)
+    })
+
+    test("different contexts run in parallel without dedup interference", async () => {
+        let releaseA, releaseB
+        const gateA = new Promise((r) => {
+            releaseA = r
+        })
+        const gateB = new Promise((r) => {
+            releaseB = r
+        })
+        const runAndParse = jest.fn(async ({ repoRoot }) => {
+            await (repoRoot.endsWith("/a") ? gateA : gateB)
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+            }
+        })
+        const inflight = new Map()
+        const depsA = makeDeps({
+            resolveContext: () => ({
+                repo: "a",
+                repoRoot: "/repo/a",
+                branch: "main",
+                key: "/repo/a|main",
+            }),
+            buildPayload: () => payloadFor(),
+            runAndParse,
+            inflight,
+        })
+        const depsB = makeDeps({
+            resolveContext: () => ({
+                repo: "b",
+                repoRoot: "/repo/b",
+                branch: "main",
+                key: "/repo/b|main",
+            }),
+            buildPayload: () => payloadFor(),
+            runAndParse,
+            inflight,
+        })
+
+        const pA = handleReview({
+            body: { cwd: "/repo/a", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: depsA,
+        })
+        const pB = handleReview({
+            body: { cwd: "/repo/b", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: depsB,
+        })
+
+        await Promise.resolve()
+        await Promise.resolve()
+        expect(inflight.size).toBe(2)
+
+        releaseA()
+        releaseB()
+        await Promise.all([pA, pB])
+        // Both spawned independently — no false dedup across contexts.
+        expect(runAndParse).toHaveBeenCalledTimes(2)
+        expect(inflight.size).toBe(0)
+    })
+
+    test("defaultInflight is a shared Map at module scope (sanity)", () => {
+        expect(defaultInflight).toBeInstanceOf(Map)
     })
 })

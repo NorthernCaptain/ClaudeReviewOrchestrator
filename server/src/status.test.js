@@ -16,6 +16,7 @@ const minimalConfig = () => ({
     codex: {
         binary: "codex",
         model: "gpt-5-codex",
+        reasoningEffort: "high",
         ignoreProjectRules: true,
         extraArgs: [],
     },
@@ -56,11 +57,54 @@ describe("redactConfig", () => {
         expect(r.port).toBe(7777)
         expect(r.limits.maxCodexRounds).toBe(5)
         expect(r.codex.model).toBe("gpt-5-codex")
+        expect(r.codex.reasoningEffort).toBe("high")
         expect(r.blockingSeverities).toEqual(["blocker", "major"])
     })
 
     test("tolerates null config", () => {
         expect(redactConfig(null)).toBeNull()
+    })
+
+    test("surfaces the gemini reviewer block (provider + model + approvalMode + timeout)", () => {
+        const cfg = {
+            ...minimalConfig(),
+            reviewer: {
+                provider: "gemini",
+                gemini: {
+                    binary: "gemini",
+                    model: "auto",
+                    approvalMode: "plan",
+                    timeoutSeconds: 600,
+                    extraArgs: [],
+                },
+            },
+        }
+        const r = redactConfig(cfg)
+        expect(r.reviewer.provider).toBe("gemini")
+        expect(r.reviewer.gemini.model).toBe("auto")
+        expect(r.reviewer.gemini.approvalMode).toBe("plan")
+        expect(r.reviewer.gemini.timeoutSeconds).toBe(600)
+    })
+
+    test("reviewer.gemini is null when only the claude block is present", () => {
+        const cfg = {
+            ...minimalConfig(),
+            reviewer: {
+                provider: "claude",
+                claude: {
+                    binary: "claude",
+                    model: "claude-opus-4-7",
+                    effort: "high",
+                    permissionMode: "bypassPermissions",
+                    disallowedTools: [],
+                    timeoutSeconds: 240,
+                    extraArgs: [],
+                },
+            },
+        }
+        const r = redactConfig(cfg)
+        expect(r.reviewer.gemini).toBeNull()
+        expect(r.reviewer.claude).not.toBeNull()
     })
 })
 
