@@ -21,6 +21,14 @@
       <string>production</string>
       <key>LOG_LEVEL</key>
       <string>info</string>
+      <!-- Pin HOME and REVIEW_ORCH_CONFIG to the install-time values so
+           the daemon always lands in the same place the installer
+           configured, regardless of what launchd inherits from the
+           launching session. -->
+      <key>HOME</key>
+      <string>__HOME__</string>
+      <key>REVIEW_ORCH_CONFIG</key>
+      <string>__HOME__/.config/review-orchestrator/config.json</string>
     </dict>
 
     <key>RunAtLoad</key>

@@ -18,9 +18,11 @@
 
 import { randomBytes } from "node:crypto"
 import {
+    chmodSync,
     existsSync,
     mkdirSync,
     readFileSync,
+    statSync,
     writeFileSync,
     renameSync,
 } from "node:fs"
@@ -75,6 +77,21 @@ const writeAtomic = (filePath, content, mode) => {
     renameSync(tmp, filePath)
 }
 
+// Enforce 0600 on the config file. Even when we don't write new bytes
+// (the "unchanged" path), an existing config may be world-readable from
+// before — repair it on every invocation so re-running install.sh is a
+// safe way to clean up the permissions.
+const enforceOwnerOnly = ({ filePath, chmod = chmodSync, stat = statSync }) => {
+    try {
+        const s = stat(filePath)
+        const mode = s.mode & 0o777
+        if (mode !== 0o600) chmod(filePath, 0o600)
+        return mode
+    } catch {
+        return null
+    }
+}
+
 export const ensureToken = ({
     configPath,
     home,
@@ -83,6 +100,8 @@ export const ensureToken = ({
     writeAtomicFn = writeAtomic,
     existsFn = existsSync,
     mkdir = mkdirSync,
+    chmod = chmodSync,
+    stat = statSync,
     defaults = DEFAULTS,
 }) => {
     const cfgDir = path.dirname(configPath)
@@ -120,6 +139,9 @@ export const ensureToken = ({
         typeof parsed.authToken === "string" &&
         parsed.authToken.length > 0
     ) {
+        // Even on the no-write path, repair perms — the file might have
+        // landed at 0644 from a hand-edit or older install.
+        enforceOwnerOnly({ filePath: configPath, chmod, stat })
         return {
             action: "unchanged",
             path: configPath,

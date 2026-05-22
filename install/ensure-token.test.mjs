@@ -3,7 +3,14 @@
  * Author: Leo Khramov
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+    chmodSync,
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { ensureToken } from "./ensure-token.mjs"
@@ -108,6 +115,34 @@ describe("ensureToken", () => {
                 generate: () => "T",
             })
         ).toThrow(/not valid JSON/)
+    })
+
+    test("repairs config permissions to 0600 even on unchanged-token path", () => {
+        const p = path.join(dir, "config.json")
+        writeFileSync(
+            p,
+            JSON.stringify({ authToken: "EXISTING-AND-VALID" }) + "\n"
+        )
+        chmodSync(p, 0o644) // simulate hand-edit / older install
+        const r = ensureToken({
+            configPath: p,
+            home,
+            generate: () => "would-not-use",
+        })
+        expect(r.action).toBe("unchanged")
+        const mode = statSync(p).mode & 0o777
+        expect(mode).toBe(0o600)
+    })
+
+    test("fresh install also enforces 0600", () => {
+        const p = path.join(dir, "config.json")
+        ensureToken({
+            configPath: p,
+            home,
+            generate: () => "T",
+        })
+        const mode = statSync(p).mode & 0o777
+        expect(mode).toBe(0o600)
     })
 
     test("creates parent directory on demand", () => {

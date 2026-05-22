@@ -90,7 +90,8 @@ maybe() {
     return 0
 }
 
-# Compare bytes; install only if differ.
+# Compare bytes; install only if differ. Reports "installed" when the
+# destination did not exist beforehand, "updated" when bytes drifted.
 install_file_idempotent() {
     local src="$1"
     local dst="$2"
@@ -100,11 +101,13 @@ install_file_idempotent() {
         note "  unchanged: $label ($dst)"
         return 0
     fi
+    local existed=0
+    [ -f "$dst" ] && existed=1
     if ! maybe "install file: $src → $dst (mode $mode)"; then return 0; fi
     mkdir -p "$(dirname "$dst")"
     cp "$src" "$dst"
     chmod "$mode" "$dst"
-    if [ -f "$dst.was" ]; then
+    if [ "$existed" -eq 1 ]; then
         note "  updated:   $label ($dst)"
     else
         note "  installed: $label ($dst)"
@@ -142,33 +145,29 @@ HEADERS
     note "  installed: mcp-headers.sh ($target)"
 }
 
-# Render the launchd plist by substituting placeholders.
+# Render the launchd plist via the Node helper. Done in JS so that
+# paths containing `&` or `|` cannot corrupt the substitution (they would
+# under raw sed). Returns:
+#   0 = wrote new/updated plist
+#   1 = unchanged on disk (no signal needed)
+#   2 = dry-run skip
 render_plist() {
     local src="$1"
     local dst="$2"
     local node_bin="$3"
     local repo_root="$4"
     local home="$5"
-    local tmp; tmp="$(mktemp)"
-    # Use printf + sed (BSD-compatible): each substitution is a separate
-    # -e to avoid GNU-ish chained syntax.
-    sed \
-        -e "s|__NODE_BIN__|$node_bin|g" \
-        -e "s|__REPO_ROOT__|$repo_root|g" \
-        -e "s|__HOME__|$home|g" \
-        "$src" > "$tmp"
-    if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
-        rm -f "$tmp"
-        note "  unchanged: launchd plist ($dst)"
-        return 1   # signal "no change"
-    fi
-    if ! maybe "render plist: $src → $dst"; then
-        rm -f "$tmp"
-        return 1
-    fi
+    if ! maybe "render plist: $src → $dst"; then return 2; fi
     mkdir -p "$(dirname "$dst")"
-    mv "$tmp" "$dst"
-    note "  installed: launchd plist ($dst)"
+    local out
+    if ! out="$(node "$REPO_ROOT/install/render-plist.mjs" \
+            "$src" "$dst" "$node_bin" "$repo_root" "$home" 2>&1)"; then
+        echo "install: render-plist failed: $out" >&2
+        exit 1
+    fi
+    local action="${out%%:*}"
+    note "  $action: launchd plist ($dst)"
+    if [ "$action" = "unchanged" ]; then return 1; fi
     return 0
 }
 
@@ -205,8 +204,31 @@ write_headers_script "$HEADERS_SCRIPT" "$CONFIG_PATH"
 # 3. Stop hook
 install_file_idempotent "$REPO_ROOT/hooks/stop-review.mjs" "$HOOK_PATH" 0700 "Stop hook"
 
-# 4. mcp entry in ~/.claude.json
-run_helper "~/.claude.json (MCP entry)" "$REPO_ROOT/install/merge-mcp.mjs" "$CLAUDE_JSON" "$HEADERS_SCRIPT"
+# 4a. Read the actual port/bind out of the config so the MCP URL we wire
+# into ~/.claude.json (and the /healthz probe under --launch) point at the
+# daemon the user actually configured. clientHost is the form to use in
+# URLs: wildcard binds normalized to loopback, IPv6 bracketed.
+PORT=7777
+BIND="127.0.0.1"
+CLIENT_HOST="127.0.0.1"
+if [ -f "$CONFIG_PATH" ]; then
+    if ! ENDPOINT="$(node "$REPO_ROOT/install/read-config-endpoint.mjs" "$CONFIG_PATH")"; then
+        echo "install: failed to read endpoint from $CONFIG_PATH" >&2
+        exit 1
+    fi
+    # ENDPOINT is "port\tbind\tclientHost".
+    PORT="${ENDPOINT%%	*}"
+    REST="${ENDPOINT#*	}"
+    BIND="${REST%%	*}"
+    CLIENT_HOST="${REST#*	}"
+    CLIENT_HOST="${CLIENT_HOST%$'\n'}"
+fi
+echo "  endpoint:  $BIND:$PORT (client URL host: $CLIENT_HOST)"
+
+# 4b. mcp entry in ~/.claude.json — pass the resolved port/bind so the
+# entry matches the daemon's actual address.
+run_helper "~/.claude.json (MCP entry)" "$REPO_ROOT/install/merge-mcp.mjs" \
+    "$CLAUDE_JSON" "$HEADERS_SCRIPT" "$PORT" "$CLIENT_HOST"
 
 # 5. Stop hook entry in ~/.claude/settings.json
 run_helper "~/.claude/settings.json (Stop hook)" "$REPO_ROOT/install/merge-stop-hook.mjs" "$SETTINGS_JSON" "$HOOK_PATH"
@@ -221,24 +243,51 @@ if [ "$LAUNCH" -eq 1 ]; then
         echo "install: node not on PATH; cannot install launchd plist" >&2
         exit 1
     fi
-    PLIST_CHANGED=0
-    if render_plist "$PLIST_SRC" "$PLIST_DST" "$NODE_BIN" "$REPO_ROOT" "$HOME_DIR"; then
-        PLIST_CHANGED=1
+
+    # The plist points its StandardOut/StandardErr at ~/.claude/logs/.
+    # launchd refuses to start the agent if that directory doesn't
+    # already exist, so create it before bootstrapping.
+    LOGS_DIR="$HOME_DIR/.claude/logs"
+    if ! maybe "mkdir $LOGS_DIR"; then
+        :
+    else
+        mkdir -p "$LOGS_DIR"
     fi
+
+    render_plist "$PLIST_SRC" "$PLIST_DST" "$NODE_BIN" "$REPO_ROOT" "$HOME_DIR" || true
+
     if ! maybe "launchctl bootstrap"; then
         :
     else
         DOMAIN="gui/$(id -u)"
         # Bootout if already loaded (idempotent rerun); ignore failure.
         launchctl bootout "$DOMAIN/com.leo.review-orchestrator" 2>/dev/null || true
-        launchctl bootstrap "$DOMAIN" "$PLIST_DST" 2>/dev/null || {
-            note "  warning:   launchctl bootstrap failed (you may need to run \`launchctl bootstrap $DOMAIN $PLIST_DST\` manually)"
-        }
-        if [ "$PLIST_CHANGED" -eq 1 ]; then
-            note "  launched:  launchd agent $DOMAIN/com.leo.review-orchestrator"
-        else
-            note "  unchanged: launchd agent (re-bootstrapped to pick up any drift)"
+        if ! launchctl bootstrap "$DOMAIN" "$PLIST_DST"; then
+            echo "install: launchctl bootstrap failed for $PLIST_DST" >&2
+            echo "  Try: launchctl bootstrap $DOMAIN $PLIST_DST" >&2
+            echo "  Check: tail -n 50 $LOGS_DIR/review-server.err.log" >&2
+            exit 1
         fi
+
+        # Probe /healthz to confirm the daemon actually came up. Retry
+        # for ~10s with a short backoff — launchd may take a moment to
+        # spawn node.
+        HEALTH_URL="http://${CLIENT_HOST}:${PORT}/healthz"
+        echo "  waiting:   ${HEALTH_URL}"
+        OK=0
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -sf --max-time 1 "$HEALTH_URL" >/dev/null 2>&1; then
+                OK=1
+                break
+            fi
+            sleep 1
+        done
+        if [ "$OK" -ne 1 ]; then
+            echo "install: bootstrap succeeded but /healthz never returned 200 at $HEALTH_URL" >&2
+            echo "  Check: tail -n 50 $LOGS_DIR/review-server.err.log" >&2
+            exit 1
+        fi
+        note "  launched:  launchd agent $DOMAIN/com.leo.review-orchestrator (verified via /healthz)"
     fi
 else
     note "  skipped:   launchd plist (--launch not passed; daemon must be started manually with \`npm start\`)"
