@@ -50,8 +50,7 @@
             "hooks/**/*.mjs",
             "install/**/*.mjs",
             "!**/*.test.js",
-            "!**/*.test.mjs",
-            "!server/src/status.js"
+            "!**/*.test.mjs"
         ],
         "coverageThreshold": {
             "global": {

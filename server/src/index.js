@@ -9,6 +9,7 @@ import { authMiddleware } from "./auth.js"
 import { mountReviewRoute } from "./review.js"
 import { mountResetRoute } from "./reset.js"
 import { mountMcpRoute } from "./mcp.js"
+import { mountStatusRoute } from "./status.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { logger } from "./logger.js"
@@ -19,6 +20,7 @@ export const createApp = ({
     archive = null,
     logger: log = logger,
     deps = {},
+    startedAt = Date.now(),
 }) => {
     const app = express()
     app.disable("x-powered-by")
@@ -32,6 +34,7 @@ export const createApp = ({
     mountReviewRoute(app, { config, store, archive, logger: log, deps })
     mountResetRoute(app, { config, store, deps })
     mountMcpRoute(app, { config, store, archive, logger: log, deps })
+    mountStatusRoute(app, { config, store, archive, startedAt })
 
     return app
 }
@@ -42,6 +45,7 @@ export const startServer = ({
     archive = null,
     deps = {},
     log = logger,
+    startedAt = Date.now(),
 } = {}) =>
     new Promise((resolve) => {
         const app = createApp({
@@ -50,6 +54,7 @@ export const startServer = ({
             archive,
             logger: log,
             deps,
+            startedAt,
         })
         const server = app.listen(config.port, config.bind)
         let settled = false
