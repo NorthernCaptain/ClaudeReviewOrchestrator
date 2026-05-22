@@ -13,7 +13,7 @@
         "test": "NODE_OPTIONS=--experimental-vm-modules jest --passWithNoTests",
         "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
         "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage --passWithNoTests",
-        "lint": "eslint server hooks",
+        "lint": "eslint server hooks install",
         "format": "prettier --write ."
     },
     "author": "Leo Khramov",
@@ -42,11 +42,13 @@
         "transform": {},
         "testMatch": [
             "<rootDir>/server/**/*.test.js",
-            "<rootDir>/hooks/**/*.test.mjs"
+            "<rootDir>/hooks/**/*.test.mjs",
+            "<rootDir>/install/**/*.test.mjs"
         ],
         "collectCoverageFrom": [
             "server/src/**/*.js",
             "hooks/**/*.mjs",
+            "install/**/*.mjs",
             "!**/*.test.js",
             "!**/*.test.mjs",
             "!server/src/status.js"
