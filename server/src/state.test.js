@@ -107,7 +107,14 @@ describe("createStateStore — idle reset", () => {
         rmSync(dir, { recursive: true, force: true })
     })
 
-    test("idle reset clears counters when idleResetMs has elapsed", () => {
+    test("idle reset clears loop counters but PRESERVES the content-keyed cache", () => {
+        // As of v0.1.9 the idle reset clears LOOP state only and
+        // KEEPS the content-keyed cache (lastBaseline +
+        // lastResultStatus + lastEscalateReason). The cache short-
+        // circuit relies on those to skip a redundant reviewer spawn
+        // after a server restart or a long quiet period; the cache
+        // only fires when progressHash + reviewConfigHash match, so
+        // retaining it across arbitrary durations is safe.
         let t = 1000
         const store = createStateStore({
             filePath,
@@ -123,14 +130,84 @@ describe("createStateStore — idle reset", () => {
             lastResultStatus: "ISSUES",
             priorFindings: [{ file: "f" }],
             lastBaseline: { progressHash: "p" },
+            lastEscalateReason: "boom",
         })
 
         t = 2000 // 1000ms idle, > 500ms threshold
         const s = store.get(ctxKey)
+        // Loop counters + priorFindings cleared.
         expect(s.codexRounds).toBe(0)
         expect(s.blockCount).toBe(0)
         expect(s.priorFindings).toEqual([])
-        expect(s.lastBaseline).toBeNull()
+        // Cache fields PRESERVED so the next /review can short-circuit
+        // on a matching progressHash + reviewConfigHash.
+        expect(s.lastBaseline).toEqual({ progressHash: "p" })
+        expect(s.lastResultStatus).toBe("ISSUES")
+        expect(s.lastEscalateReason).toBe("boom")
+        // lastReviewedAt zeroed so a follow-up get() doesn't trigger
+        // a second idle reset until a real review writes a new value.
+        expect(s.lastReviewedAt).toBe(0)
+    })
+
+    test("idle reset is one-shot: a follow-up get() does not re-reset", () => {
+        let t = 1000
+        const store = createStateStore({
+            filePath,
+            now: () => t,
+            idleResetMs: 500,
+        })
+        store.save(ctxKey.key, {
+            repoRoot: ctxKey.repoRoot,
+            branch: ctxKey.branch,
+            codexRounds: 7,
+            lastReviewedAt: 1000,
+            lastBaseline: { progressHash: "p" },
+            lastResultStatus: "GOOD_TO_GO",
+        })
+        t = 5000 // first get triggers idle reset
+        store.get(ctxKey)
+        // Second get must not idle-reset again (lastReviewedAt is 0).
+        const second = store.get(ctxKey)
+        expect(second.lastBaseline).toEqual({ progressHash: "p" })
+        expect(second.lastResultStatus).toBe("GOOD_TO_GO")
+    })
+
+    test("idle reset preserves cache across a simulated server restart", () => {
+        // Round-trip: state saved at t=1000, "restart" at t=2_000_000
+        // (well past idleResetMs). New store instance loads the
+        // persisted file, the first get() triggers idle reset but
+        // the cache fields survive.
+        let t = 1000
+        const idle = 60_000
+        const s1 = createStateStore({
+            filePath,
+            now: () => t,
+            idleResetMs: idle,
+        })
+        s1.save(ctxKey.key, {
+            repoRoot: ctxKey.repoRoot,
+            branch: ctxKey.branch,
+            codexRounds: 1,
+            lastReviewedAt: 1000,
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: {
+                progressHash: "stable",
+                reviewConfigHash: "cfg",
+            },
+        })
+        // "Restart" — discard s1, build a fresh store reading the
+        // same file with the clock far in the future.
+        t = 2_000_000
+        const s2 = createStateStore({
+            filePath,
+            now: () => t,
+            idleResetMs: idle,
+        })
+        const restored = s2.get(ctxKey)
+        expect(restored.lastResultStatus).toBe("GOOD_TO_GO")
+        expect(restored.lastBaseline.progressHash).toBe("stable")
+        // Loop counter reset, cache preserved.
+        expect(restored.codexRounds).toBe(0)
     })
 
     test("idle reset does NOT fire while still within the window", () => {

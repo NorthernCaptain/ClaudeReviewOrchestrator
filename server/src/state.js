@@ -26,6 +26,30 @@ const blankContext = ({ key, repoRoot, branch }) => ({
     priorFindings: [],
     lastReviewedAt: 0,
     lastResultStatus: null,
+    lastEscalateReason: null,
+})
+
+// Idle reset: clear LOOP counters but keep the content-keyed CACHE
+// (lastBaseline + lastResultStatus + lastEscalateReason). The cache
+// only short-circuits when progressHash + reviewConfigHash match, so
+// retaining it across an arbitrarily long idle period is safe — it
+// will simply miss when something has actually changed on disk. The
+// counters are loop state (the verify-finding cycle, the block cap)
+// and shouldn't persist past quiet periods, so those still reset.
+//
+// lastReviewedAt is set to 0 so a follow-up get() doesn't trigger a
+// second idle reset until a real review writes a new value.
+const idleResetContext = ({ key, repoRoot, branch }, existing) => ({
+    key,
+    repoRoot,
+    branch,
+    codexRounds: 0,
+    blockCount: 0,
+    priorFindings: [],
+    lastReviewedAt: 0,
+    lastBaseline: existing?.lastBaseline ?? null,
+    lastResultStatus: existing?.lastResultStatus ?? null,
+    lastEscalateReason: existing?.lastEscalateReason ?? null,
 })
 
 const cloneState = (state) => JSON.parse(JSON.stringify(state))
@@ -71,15 +95,14 @@ export const createStateStore = ({
 
     const get = ({ key, repoRoot, branch }) => {
         const state = ensure({ key, repoRoot, branch })
-        // Idle reset: when the loop has been quiet long enough, drop
-        // counters and the baseline so the next call starts fresh. We
-        // preserve no historical data on purpose — see README "Counter
-        // reset triggers".
+        // Idle reset: clear loop counters but KEEP the content-keyed
+        // cache (lastBaseline + lastResultStatus + lastEscalateReason).
+        // See idleResetContext() for the rationale.
         if (
             state.lastReviewedAt > 0 &&
             now() - state.lastReviewedAt > idleResetMs
         ) {
-            contexts[key] = blankContext({ key, repoRoot, branch })
+            contexts[key] = idleResetContext({ key, repoRoot, branch }, state)
             persistAtomically(filePath, contexts)
         }
         return cloneState(contexts[key])
