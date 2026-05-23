@@ -21,6 +21,20 @@ const STATUS_COLORS = {
     ESCALATE: "#ef4444",
 }
 const STATUS_FALLBACK = "#94a3b8"
+// Color reused by the FAILED section heading so it matches the
+// ESCALATE bars in the timeline at a glance.
+const ESCALATE_COLOR = STATUS_COLORS.ESCALATE
+
+// The full status names are long; the summary row's status column
+// would wrap into the next column for GOOD_TO_GO_WITH_NOTES and
+// NO_PROGRESS_WITH_OPEN_ISSUES. The chart tooltip and the expanded
+// row still show the full canonical name; this is purely a display
+// abbreviation for the cramped summary cell.
+const STATUS_LABEL = {
+    GOOD_TO_GO_WITH_NOTES: "GO_WITH_NOTES",
+    NO_PROGRESS_WITH_OPEN_ISSUES: "NO_PROGRESS",
+}
+const labelFor = (status) => STATUS_LABEL[status] ?? status ?? "?"
 
 const SEVERITY_BADGE = {
     blocker: { bg: "#fee2e2", fg: "#b91c1c" },
@@ -113,11 +127,14 @@ const renderChart = (records) => {
             typeof r.durationMs === "number" ? r.durationMs : 0
         )
     )
-    // Log scale so a 200ms ESCALATE next to a 300s real review is still
-    // visible. log1p keeps zero-duration bars renderable.
+    // Linear scale: bar height is proportional to durationMs. A tiny
+    // ESCALATE next to a 5-minute review will be a sliver — we floor
+    // at 2px so even sub-1% bars stay visible and clickable.
+    const MIN_BAR_PX = 2
     const scale = (ms) => {
         const v = Math.max(0, typeof ms === "number" ? ms : 0)
-        return (Math.log1p(v) / Math.log1p(maxDur)) * innerH
+        const h = (v / maxDur) * innerH
+        return v > 0 ? Math.max(MIN_BAR_PX, h) : 0
     }
     const gap = 2
     const barW = Math.max(
@@ -137,17 +154,27 @@ const renderChart = (records) => {
                 r.findingsCount > 0 && barW >= 8
                     ? `<text x="${x + barW / 2}" y="${y - 4}" text-anchor="middle" class="bar-label">${r.findingsCount}</text>`
                     : ""
+            // Wrap each bar in an SVG <a> targeting the matching row's
+            // id. The tiny page-load JS opens the target <details> so
+            // the user lands on a fully visible review entry.
+            const href = r._id ? `#${escapeHtml(r._id)}` : null
+            const wrapOpen = href
+                ? `<a href="${href}" class="bar-link">`
+                : `<g>`
+            const wrapClose = href ? `</a>` : `</g>`
             return (
-                `<g><title>${titleAttr}</title>` +
+                `${wrapOpen}<title>${titleAttr}</title>` +
                 `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" fill="${color}" rx="1"/>` +
                 label +
-                `</g>`
+                `${wrapClose}`
             )
         })
         .join("")
 
-    // Light reference lines + duration ticks on the left axis.
-    const refDurs = [1000, 10_000, 60_000, 300_000].filter((d) => d <= maxDur)
+    // Light reference lines + duration ticks on the left axis. Pick
+    // 25 / 50 / 75 / 100 % of the observed max so the linear scale
+    // has readable gridlines regardless of how slow/fast reviews are.
+    const refDurs = [0.25, 0.5, 0.75, 1].map((f) => Math.round(maxDur * f))
     const refs = refDurs
         .map((d) => {
             const y = padT + (innerH - scale(d))
@@ -242,20 +269,41 @@ const renderFinding = (f) => {
     )
 }
 
-const renderSuccessRow = (r) => {
+// Row body for an ESCALATE-status review when shown in the unified
+// reviews list (the standalone Failed section uses renderFailureRow's
+// richer layout). Single-line reason here keeps the row compact;
+// users wanting the full stderr/argv expand the Failed section.
+const renderEscalateBody = (r) => {
+    const reasonStr =
+        r.reason === null || r.reason === undefined ? "—" : String(r.reason)
+    return (
+        `<div class="empty" style="color:${ESCALATE_COLOR}">` +
+        `failed — ${escapeHtml(reasonStr.slice(0, 240))}` +
+        (reasonStr.length > 240 ? "…" : "") +
+        ` <em>(see Failed section below for full details)</em>` +
+        `</div>`
+    )
+}
+
+const renderReviewRow = (r) => {
     const color = STATUS_COLORS[r.status] ?? STATUS_FALLBACK
+    const idAttr = r._id ? ` id="${escapeHtml(r._id)}"` : ""
     const summary =
         `<summary>` +
         `<span class="ts">${escapeHtml(fmtTs(r.ts))}</span>` +
         `<span class="repo">${escapeHtml(r.context)}</span>` +
-        `<span class="status" style="color:${color}">${escapeHtml(r.status ?? "?")}</span>` +
+        `<span class="status" style="color:${color}" title="${escapeHtml(r.status ?? "?")}">${escapeHtml(labelFor(r.status))}</span>` +
         `<span class="dur">${escapeHtml(fmtMs(r.durationMs))}</span>` +
         `<span class="count">${r.findingsCount} (blocking: ${r.blockingCount})</span>` +
         `</summary>`
-    const body =
-        r.findingsCount === 0
-            ? `<div class="empty">no findings — clean review</div>`
-            : `<ul class="findings">${r.findings.map(renderFinding).join("")}</ul>`
+    let body
+    if (r.status === "ESCALATE") {
+        body = renderEscalateBody(r)
+    } else if (r.findingsCount === 0) {
+        body = `<div class="empty">no findings — clean review</div>`
+    } else {
+        body = `<ul class="findings">${r.findings.map(renderFinding).join("")}</ul>`
+    }
     const meta =
         `<div class="meta">` +
         `<span>round ${escapeHtml(String(r.round ?? "?"))}</span>` +
@@ -266,8 +314,12 @@ const renderSuccessRow = (r) => {
             ? `<span class="warn">${r.droppedCount} dropped</span>`
             : "") +
         `</div>`
-    return `<details>${summary}${meta}${body}</details>`
+    return `<details${idAttr}>${summary}${meta}${body}</details>`
 }
+
+// Keep the old name as an alias so the public API the tests use
+// stays stable. Removed in a follow-up once tests migrate.
+const renderSuccessRow = renderReviewRow
 
 const renderFailureRow = (r) => {
     const d = r.failureDetail ?? {}
@@ -368,6 +420,17 @@ svg.chart .ref-label { fill: var(--muted); font-size: 10px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 svg.chart .bar-label { fill: var(--muted); font-size: 9px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+svg.chart a.bar-link { cursor: pointer; }
+svg.chart a.bar-link rect { transition: opacity 0.1s; }
+svg.chart a.bar-link:hover rect { opacity: 0.75; stroke: var(--fg);
+  stroke-width: 1; }
+/* Briefly flash a row when arrived via hash to make it obvious which
+   row matched the bar that was clicked. */
+@keyframes flash-target {
+  0% { background: rgba(96, 165, 250, 0.25); }
+  100% { background: transparent; }
+}
+details:target { animation: flash-target 1.2s ease-out 1; }
 svg.chart .empty { fill: var(--muted); font-size: 12px; }
 details { border-top: 1px solid var(--border); }
 details:first-of-type { border-top: 0; }
@@ -424,8 +487,19 @@ export const renderDashboard = ({
     startedAt = null,
     records = [],
 } = {}) => {
-    const successes = records.filter((r) => r.status !== "ESCALATE")
-    const failures = records.filter((r) => r.status === "ESCALATE")
+    // Assign a stable id per record so chart bars can deep-link to the
+    // matching row in the reviews table. Index is the position in the
+    // newest-first list — chart reverses for display, but the id is
+    // stable.
+    const recordsWithIds = records.map((r, i) => ({
+        ...r,
+        _id: `review-${i}`,
+    }))
+    // Reviews section now shows EVERY attempt (success + failure) so a
+    // chart click always lands on a row. The Failed section below
+    // remains as a focused quick-view of just the ESCALATEs.
+    const allRecords = recordsWithIds
+    const failures = recordsWithIds.filter((r) => r.status === "ESCALATE")
     const startedAtStr = startedAt ? fmtTs(startedAt) : "—"
     return `<!doctype html>
 <html lang="en">
@@ -449,21 +523,21 @@ export const renderDashboard = ({
 
 <section aria-label="timeline">
   <h2>timeline · last ${records.length} review${records.length === 1 ? "" : "s"} (oldest → newest)</h2>
-  ${renderChart(records)}
-  <div class="meta" style="padding-top:4px">bars colored by status · height = duration (log scale) · label above = findings count</div>
+  ${renderChart(recordsWithIds)}
+  <div class="meta" style="padding-top:4px">bars colored by status · height = duration (linear scale) · label above = findings count · click a bar to jump to the row</div>
 </section>
 
 <section aria-label="reviews">
-  <h2>reviews · ${successes.length}</h2>
+  <h2>reviews · ${allRecords.length}</h2>
   ${
-      successes.length === 0
-          ? `<div class="empty">no successful reviews recorded yet</div>`
-          : successes.map(renderSuccessRow).join("")
+      allRecords.length === 0
+          ? `<div class="empty">no reviews recorded yet</div>`
+          : allRecords.map(renderSuccessRow).join("")
   }
 </section>
 
 <section aria-label="failed">
-  <h2>failed · ${failures.length}</h2>
+  <h2 style="color:${ESCALATE_COLOR}">failed · ${failures.length}</h2>
   ${
       failures.length === 0
           ? `<div class="empty">no failed reviews recorded yet</div>`
@@ -473,6 +547,24 @@ export const renderDashboard = ({
 
 <footer>review-orchestrator · localhost only · no auth on this page</footer>
 </main>
+<script>
+// Open the target <details> when a chart bar is clicked and the URL
+// hash changes. Native :target cannot set the open attribute,
+// so a small JS snippet does it.
+(function () {
+  function openTarget() {
+    if (!location.hash) return
+    var el
+    try { el = document.querySelector(location.hash) } catch (e) { return }
+    if (!el) return
+    var d = el.closest("details") || (el.tagName === "DETAILS" ? el : null)
+    if (d) d.open = true
+    el.scrollIntoView({ behavior: "smooth", block: "center" })
+  }
+  window.addEventListener("hashchange", openTarget)
+  window.addEventListener("load", openTarget)
+})();
+</script>
 </body>
 </html>`
 }

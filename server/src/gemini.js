@@ -92,8 +92,12 @@ const REVIEWER_DIRECTIVE =
     "before the JSON. The response is EXACTLY ONE JSON object matching " +
     "the review output schema and NOTHING ELSE — no leading prose, no " +
     "trailing commentary, no markdown. " +
-    "Top-level keys: `status` (one of GOOD_TO_GO, GOOD_TO_GO_WITH_NOTES, " +
-    "ISSUES, NO_CHANGES) and `findings` (array). Each finding has " +
+    "Top-level keys: `status` (EXACTLY one of `GOOD_TO_GO` or `ISSUES` — " +
+    "GOOD_TO_GO when findings is empty, ISSUES when findings has at " +
+    "least one entry; the server derives every other public status " +
+    "from these two and the on-disk change state, so you MUST NOT " +
+    "emit GOOD_TO_GO_WITH_NOTES, NO_CHANGES, NO_PROGRESS_WITH_OPEN_ISSUES, " +
+    "or ESCALATE) and `findings` (array). Each finding has " +
     "`file` (string), `line` (integer ≥1), `severity` (one of blocker, " +
     "major, minor, nit), `category` (one of bug, security, perf, style, " +
     "test, other), `message` (string), and optional `suggestion` " +
@@ -379,6 +383,23 @@ export const parseGeminiOutput = (
             ) {
                 f.category = "other"
             }
+        }
+    }
+
+    // Defense in depth: even with the directive spelling out only
+    // GOOD_TO_GO/ISSUES, the model occasionally returns a server-side
+    // public status (GOOD_TO_GO_WITH_NOTES, NO_CHANGES, …). Coerce to
+    // the schema-valid pair before ajv runs — the server's downstream
+    // derivePublicStatus() will re-derive the public form correctly.
+    if (parsed && typeof parsed.status === "string") {
+        const STATUS_COERCE = {
+            GOOD_TO_GO_WITH_NOTES: "ISSUES",
+            NO_PROGRESS_WITH_OPEN_ISSUES: "ISSUES",
+            NO_CHANGES: "GOOD_TO_GO",
+            ESCALATE: "ISSUES", // model says "escalate" → treat as ISSUES; server can re-classify
+        }
+        if (STATUS_COERCE[parsed.status]) {
+            parsed.status = STATUS_COERCE[parsed.status]
         }
     }
 

@@ -141,13 +141,14 @@ describe("renderDashboard", () => {
         expect(html).not.toMatch(/src="https?:/)
     })
 
-    test("renders successful and failed records into their respective sections", () => {
+    test("renders all records in reviews; failures also appear in the Failed quick-view", () => {
         const html = renderDashboard({
             version: "0.1.3",
             config: baseConfig(),
             records: [issuesRecord(), goodRecord(), escalateRecord()],
         })
-        expect(html).toContain("reviews · 2")
+        // Reviews section now includes EVERY record (success + failed).
+        expect(html).toContain("reviews · 3")
         expect(html).toContain("failed · 1")
         expect(html).toContain("ISSUES")
         expect(html).toContain("GOOD_TO_GO")
@@ -161,7 +162,7 @@ describe("renderDashboard", () => {
             config: baseConfig(),
             records: [],
         })
-        expect(html).toContain("no successful reviews recorded yet")
+        expect(html).toContain("no reviews recorded yet")
         expect(html).toContain("no failed reviews recorded yet")
         expect(html).toContain("no reviews yet")
     })
@@ -300,6 +301,97 @@ describe("renderDashboard", () => {
         const html = renderFailureRow(evil)
         // The short-reason cell shows the em-dash placeholder.
         expect(html).toContain("—")
+    })
+
+    test("long status names use the shortened label in the summary row, full name in the title attribute", () => {
+        const r = issuesRecord({ status: "GOOD_TO_GO_WITH_NOTES" })
+        const html = renderSuccessRow(r)
+        // Shortened label shows in the cramped summary cell.
+        expect(html).toContain("GO_WITH_NOTES")
+        // Full canonical name preserved in the hover title.
+        expect(html).toContain('title="GOOD_TO_GO_WITH_NOTES"')
+        // No raw "WITH_NOTES" without the GO_ prefix.
+        expect(html).not.toMatch(/>GOOD_TO_GO_WITH_NOTES</)
+    })
+
+    test("ESCALATE rows now render inside the reviews list with the failure reason in the body", () => {
+        const r = escalateRecord()
+        const html = renderSuccessRow(r)
+        expect(html).toContain("ESCALATE")
+        // Body shows the (truncated) reason, NOT "clean review".
+        expect(html).toContain("gemini exited with code 41")
+        expect(html).not.toContain("clean review")
+    })
+
+    test("reviews rows carry an id derived from the record's _id (for chart deep-linking)", () => {
+        const html = renderSuccessRow({ ...goodRecord(), _id: "review-7" })
+        expect(html).toMatch(/<details id="review-7">/)
+    })
+
+    test("chart wraps each bar in <a href='#review-N'> so clicks deep-link to rows", () => {
+        // Two records, both tagged with _id by renderDashboard.
+        const html = renderDashboard({
+            version: "0.1.7",
+            config: baseConfig(),
+            records: [goodRecord(), issuesRecord()],
+        })
+        // Two anchors, one per record.
+        expect(html.match(/<a href="#review-\d+" class="bar-link">/g)).toHaveLength(2)
+        // The matching rows carry the same ids.
+        expect(html).toContain('<details id="review-0">')
+        expect(html).toContain('<details id="review-1">')
+    })
+
+    test("failed section heading is rendered in red (matches ESCALATE bar color)", () => {
+        const html = renderDashboard({
+            version: "0.1.7",
+            config: baseConfig(),
+            records: [escalateRecord()],
+        })
+        // The CSS color value the chart uses for ESCALATE bars.
+        expect(html).toMatch(/<h2 style="color:#ef4444">failed · 1<\/h2>/)
+    })
+
+    test("chart uses a linear scale: a 5s bar is ~5x taller than a 1s bar", () => {
+        // Construct two records, one at maxDur and one at 1/5 of it.
+        const fast = goodRecord({ durationMs: 1000 })
+        const slow = goodRecord({ durationMs: 5000 })
+        const svg = renderChart([fast, slow])
+        // Pull the height attributes from the two <rect> elements.
+        const heights = [...svg.matchAll(/height="([\d.]+)"/g)].map((m) =>
+            parseFloat(m[1])
+        )
+        expect(heights).toHaveLength(2)
+        // Linear: 1000/5000 = 0.2 ratio. Allow ±0.05 for the min-px floor.
+        const ratio = Math.min(...heights) / Math.max(...heights)
+        expect(ratio).toBeGreaterThan(0.15)
+        expect(ratio).toBeLessThan(0.25)
+    })
+
+    test("chart enforces a minimum bar height so sub-1% durations stay visible", () => {
+        // A 10ms bar next to a 300s bar would be a hairline in a pure
+        // linear scale; we floor at 2px so it stays clickable.
+        const tiny = goodRecord({ durationMs: 10 })
+        const huge = goodRecord({ durationMs: 300_000 })
+        const svg = renderChart([huge, tiny])
+        const heights = [...svg.matchAll(/height="([\d.]+)"/g)].map((m) =>
+            parseFloat(m[1])
+        )
+        // Smallest height >= 2 (the MIN_BAR_PX floor).
+        expect(Math.min(...heights)).toBeGreaterThanOrEqual(2)
+    })
+
+    test("hash-target JS is inlined at the bottom of the document", () => {
+        const html = renderDashboard({
+            version: "0.1.7",
+            config: baseConfig(),
+            records: [],
+        })
+        expect(html).toContain("<script>")
+        expect(html).toContain("hashchange")
+        expect(html).toContain("scrollIntoView")
+        // No external script source — keep the dashboard a single file.
+        expect(html).not.toMatch(/<script[^>]+src=/)
     })
 })
 

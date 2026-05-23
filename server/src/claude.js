@@ -411,6 +411,23 @@ export const parseClaudeOutput = (
         }
     }
 
+    // Defense in depth: occasionally a model emits a server-side
+    // public status (GOOD_TO_GO_WITH_NOTES, NO_CHANGES, …) even when
+    // the schema is enforced via --json-schema. Coerce to the
+    // schema-valid pair so derivePublicStatus() can re-derive the
+    // public form correctly downstream.
+    if (parsed && typeof parsed.status === "string") {
+        const STATUS_COERCE = {
+            GOOD_TO_GO_WITH_NOTES: "ISSUES",
+            NO_PROGRESS_WITH_OPEN_ISSUES: "ISSUES",
+            NO_CHANGES: "GOOD_TO_GO",
+            ESCALATE: "ISSUES",
+        }
+        if (STATUS_COERCE[parsed.status]) {
+            parsed.status = STATUS_COERCE[parsed.status]
+        }
+    }
+
     if (!validator(parsed)) {
         return {
             ok: false,

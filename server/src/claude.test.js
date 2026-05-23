@@ -346,6 +346,32 @@ describe("parseClaudeOutput", () => {
         expect(out.ok).toBe(true)
         expect(out.value.findings[0].category).toBe("other")
     })
+
+    test("coerces a server-side public status to the schema-valid pair (defense in depth)", () => {
+        const f = {
+            file: "a.js",
+            line: 1,
+            severity: "minor",
+            category: "bug",
+            message: "x",
+        }
+        // Schema requires findings >= 1 when status === ISSUES, 0 when
+        // GOOD_TO_GO — so fixtures match the EXPECTED side.
+        const cases = [
+            ["GOOD_TO_GO_WITH_NOTES", "ISSUES", [f]],
+            ["NO_PROGRESS_WITH_OPEN_ISSUES", "ISSUES", [f]],
+            ["NO_CHANGES", "GOOD_TO_GO", []],
+            ["ESCALATE", "ISSUES", [f]],
+        ]
+        for (const [input, expected, findings] of cases) {
+            const out = parseClaudeOutput(
+                wrap({ status: input, findings }),
+                validator
+            )
+            expect(out.ok).toBe(true)
+            expect(out.value.status).toBe(expected)
+        }
+    })
 })
 
 describe("runAndParse", () => {

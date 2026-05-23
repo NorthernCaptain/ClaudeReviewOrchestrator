@@ -249,6 +249,47 @@ describe("parseGeminiOutput", () => {
         expect(out.ok).toBe(true)
         expect(out.value.findings[0].category).toBe("other")
     })
+
+    test("coerces a server-side public status to the schema-valid pair", () => {
+        // The schema only allows GOOD_TO_GO/ISSUES. The model occasionally
+        // emits a derived status like GOOD_TO_GO_WITH_NOTES (we even
+        // wrongly listed it in an earlier directive). Coerce, then
+        // validate — the server's derivePublicStatus re-derives the
+        // public name afterwards.
+        const f = {
+            file: "a.js",
+            line: 1,
+            severity: "minor",
+            category: "bug",
+            message: "x",
+        }
+        // Schema requires findings >= 1 when status is ISSUES and 0
+        // when status is GOOD_TO_GO; fixtures match the EXPECTED side.
+        const cases = [
+            ["GOOD_TO_GO_WITH_NOTES", "ISSUES", [f]],
+            ["NO_PROGRESS_WITH_OPEN_ISSUES", "ISSUES", [f]],
+            ["NO_CHANGES", "GOOD_TO_GO", []],
+            ["ESCALATE", "ISSUES", [f]],
+        ]
+        for (const [input, expected, findings] of cases) {
+            const out = parseGeminiOutput(
+                wrap({ status: input, findings }),
+                validator
+            )
+            expect(out.ok).toBe(true)
+            expect(out.value.status).toBe(expected)
+        }
+    })
+
+    test("directive lists only GOOD_TO_GO and ISSUES as valid status values", () => {
+        // Pin the directive contract — historically we listed 4 statuses
+        // and gemini followed our (wrong) directive, blowing up at
+        // ajv. This test guards against that regression.
+        const directive = __defaults__.REVIEWER_DIRECTIVE
+        expect(directive).toMatch(/EXACTLY one of `?GOOD_TO_GO`? or `?ISSUES`?/)
+        expect(directive).toMatch(/MUST NOT emit/)
+        expect(directive).toMatch(/GOOD_TO_GO_WITH_NOTES/)
+    })
 })
 
 describe("runAndParse", () => {
