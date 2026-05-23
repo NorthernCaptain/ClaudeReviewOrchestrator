@@ -103,6 +103,12 @@ const DEFAULTS = {
         "**/*.min.css",
         "**/generated/**",
     ],
+    // When true, buildPayload falls back to the most recent commit
+    // range (merge-base(HEAD, @{upstream})..HEAD, else HEAD~1..HEAD)
+    // when the working tree is clean. Repeat Stop hooks for the same
+    // HEAD short-circuit via the existing NO_CHANGES cache so no
+    // redundant reviewer spawns happen.
+    payload: { fallbackToHead: false },
     blockingSeverities: ["blocker", "major"],
     extraReviewerInstructions: null,
     reviewsDir: "./reviews",

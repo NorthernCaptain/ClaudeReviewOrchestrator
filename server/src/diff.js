@@ -132,6 +132,25 @@ const readBytesOrNull = (readFile, abs) => {
     }
 }
 
+// Resolve a base commit for the head-fallback. Prefer the merge-base
+// with the upstream branch (so a feature branch with N unreviewed
+// commits is reviewed as one range), fall back to HEAD~1 for branches
+// without an upstream. Returns null when neither resolves (e.g. an
+// initial commit with no parent).
+const resolveFallbackBase = (git, repoRoot) => {
+    const tryGit = (args) => {
+        try {
+            return git(repoRoot, args).trim()
+        } catch {
+            return ""
+        }
+    }
+    const upstream = tryGit(["merge-base", "HEAD", "@{upstream}"])
+    if (upstream) return upstream
+    const parent = tryGit(["rev-parse", "HEAD~1"])
+    return parent || null
+}
+
 export const buildPayload = ({
     repoRoot,
     config,
@@ -143,16 +162,43 @@ export const buildPayload = ({
     const priorFindingPaths = collectPriorFindingPaths(priorFindings, repoRoot)
     const isPrior = (p) => priorFindingPaths.has(p)
 
-    const nameStatusOut = git(repoRoot, ["diff", "HEAD", "--name-status", "-z"])
-    const changed = parseNameStatusZ(nameStatusOut)
-
-    const untrackedOut = git(repoRoot, [
+    let nameStatusOut = git(repoRoot, ["diff", "HEAD", "--name-status", "-z"])
+    let untrackedOut = git(repoRoot, [
         "ls-files",
         "--others",
         "--exclude-standard",
         "-z",
     ])
-    const untrackedAll = untrackedOut.split("\0").filter(Boolean)
+    let untrackedAll = untrackedOut.split("\0").filter(Boolean)
+
+    // Working tree clean + opt-in head-fallback → switch the diff
+    // reference to the commit range so a Stop hook firing AFTER the
+    // commit still has something to review. The rest of the function
+    // is reused unchanged; only the `diffRef` argument to `git diff`
+    // changes.
+    const fallbackEnabled = config?.payload?.fallbackToHead === true
+    const workingTreeClean =
+        nameStatusOut.length === 0 && untrackedAll.length === 0
+    let diffRef = "HEAD"
+    let source = "working-tree"
+    let baseSha = null
+    if (workingTreeClean && fallbackEnabled) {
+        baseSha = resolveFallbackBase(git, repoRoot)
+        if (baseSha && baseSha !== headSha) {
+            diffRef = `${baseSha}..HEAD`
+            // Re-fetch name-status for the commit range. Untracked is
+            // irrelevant — every change in the range is committed.
+            nameStatusOut = git(repoRoot, [
+                "diff",
+                diffRef,
+                "--name-status",
+                "-z",
+            ])
+            untrackedAll = []
+            source = "head-fallback"
+        }
+    }
+    const changed = parseNameStatusZ(nameStatusOut)
 
     const ignorePaths = config.ignorePaths
     const keepOrPrior = (p) => isPrior(p) || !matchesAny(p, ignorePaths)
@@ -215,7 +261,7 @@ export const buildPayload = ({
             truncated = true
             continue
         }
-        const diff = git(repoRoot, ["diff", "HEAD", "--", file])
+        const diff = git(repoRoot, ["diff", diffRef, "--", file])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
         if (t) truncated = true
         pushBlock(
@@ -237,7 +283,7 @@ export const buildPayload = ({
             truncated = true
             continue
         }
-        const diff = git(repoRoot, ["diff", "HEAD", "--", r.to])
+        const diff = git(repoRoot, ["diff", diffRef, "--", r.to])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
         if (t) truncated = true
         pushBlock(
@@ -261,7 +307,7 @@ export const buildPayload = ({
             truncated = true
             continue
         }
-        const diff = git(repoRoot, ["diff", "HEAD", "--", file])
+        const diff = git(repoRoot, ["diff", diffRef, "--", file])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
         if (t) truncated = true
         pushBlock(
@@ -376,6 +422,13 @@ export const buildPayload = ({
 
     return {
         headSha,
+        // "working-tree" | "head-fallback". The dashboard / pipeline
+        // log surfaces this so the operator can tell at a glance
+        // whether a review was triggered by uncommitted work or by
+        // a fallback to the latest commit range.
+        source,
+        // Non-null only when source === "head-fallback".
+        baseSha,
         files: filesMeta,
         totalBytes,
         truncated,

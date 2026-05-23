@@ -1483,6 +1483,91 @@ describe("handleReview — pipeline log emissions", () => {
         }
     })
 
+    test("'payload built' log carries baseSha=null when source is working-tree", async () => {
+        // Defensive: the head-fallback adds baseSha only when source is
+        // "head-fallback". The working-tree path must emit baseSha: null
+        // in the log without errors (short() handles null but the call
+        // site is now explicit — this test pins the contract).
+        const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            logger,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        // makePayload's defaults: source omitted, baseSha
+                        // omitted → both undefined in the payload.
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
+                }),
+            }),
+        })
+        const built = logger.info.mock.calls.find(
+            (c) => c[1] === "payload built"
+        )
+        expect(built).toBeDefined()
+        expect(built[0].source).toBe("working-tree")
+        expect(built[0].baseSha).toBeNull()
+    })
+
+    test("'payload built' log carries baseSha when source is head-fallback", async () => {
+        const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            logger,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                        source: "head-fallback",
+                        baseSha:
+                            "deadbeef00112233445566778899aabbccddeeff",
+                    }),
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
+                }),
+            }),
+        })
+        const built = logger.info.mock.calls.find(
+            (c) => c[1] === "payload built"
+        )
+        expect(built[0].source).toBe("head-fallback")
+        // Short-form (first 12 chars) lands in the log.
+        expect(built[0].baseSha).toBe("deadbeef0011")
+    })
+
     test("emits a stderr-tail warning when codex fails", async () => {
         const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() }
         await handleReview({
@@ -2093,5 +2178,42 @@ describe("handleReview — in-flight dedup", () => {
 
     test("defaultInflight is a shared Map at module scope (sanity)", () => {
         expect(defaultInflight).toBeInstanceOf(Map)
+    })
+})
+
+describe("computeReviewConfigHash — payload.fallbackToHead", () => {
+    test("flipping payload.fallbackToHead changes the hash (cache invalidates on flip)", () => {
+        const off = computeReviewConfigHash({
+            blockingSeverities: ["blocker", "major"],
+            ignorePaths: ["a/b/**"],
+            extraReviewerInstructions: null,
+            limits: { maxPayloadBytes: 1, maxFileBytes: 1, maxFiles: 1 },
+            payload: { fallbackToHead: false },
+        })
+        const on = computeReviewConfigHash({
+            blockingSeverities: ["blocker", "major"],
+            ignorePaths: ["a/b/**"],
+            extraReviewerInstructions: null,
+            limits: { maxPayloadBytes: 1, maxFileBytes: 1, maxFiles: 1 },
+            payload: { fallbackToHead: true },
+        })
+        expect(off).not.toBe(on)
+    })
+
+    test("absent payload block is equivalent to fallbackToHead=false", () => {
+        const absent = computeReviewConfigHash({
+            blockingSeverities: ["blocker", "major"],
+            ignorePaths: [],
+            extraReviewerInstructions: null,
+            limits: {},
+        })
+        const off = computeReviewConfigHash({
+            blockingSeverities: ["blocker", "major"],
+            ignorePaths: [],
+            extraReviewerInstructions: null,
+            limits: {},
+            payload: { fallbackToHead: false },
+        })
+        expect(absent).toBe(off)
     })
 })

@@ -271,13 +271,19 @@ const renderSuccessRow = (r) => {
 
 const renderFailureRow = (r) => {
     const d = r.failureDetail ?? {}
-    const shortReason = (r.reason ?? "—").slice(0, 120)
+    // Coerce reason: archive blobs come from disk and a hand-edited
+    // file could leave `reason` non-string. Coerce once at the top
+    // so every downstream slice / length / template-literal use is
+    // safe.
+    const reasonStr =
+        r.reason === null || r.reason === undefined ? "—" : String(r.reason)
+    const shortReason = reasonStr.slice(0, 120)
     const summary =
         `<summary>` +
         `<span class="ts">${escapeHtml(fmtTs(r.ts))}</span>` +
         `<span class="repo">${escapeHtml(r.context)}</span>` +
         `<span class="dur">${escapeHtml(fmtMs(r.durationMs))}</span>` +
-        `<span class="reason">${escapeHtml(shortReason)}${r.reason && r.reason.length > 120 ? "…" : ""}</span>` +
+        `<span class="reason">${escapeHtml(shortReason)}${reasonStr.length > 120 ? "…" : ""}</span>` +
         `</summary>`
     const kv = (k, v) =>
         v === null || v === undefined || v === ""

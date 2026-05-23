@@ -47,6 +47,11 @@ export const computeReviewConfigHash = (config) => {
             maxFileBytes: config.limits?.maxFileBytes ?? null,
             maxFiles: config.limits?.maxFiles ?? null,
         },
+        // Toggling head-fallback changes WHICH diff the reviewer sees,
+        // so a cached baseline from before the flip is no longer
+        // comparable. Including it here invalidates the cache on
+        // flip, forcing a fresh review.
+        fallbackToHead: config.payload?.fallbackToHead === true,
     }
     return createHash("sha256").update(JSON.stringify(policy)).digest("hex")
 }
@@ -176,6 +181,11 @@ const baselineSummary = (payload, reviewConfigHash = null) => ({
     files: payload.files,
     totalBytes: payload.totalBytes,
     truncated: payload.truncated,
+    // "working-tree" | "head-fallback" — only set when the payload
+    // came from a commit range (working tree was clean and the
+    // fallback flag was on). null on older payloads.
+    source: payload.source ?? null,
+    baseSha: payload.baseSha ?? null,
 })
 
 // Compact reviewer summary embedded in the /review response body.
@@ -419,6 +429,12 @@ export const handleReview = async ({
                 headSha: short(payload.headSha, 12),
                 promptHash: short(payload.promptHash, 16),
                 progressHash: short(payload.progressHash, 16),
+                source: payload.source ?? "working-tree",
+                // baseSha is null for the working-tree path; keep that
+                // null in the log instead of routing through short() so
+                // the intent is explicit at the call site and the field
+                // value is unambiguous to anyone grepping the log.
+                baseSha: payload.baseSha ? short(payload.baseSha, 12) : null,
             },
             "payload built"
         )

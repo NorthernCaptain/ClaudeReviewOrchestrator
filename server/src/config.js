@@ -141,6 +141,18 @@ const ConfigSchema = z
             })
             .default({}),
         ignorePaths: z.array(z.string()).default(DEFAULT_IGNORE_PATHS),
+        // Payload-shaping options. fallbackToHead lets buildPayload
+        // review the most recent commit range when the working tree is
+        // clean — catches the "I committed before the Stop hook fired"
+        // case. Range resolution: merge-base(HEAD, @{upstream})..HEAD
+        // when an upstream exists, otherwise HEAD~1..HEAD. Cache logic
+        // is unchanged: the resulting payload is byte-deterministic
+        // for a given HEAD so repeat Stop hooks hit NO_CHANGES.
+        payload: z
+            .object({
+                fallbackToHead: z.boolean().default(false),
+            })
+            .default({}),
         blockingSeverities: z.array(Severity).default(["blocker", "major"]),
         extraReviewerInstructions: z.string().nullable().default(null),
         reviewsDir: z.string().default("./reviews"),

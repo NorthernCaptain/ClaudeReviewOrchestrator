@@ -120,6 +120,25 @@ describe("ConfigSchema", () => {
             })
         ).toThrow()
     })
+    test("payload.fallbackToHead defaults to false", () => {
+        const r = ConfigSchema.parse({ authToken: "abc" })
+        expect(r.payload.fallbackToHead).toBe(false)
+    })
+    test("payload.fallbackToHead accepts true explicitly", () => {
+        const r = ConfigSchema.parse({
+            authToken: "x",
+            payload: { fallbackToHead: true },
+        })
+        expect(r.payload.fallbackToHead).toBe(true)
+    })
+    test("rejects a non-boolean payload.fallbackToHead", () => {
+        expect(() =>
+            ConfigSchema.parse({
+                authToken: "x",
+                payload: { fallbackToHead: "yes" },
+            })
+        ).toThrow()
+    })
     test("rejects missing authToken", () => {
         expect(() => ConfigSchema.parse({})).toThrow()
     })

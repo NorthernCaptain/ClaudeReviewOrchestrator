@@ -397,6 +397,10 @@ export const createArchive = ({
             } catch {
                 continue
             }
+            // JSON.parse("null") returns null (and similarly "42" /
+            // '"str"' return non-objects) — guard so the dashboard
+            // doesn't crash on a hand-corrupted archive file.
+            if (!record || typeof record !== "object") continue
             const result = record.result ?? {}
             const codex = record.codex ?? {}
             const context = record.context ?? {}
@@ -432,7 +436,9 @@ export const createArchive = ({
                         ? {
                               exitCode: codex.exitCode ?? null,
                               stderrTail: codex.rawStderrTail ?? "",
-                              stdoutTail: (codex.rawStdout ?? "").slice(-800),
+                              stdoutTail: String(codex.rawStdout ?? "").slice(
+                                  -800
+                              ),
                               schemaError: result.schemaError ?? null,
                               argv: codex.argv ?? null,
                           }

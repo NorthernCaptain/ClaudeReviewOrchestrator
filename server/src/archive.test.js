@@ -858,4 +858,55 @@ describe("createArchive.readRecent", () => {
         // The valid record still surfaces.
         expect(recent.some((r) => r.status === "GOOD_TO_GO")).toBe(true)
     })
+
+    test("skips files where JSON.parse succeeds but the value isn't an object", () => {
+        // JSON.parse("null") returns null — valid JSON, not an object.
+        // Pre-fix the dashboard would TypeError on record.result.
+        const archive = tickArchive()
+        writeOne(archive, 0, "a", "main", "GOOD_TO_GO")
+        const ctxDir = path.join(tmp, "a:main")
+        writeFileSync(path.join(ctxDir, "2026-12-31T23-59-59-001Z.json"), "null")
+        writeFileSync(path.join(ctxDir, "2026-12-31T23-59-59-002Z.json"), "42")
+        writeFileSync(
+            path.join(ctxDir, "2026-12-31T23-59-59-003Z.json"),
+            '"plain string"'
+        )
+        expect(() => archive.readRecent({ limit: 10 })).not.toThrow()
+        const recent = archive.readRecent({ limit: 10 })
+        // Only the real GOOD_TO_GO record survives.
+        expect(recent).toHaveLength(1)
+        expect(recent[0].status).toBe("GOOD_TO_GO")
+    })
+
+    test("tolerates a non-string rawStdout in ESCALATE records (coerces before slice)", () => {
+        const archive = tickArchive()
+        // Hand-write a record whose `codex.rawStdout` is a number so
+        // we exercise the coercion in readRecent without going through
+        // write() (which sanitizes).
+        mkdirSync(path.join(tmp, "x:main"), { recursive: true })
+        const malformed = {
+            timestamp: "2026-05-23T00:00:00.000Z",
+            context: { repo: "x", branch: "main" },
+            codex: {
+                provider: "codex",
+                model: "gpt-5.5",
+                rawStdout: 12345, // <-- not a string
+                rawStderrTail: "",
+                exitCode: 1,
+                argv: null,
+            },
+            result: { status: "ESCALATE", reason: "boom", findings: [] },
+            round: 1,
+            blockCount: 0,
+            trigger: "manual",
+        }
+        writeFileSync(
+            path.join(tmp, "x:main", "2026-05-23T00-00-00-000Z.json"),
+            JSON.stringify(malformed)
+        )
+        expect(() => archive.readRecent({ limit: 10 })).not.toThrow()
+        const recent = archive.readRecent({ limit: 10 })
+        expect(recent).toHaveLength(1)
+        expect(typeof recent[0].failureDetail.stdoutTail).toBe("string")
+    })
 })

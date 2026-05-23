@@ -283,6 +283,24 @@ describe("renderDashboard", () => {
         expect(html).toContain("SCHEMA_INVALID")
         expect(html).toContain("bad enum")
     })
+
+    test("failure row tolerates a non-string r.reason (coerces before slice)", () => {
+        // Defensive: archive blobs come from disk; a hand-edited file
+        // could leave reason as e.g. a number. The renderer must not
+        // TypeError on `.slice` / `.length`.
+        const evil = escalateRecord({ reason: 12345 })
+        expect(() => renderFailureRow(evil)).not.toThrow()
+        const html = renderFailureRow(evil)
+        expect(html).toContain("12345")
+    })
+
+    test("failure row tolerates a null r.reason (falls back to em-dash)", () => {
+        const evil = escalateRecord({ reason: null })
+        expect(() => renderFailureRow(evil)).not.toThrow()
+        const html = renderFailureRow(evil)
+        // The short-reason cell shows the em-dash placeholder.
+        expect(html).toContain("—")
+    })
 })
 
 describe("mountDashboardRoute", () => {

@@ -568,3 +568,107 @@ describe("buildPayload (integration)", () => {
         expect(out.headSha).toBe(sha)
     })
 })
+
+describe("buildPayload — head-fallback (clean working tree)", () => {
+    let dir
+    beforeEach(() => {
+        dir = makeRepo()
+        // Add a second commit so HEAD~1 exists and the fallback has
+        // something to diff against.
+        writeFileSync(path.join(dir, "feature.js"), "function f(){return 1}\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "add feature"])
+    })
+    afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+    })
+
+    const fallbackOnConfig = () => ({
+        ...baseConfig(),
+        payload: { fallbackToHead: true },
+    })
+
+    test("clean tree + fallback off → empty payload (existing behavior)", () => {
+        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(out.empty).toBe(true)
+        expect(out.source).toBe("working-tree")
+        expect(out.baseSha).toBeNull()
+    })
+
+    test("clean tree + fallback ON → emits the HEAD~1..HEAD diff with source tag", () => {
+        const out = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+        expect(out.empty).toBe(false)
+        expect(out.source).toBe("head-fallback")
+        expect(out.baseSha).toBeTruthy()
+        // The latest commit added feature.js — that's what the
+        // reviewer should see.
+        expect(out.promptText).toMatch(/=== FILE: feature.js \(modified\) ===/)
+        expect(out.files.modified.map((f) => f.path)).toContain("feature.js")
+    })
+
+    test("uncommitted working-tree change suppresses the fallback", () => {
+        // Working tree is not clean → working-tree path wins even
+        // when fallbackToHead is on.
+        writeFileSync(path.join(dir, "scratch.txt"), "wip\n")
+        const out = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+        expect(out.source).toBe("working-tree")
+        expect(out.baseSha).toBeNull()
+        // The untracked file is what's reviewed, not the commit range.
+        expect(out.files.untracked.map((u) => u.path)).toContain("scratch.txt")
+        expect(out.files.modified.map((f) => f.path)).not.toContain(
+            "feature.js"
+        )
+    })
+
+    test("two fallback runs at the same HEAD produce identical progressHash (cache stability)", () => {
+        // The whole point: a Stop hook firing repeatedly at the same
+        // HEAD must hit the existing NO_CHANGES cache. That requires
+        // buildPayload to be deterministic for the same git state.
+        const a = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+        const b = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+        expect(a.progressHash).toBe(b.progressHash)
+        expect(a.promptHash).toBe(b.promptHash)
+        expect(a.headSha).toBe(b.headSha)
+        expect(a.baseSha).toBe(b.baseSha)
+    })
+
+    test("a new commit changes the headSha AND the progressHash (cache busts)", () => {
+        const before = buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+        })
+        // New commit — same fallback path, different content.
+        writeFileSync(path.join(dir, "feature.js"), "function f(){return 2}\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "tweak"])
+        const after = buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+        })
+        expect(after.headSha).not.toBe(before.headSha)
+        expect(after.progressHash).not.toBe(before.progressHash)
+    })
+
+    test("returns empty when working tree is clean AND no parent exists (initial commit)", () => {
+        // Initialize a one-commit repo so HEAD~1 fails.
+        const empty = realpathSync(mkdtempSync(path.join(tmpdir(), "fb-init-")))
+        try {
+            execFileSync("git", ["init", "-q", "-b", "main", empty])
+            execFileSync("git", ["-C", empty, "config", "user.email", "t@t"])
+            execFileSync("git", ["-C", empty, "config", "user.name", "t"])
+            writeFileSync(path.join(empty, "a.txt"), "hi\n")
+            execFileSync("git", ["-C", empty, "add", "."])
+            execFileSync("git", ["-C", empty, "commit", "-qm", "first"])
+            const out = buildPayload({
+                repoRoot: empty,
+                config: fallbackOnConfig(),
+            })
+            // No parent → no fallback possible → empty.
+            expect(out.empty).toBe(true)
+            expect(out.source).toBe("working-tree")
+            expect(out.baseSha).toBeNull()
+        } finally {
+            rmSync(empty, { recursive: true, force: true })
+        }
+    })
+})
