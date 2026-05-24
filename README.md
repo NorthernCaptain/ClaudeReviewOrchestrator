@@ -1,16 +1,22 @@
 # Review Orchestrator
 
-An automatic, in-session code-review loop for Claude Code, using Codex CLI as a
-read-only meticulous reviewer. Claude does all development work in a single CLI
-session; when it tries to finish (or explicitly asks for a review), a local
-service runs Codex against the current changes and returns a structured result
-(approval, informational notes, or a list of blocking issues). Claude addresses
-every blocking issue in the same session and tries again. The loop repeats
-until Codex is satisfied or a per-context retry cap is reached.
+An automatic, in-session code-review loop for Claude Code. Claude does all
+development work in one CLI session; when it tries to finish (or explicitly
+asks for a review), a local service runs **one of three pluggable reviewers**
+— Codex CLI, Claude CLI, or Gemini CLI — against the current changes and
+returns a structured result (approval, informational notes, or a list of
+blocking issues). Claude addresses every blocking issue in the same session
+and tries again. The loop repeats until the reviewer is satisfied or a
+per-context retry cap is reached.
 
 No second Claude process. No external orchestrator. One long-lived Claude
-session, one short-lived Codex subprocess per review round, one local server
-that ties it all together.
+session, one short-lived reviewer subprocess per round, one local server that
+ties it all together.
+
+**Current version:** see [`package.json`](./package.json) (also surfaced via
+the startup `active config` log line and the `version` field at `/status`).
+The convention in this repo is **one patch bump per change** so a quick
+`/status` (or the dashboard at `GET /`) tells you which build is running.
 
 ## Goals
 
@@ -18,11 +24,13 @@ that ties it all together.
   cycle. The user talks to Claude there and only there.
 - Make review **automatic** by default (Stop hook), and **explicit** on demand
   (MCP tool Claude can call mid-task).
-- Make Codex's job narrow and stateless: read a diff, return findings, exit.
+- Make the reviewer's job narrow and stateless: read a diff, return findings,
+  exit. The reviewer subprocess holds no state — all bookkeeping lives in the
+  server.
 - Share **state** (change detection, retry counter, prior-findings cache)
   between the automatic and explicit entry points so they can't disagree.
 - Treat reviewed content as **untrusted data**: prompt-injection-resistant
-  Codex invocation, schema-enforced output, prompt size limits. (Note:
+  reviewer invocation, schema-enforced output, prompt size limits. (Note:
   size limits bound the prompt, not the reviewer's read-only repo
   access — see "promptHash" below.)
 - Fail open: if any piece of the infrastructure is broken, the CLI still
@@ -44,31 +52,50 @@ that ties it all together.
    ┌───────────────┐  HTTP  │  POST /mcp          (MCP transport)  │
    │  Claude CLI   │◄──────►│  POST /review       (Stop-hook API)  │
    │   (session)   │        │  POST /reset                         │
-   └───────┬───────┘        │  GET  /status                        │
-           │                │  X-Review-Token required on all      │
-           │ Stop event     │                                      │
-           ▼                │  state per (repoRoot, branch):       │
-   ┌───────────────┐  HTTP  │   - block + Codex round counters     │
-   │  Stop hook    │───────►│   - last full baseline (diff + new)  │
-   │  (Node)       │        │   - prior findings (for verify)      │
-   └───────────────┘        │   - last result status               │
-                            │   - idle timer                       │
-                            │                                      │
-                            │  spawns per Codex round:             │
-                            │   $ codex exec --cd <repoRoot>       │
-                            │       --ephemeral --sandbox read-only│
-                            │       --output-schema <path> -       │
+   └───────┬───────┘        │  GET  /status   (X-Review-Token)     │
+           │                │  GET  /        (dashboard, NO auth)  │
+           │ Stop event     │  GET  /healthz                       │
+           ▼                │                                      │
+   ┌───────────────┐  HTTP  │  state per (repoRoot, branch):       │
+   │  Stop hook    │───────►│   - block + reviewer round counters  │
+   │  (Node)       │        │   - last full baseline + hashes      │
+   └───────────────┘        │   - prior findings (for verify)      │
+                            │   - last result status (cache)       │
+                            │   - persisted under ~/.cache         │
+   ┌───────────────┐        │                                      │
+   │  Browser      │───────►│  spawns per round, one of:           │
+   │  (dashboard)  │        │   - codex exec (default)             │
+   └───────────────┘        │   - claude  -p                       │
+                            │   - gemini  -p                       │
+                            │  selected by reviewer.provider       │
                             └──────────────────────────────────────┘
 ```
 
-Three components talk to one server:
+Four components talk to one server:
 
 1. **Claude (MCP client)** calls `request_review` and `reset_review_context`
    tools over HTTP MCP, passing `cwd` explicitly.
 2. **Stop hook** posts to `/review` whenever Claude tries to end a turn,
    passing the Stop payload's `cwd` and `session_id`.
-3. **The server** is the only thing that runs `codex` and the only thing that
-   holds state.
+3. **A browser** (operator) hits `GET /` for the no-auth localhost dashboard
+   showing version, active config, timeline chart, and review history.
+4. **The server** is the only thing that runs the reviewer subprocess and
+   the only thing that holds state.
+
+### Where things live
+
+| Thing | Path |
+|---|---|
+| Config | `~/.config/review-orchestrator/config.json` |
+| Persisted state | `~/.cache/review-orchestrator/state.json` |
+| Server logs (foreground) | server's stdout/stderr |
+| Server logs (launchd) | `~/.claude/logs/review-server.{out,err}.log` |
+| Hook event log (per call) | `~/.claude/logs/review-hook.log` |
+| Hook per-call snapshot | `~/.claude/logs/review-hook-calls/<ts>.json` |
+| Archived reviews | `<config.reviewsDir>/<repo>:<branch>/<ts>.{json,md}` |
+| Replay helper | `scripts/replay-review.sh [snapshot \| --cwd <path>]` |
+| Dashboard | `http://127.0.0.1:7777/` (no auth) |
+| Healthz | `http://127.0.0.1:7777/healthz` |
 
 ### Why a server instead of two independent integrations
 
@@ -91,18 +118,23 @@ this coherent.
 
 ### 1. Review Server (`server/`)
 
-Node 24 ESM, Express, spawns `codex` per round. Long-running, started by
-launchd. Binds `127.0.0.1` only.
+Node 24 ESM, Express, spawns the configured reviewer per round. Long-running,
+started by launchd. Binds `127.0.0.1` only.
 
-**Endpoints (all require `X-Review-Token` header):**
+**Endpoints:**
 
-| Method | Path        | Purpose                                       | Caller       |
-|--------|-------------|-----------------------------------------------|--------------|
-| POST   | `/mcp`      | MCP HTTP transport (tools listed below)       | Claude       |
-| POST   | `/review`   | Run a review, return Stop-hook decision JSON  | Stop hook    |
-| POST   | `/reset`    | Clear counter + cache for a context           | Stop hook / manual |
-| GET    | `/status`   | Dump all live contexts (debug / inspection)   | Human        |
-| GET    | `/healthz`  | Liveness check (no auth)                      | launchd / hook fail-open |
+| Method | Path        | Auth | Purpose                                       | Caller       |
+|--------|-------------|------|-----------------------------------------------|--------------|
+| POST   | `/mcp`      | yes  | MCP HTTP transport (tools listed below)       | Claude       |
+| POST   | `/review`   | yes  | Run a review, return Stop-hook decision JSON  | Stop hook    |
+| POST   | `/reset`    | yes  | Clear counter + cache for a context           | Stop hook / manual |
+| GET    | `/status`   | yes  | Dump live contexts, version, redacted config  | Human        |
+| GET    | `/`         | **no**  | HTML dashboard (version, config, timeline, history) | Browser |
+| GET    | `/healthz`  | no   | Liveness check                                | launchd / hook fail-open |
+
+Auth-protected endpoints require the `X-Review-Token` header. `GET /` is
+deliberately public because the server binds `127.0.0.1` — the network bind
+is the trust boundary, not an HTTP secret.
 
 #### MCP tools exposed over `/mcp`
 
@@ -314,7 +346,7 @@ issues."
 - **Status:** ISSUES (round 2 of 5, blocks 3 of 8)
 - **Trigger:** stop_hook
 - **HEAD:** abc1234
-- **Model:** gpt-5-codex (18.4s)
+- **Reviewer:** codex (gpt-5.5) (18.4s)
 - **Payload:** 18.2 KB (not truncated)
 
 ## Blockers
@@ -331,7 +363,7 @@ issues."
 - …
 
 ---
-## Prior findings fed to Codex this round
+## Prior findings fed to the reviewer this round
 - `src/auth.js:42` — (from previous review)
 ```
 
@@ -462,40 +494,57 @@ files binary) or the total bytes is zero, return
 are excluded before size calculations. The repo-local
 `.review-orchestrator.json` (see below) can extend this list.
 
-#### Codex invocation
+#### Reviewer invocation
 
-We use plain `codex exec`, **not** `codex exec review --uncommitted`. The
-review subcommand collects its own diff and treats stdin as supplemental
-instructions, which would invalidate `promptHash`, ignore globs,
-truncation, and the prompt-injection delimiters. Owning the payload
-end-to-end is non-negotiable.
+We use the plain non-interactive `exec`/`-p` modes of each CLI, **not**
+their built-in review subcommands. The review subcommands collect their
+own diff and treat stdin as supplemental instructions, which would
+invalidate `promptHash`, ignore globs, truncation, and the
+prompt-injection delimiters. Owning the payload end-to-end is
+non-negotiable across all three providers.
+
+Argv per provider (see [`server/src/codex.js`](./server/src/codex.js),
+[`claude.js`](./server/src/claude.js), [`gemini.js`](./server/src/gemini.js)
+for the canonical builders):
 
 ```bash
-codex exec \
-  --cd <repoRoot> \
-  --ephemeral \
-  --sandbox read-only \
-  --model <config.codex.model> \
-  --output-schema <path-to-bundled-schema.json> \
-  -
+# codex
+codex exec --cd <repoRoot> --ephemeral --sandbox read-only \
+  --model <reviewer.codex.model> \
+  --output-schema <bundled-schema.json> \
+  -c model_reasoning_effort=<reviewer.codex.reasoningEffort> \
+  --ignore-rules -
+
+# claude
+claude -p --no-session-persistence --session-id <uuid> \
+  --model <reviewer.claude.model> --effort <reviewer.claude.effort> \
+  --permission-mode <reviewer.claude.permissionMode> \
+  --add-dir <repoRoot> --output-format json --json-schema <inline> \
+  --append-system-prompt <directive> --disallowed-tools <csv>
+
+# gemini
+gemini -p <directive> -m <reviewer.gemini.model> \
+  --approval-mode <reviewer.gemini.approvalMode> --skip-trust -o json \
+  --session-id <uuid>
 ```
 
-- `--cd <repoRoot>` ensures Codex resolves paths against the actual repo,
-  not the server's working directory.
-- `--ephemeral` skips session persistence on Codex's side — we don't want
-  the reviewer to remember prior runs across our explicit `priorFindings`
-  hand-off.
-- `--output-schema` points at `server/src/codex-output.schema.json`, the
-  JSON Schema for the unified review result. Schema enforcement is the
-  *primary* guarantee that the output is structured.
-- `--sandbox read-only` keeps the reviewer from touching the filesystem.
+Common ground:
 
-If `config.codex.ignoreProjectRules: true` (default **true**), append
-`--ignore-rules` so the repo's `AGENTS.md` / `.codex/instructions.md`
-cannot contradict the reviewer system preamble or the output contract.
+- The reviewer's CWD is the repo root.
+- The reviewer is started ephemeral (no session persistence) so prior
+  runs don't bleed in across our explicit `priorFindings` hand-off.
+- The reviewer is read-only via per-CLI sandbox/permission flags +
+  (for claude) an explicit `--disallowed-tools` block.
+- Output is JSON validated against `server/src/codex-output.schema.json`.
+  Codex enforces the schema via `--output-schema`; claude via
+  `--json-schema`; gemini relies on the prompt directive plus our salvage
+  parser + ajv re-validation.
+- If `config.codex.ignoreProjectRules: true` (default), codex gets
+  `--ignore-rules` so the repo's `AGENTS.md` / `.codex/instructions.md`
+  cannot contradict the reviewer system preamble or the output contract.
 
 **Unified output contract — one JSON object, always.** No raw
-`GOOD-TO-GO` string, no findings-only array. Codex must emit:
+`GOOD-TO-GO` string, no findings-only array. Every provider must emit:
 
 ```json
 {
@@ -515,13 +564,18 @@ cannot contradict the reviewer system preamble or the output contract.
 
 - `findings` is `[]` when `status: "GOOD_TO_GO"`.
 - `findings` is non-empty when `status: "ISSUES"`.
-- The server computes `blockingFindings = findings.filter(f => blockingSeverities.includes(f.severity))` itself; Codex doesn't carry that concept.
+- The server computes `blockingFindings = findings.filter(f => blockingSeverities.includes(f.severity))` itself; the reviewer doesn't carry that concept.
+- The server post-processes `ISSUES` into `GOOD_TO_GO_WITH_NOTES` when
+  no finding's severity is in `blockingSeverities` (default `["blocker",
+  "major"]`). The reviewer never emits the derived statuses directly.
 
-The bundled `codex-output.schema.json` enforces this exactly. There is no
-fallback parser — schema-invalid output returns
-`ESCALATE: codex output failed schema` and archives the raw stdout for
-inspection. (Codex's `--output-schema` is documented to constrain output
-reliably; trusting it removes a whole class of parsing edge cases.)
+The bundled `codex-output.schema.json` is the single source of truth.
+Schema-invalid output returns `ESCALATE: <provider> output SCHEMA_INVALID`
+and archives the raw stdout for inspection. Claude and Gemini adapters
+include a defense-in-depth coercion step that maps known server-side
+status names (`GOOD_TO_GO_WITH_NOTES`, `NO_PROGRESS_WITH_OPEN_ISSUES`,
+`NO_CHANGES`, `ESCALATE`) to the schema-valid pair before ajv runs, so
+a single status drift doesn't blow up an otherwise-valid review.
 
 stdin payload (built by the server):
 
@@ -671,13 +725,38 @@ Hook responsibilities (kept minimal):
      ```json
      {
        "decision": "block",
-       "reason": "Codex review (round N of 5, block M of 6):\n\n<formatted blocking findings>\n\nAddress every BLOCKING point, then finish."
+       "reason": "Code review by <provider> (round N of 5, block M of 6):\n\n<formatted blocking findings>\n\nAddress every BLOCKING point, then finish."
      }
      ```
-     Exit 0.
+     Exit 0. The `<provider>` is read from `body.codex.provider` in the
+     `/review` response; if absent (legacy server), the header degrades
+     to plain `Code review`.
 
-Hook writes a heartbeat (`Reviewing changes with Codex…`) to stderr before
-the fetch so the CLI shows progress instead of looking hung.
+Hook writes a heartbeat (`reviewing changes…`) to stderr before the fetch
+so the CLI shows progress instead of looking hung.
+
+The hook also writes a per-invocation **snapshot** to
+`~/.claude/logs/review-hook-calls/<ts>.json` capturing `claudeInput`,
+`serverRequest` (auth redacted), `serverResponse` (incl. `x-request-id`),
+and the decision returned to Claude Code. Use `scripts/replay-review.sh`
+to re-run any snapshot against the live server without invoking Claude.
+
+#### Hook env vars
+
+The hook inherits its env from the `claude` process, which in turn
+inherits from the shell that launched it. The orchestrator reads one
+env var directly:
+
+| Env | Effect |
+|---|---|
+| `REVIEW_ORCH_SKIP` | When set to any non-empty value, the hook skips the review entirely — no server call, no `decision: block`, exits 0. A short banner is printed to stderr (`review-orchestrator: skipping review (REVIEW_ORCH_SKIP=…)`), the skip is recorded in `~/.claude/logs/review-hook.log` as `event: "skipped_via_env"`, and a snapshot is still written for grep-ability. Per-`claude`-invocation: closing the CLI removes the var. |
+
+Use it for sessions that won't produce code worth reviewing — long Q&A,
+docs-only edits, or scratch exploration:
+
+```bash
+REVIEW_ORCH_SKIP=1 claude   # this CLI session skips every Stop review
+```
 
 ### 4. Per-project overrides (`.review-orchestrator.json`)
 
@@ -718,7 +797,110 @@ The snippet must tell Claude to **always pass `cwd`** to `request_review`
 and `reset_review_context`, using the current working directory of the
 session.
 
+### 6. Reviewer providers
+
+The reviewer is pluggable. `config.reviewer.provider` picks one of:
+
+| Provider | Binary  | Schema enforcement              | Auth                                   | Notes |
+|----------|---------|----------------------------------|----------------------------------------|-------|
+| `codex`  | `codex` | `--output-schema <path>` (strict) | Codex CLI's own login (ChatGPT or API key) | Default. The original adapter; tightest schema enforcement. |
+| `claude` | `claude` | `--json-schema <inline>` (best-effort) | OAuth keychain via `claude login`, or `ANTHROPIC_API_KEY` | Salvage parser handles prose lead-ins; defense-in-depth status coercion. |
+| `gemini` | `gemini` | none (prompt-only contract)      | `GEMINI_API_KEY` env, or `gemini auth login` (OAuth) | `--model auto` is the "Auto (Gemini 3)" router; status coercion required. |
+
+Each adapter implements the same `runAndParse({repoRoot, prompt, config})`
+contract and returns `{status, findings, raw, salvaged?}`. The schema
+([`server/src/codex-output.schema.json`](./server/src/codex-output.schema.json))
+is shared across providers; it allows exactly two status values — `GOOD_TO_GO`
+and `ISSUES`. Every other public status (`GOOD_TO_GO_WITH_NOTES`, `NO_CHANGES`,
+`NO_PROGRESS_WITH_OPEN_ISSUES`, `ESCALATE`) is **server-derived** from those
+two plus the on-disk change state and the configured `blockingSeverities`. If
+a model returns a server-side status name anyway, the adapter coerces it back
+to the schema-valid pair before validation as defense in depth.
+
+Switch providers by editing the config and restarting the server:
+
+```bash
+jq '.reviewer.provider = "claude"' \
+  ~/.config/review-orchestrator/config.json | sponge ~/.config/review-orchestrator/config.json
+```
+
+For gemini in particular, the orchestrator runs a startup pre-flight check:
+if `provider === "gemini"` AND `GEMINI_API_KEY` is missing in env AND
+`~/.gemini/settings.json` says `auth.selectedType === "gemini-api-key"`, the
+server exits with a clear error rather than failing every Stop hook in ~1s
+with an opaque exit code. Filesystem-based OAuth credentials are accepted.
+
+The active provider is logged at startup (`active config` line) and surfaced
+both in `GET /status.config.reviewer.provider` and in the dashboard at
+`GET /`. The /review response body's `codex.provider` field carries the
+actual provider that ran, which the Stop hook uses to render its block
+reason header (e.g. "Code review by gemini").
+
+### 7. Dashboard (`server/src/dashboard.js`, served at `GET /`)
+
+Self-contained HTML page, no external assets, no client-side framework. Three
+panels:
+
+- **Active config:** version, provider, model, effort/mode, reviewer timeout,
+  hook fetch timeout (shows `auto` when derived), round + block caps,
+  blocking severities, allowed roots count, port/bind.
+- **Timeline chart:** inline SVG, one bar per archived review, oldest→newest,
+  **linear** duration height with a min-px floor, color-coded by status
+  (`ESCALATE` is red). Findings count labels above the bar when there's room.
+  Each bar is wrapped in `<a href="#review-N">`; a ~15-line inline JS opens
+  the matching `<details>` row on `hashchange` and `scrollIntoView`s it.
+- **Reviews + Failed:** every archived attempt appears in **Reviews** (incl.
+  ESCALATEs, which render an inline reason); the **Failed** quick-view duplicates
+  just the failures with full stderr/argv/schema-error detail. Section
+  headings: "failed · N" in the same red as the ESCALATE bars.
+
+XSS-safe: every dynamic field passes through an `escapeHtml` helper.
+
+Data source is the archive directory (`config.reviewsDir`). The server reads
+the most recent 200 records on every request via `archive.readRecent({limit})`;
+malformed files (`JSON.parse("null")`, non-object roots, etc.) are skipped
+silently.
+
 ## Loop semantics (important)
+
+### Behavior changes since the original v1 spec
+
+This section documents the orchestrator's current behavior, including
+changes since the initial Phase-9 build. The most material ones an
+operator should know about:
+
+- **Multi-provider** — the reviewer is pluggable: `codex` (default),
+  `claude`, or `gemini`. See *Reviewer providers* and `reviewer.provider`.
+- **State persistence is real** — `~/.cache/review-orchestrator/state.json`
+  is loaded on startup. Restarting the server does NOT lose the cache.
+- **Idle reset is partial** — clears loop counters only; `lastBaseline`
+  + `lastResultStatus` + `lastEscalateReason` are preserved so a Stop
+  hook fired hours after the previous review on a clean tree hits the
+  cache and returns `NO_CHANGES` in milliseconds.
+- **In-flight dedup** — concurrent `/review` calls for the same
+  `<repoRoot>|<branch>` attach to one in-flight Promise, one spawn.
+- **Head-fallback** — `payload.fallbackToHead: true` (opt-in) reviews
+  the last commit range when the working tree is clean, catching the
+  "I committed before the Stop hook fired" case.
+- **Hook fetch timeout** — auto-derived from the reviewer timeout + 60s
+  when `hook.fetchTimeoutSeconds` is null. One knob (the reviewer
+  timeout) controls the whole chain.
+- **Public dashboard** — `GET /` is no-auth, server-rendered HTML with
+  a timeline chart of recent reviews and an expandable history.
+- **Provider-agnostic logs** — pipeline log messages use "reviewer"
+  instead of "codex"; the actual provider name appears in a `provider`
+  log field and in the `/review` response's `codex.provider` sub-field
+  (the envelope key stays `codex` for client compatibility).
+- **Status enum** — the schema allows only `GOOD_TO_GO` and `ISSUES`.
+  Other public statuses are derived by the server. Adapters coerce any
+  drift back to the schema-valid pair as defense in depth.
+- **Skip-via-env** — `REVIEW_ORCH_SKIP=<anything>` makes the Stop hook
+  short-circuit before contacting the server. Useful for Claude
+  sessions where you know no code review is needed (long Q&A, doc-only
+  edits, scratch). The skip is per-claude-invocation; set the var in
+  the shell that launches `claude`. See *Hook env vars* below.
+
+### Multi-round loop
 
 The multi-round review loop happens **inside a single turn**. The hook
 ignores `stop_hook_active` and keeps blocking until the server returns a
@@ -729,16 +911,17 @@ Sequence on the user's screen:
 
 1. User: "implement X"
 2. Claude edits files, says "done", emits Stop.
-3. Stop hook fires → server runs Codex → `ISSUES` (round 1).
+3. Stop hook fires → server runs the configured reviewer → `ISSUES` (round 1).
 4. Hook returns `decision: block` with **blocking** findings as `reason`.
 5. Claude sees the findings as a system message and continues **in the
    same turn**, edits files, says "done", emits Stop again.
 6. Hook fires again. Server recomputes the baseline; if anything actually
-   changed, runs Codex (round 2). If nothing changed and findings remain,
-   returns `NO_PROGRESS_WITH_OPEN_ISSUES` and the hook re-blocks with the
-   same findings (`blockCount` is still under cap).
+   changed, runs the reviewer (round 2). If nothing changed and findings
+   remain, returns `NO_PROGRESS_WITH_OPEN_ISSUES` and the hook re-blocks
+   with the same findings (`blockCount` is still under cap).
 7. Repeats until one of:
-   - Codex returns `GOOD_TO_GO` (or `GOOD_TO_GO_WITH_NOTES`, when only
+   - The reviewer returns `GOOD_TO_GO` (or the server derives
+     `GOOD_TO_GO_WITH_NOTES` when only
      `minor`/`nit` findings remain) → hook exits 0 → turn actually ends.
    - `codexRounds` hits `maxCodexRounds` (default 5) → `ESCALATE`.
    - `blockCount` hits `maxBlocks` (default 6) → `ESCALATE`.
@@ -752,74 +935,173 @@ Trade-offs of this choice (vs honoring `stop_hook_active`):
 - **Pro:** All review rounds for one task are visibly contiguous in the
   transcript.
 - **Con:** Higher risk of a runaway turn if caps fail or are
-  misconfigured. Mitigations: two server-side caps (Codex rounds and total
+  misconfigured. Mitigations: two server-side caps (reviewer rounds and total
   blocks), the Claude-Code-level 8-block backstop, and `NO_PROGRESS`
   detection that does not consume `codexRounds`.
 - **Con:** No natural human checkpoint between rounds. The user can
   Ctrl-C at any point.
+
+### Cache & change detection
+
+Three hashes drive the no-spawn short-circuit:
+
+- **`promptHash`** — sha256 of the full prompt text the reviewer would see.
+- **`progressHash`** — sha256 of `promptHash` plus per-file content hashes of
+  every prior-finding file (so an edit past `maxFileBytes` still flips the
+  hash and the no-progress check sees forward motion).
+- **`reviewConfigHash`** — sha256 of the review-policy slice of config:
+  `blockingSeverities`, `ignorePaths`, `extraReviewerInstructions`,
+  `limits.maxPayloadBytes/maxFileBytes/maxFiles`, AND `payload.fallbackToHead`.
+  Flipping any of these invalidates cached baselines automatically.
+
+A cache hit fires when the new `progressHash` matches `state.lastBaseline.progressHash`
+AND `reviewConfigHash` matches `state.lastBaseline.reviewConfigHash` AND
+`state.lastResultStatus` is a terminal status. Outcomes:
+
+| Last status | Cache decision |
+|---|---|
+| `GOOD_TO_GO` / `GOOD_TO_GO_WITH_NOTES` | `NO_CHANGES`, no spawn |
+| `ISSUES` | `NO_PROGRESS_WITH_OPEN_ISSUES`, block (counts against `maxBlocks`) |
+| `ESCALATE` | Returns cached `ESCALATE` with the prior reason; no re-spawn |
+
+### State persistence and idle reset
+
+State is persisted to `~/.cache/review-orchestrator/state.json` and reloaded
+on server startup. Each context (`<repoRoot>|<branch>`) has two kinds of
+data:
+
+- **Loop counters** (`codexRounds`, `blockCount`, `priorFindings`) — track
+  the verify-finding cycle within a single development session. These are
+  cleared by the **idle reset** when more than `idleResetMinutes` (default
+  10) has passed since the last review.
+- **Content-keyed cache** (`lastBaseline`, `lastResultStatus`,
+  `lastEscalateReason`) — **preserved** across idle resets and server
+  restarts. The cache only short-circuits when `progressHash` and
+  `reviewConfigHash` match, so keeping it across arbitrary durations is
+  safe: stale entries just miss when something has actually changed on disk.
+
+This means a Stop hook fired hours after the previous review — on a clean
+tree with no commits — hits the cache and returns `NO_CHANGES` in
+milliseconds, no reviewer spawn. A `POST /reset` clears both kinds of data
+for a specific context.
+
+### In-flight deduplication
+
+When two Stop hooks fire for the same `<repoRoot>|<branch>` within a single
+review window (Claude Code re-invokes the hook on each Stop event even while
+a previous invocation is still waiting), the second `/review` call attaches
+to the first one's in-flight Promise via a module-scoped Map. Same response
+returned to both callers, only one reviewer spawn. Cleared on resolve OR
+reject so a failed run doesn't poison the slot.
+
+### Head-fallback (opt-in)
+
+`payload.fallbackToHead: true` lets `buildPayload` review the most recent
+commit range when the working tree is clean. Range:
+`merge-base(HEAD, @{upstream})..HEAD` when an upstream exists, else
+`HEAD~1..HEAD`. Catches the "I committed before the Stop hook fired" case.
+
+Cache rules still apply: a stable `progressHash` for `(headSha, base, file
+contents)` means a follow-up Stop hook on the same `HEAD` short-circuits to
+`NO_CHANGES` with no spawn. A new commit on the branch busts the hash and
+re-spawns the reviewer.
+
+Off by default to preserve the original working-tree-only semantics. The
+flag is part of `reviewConfigHash` so toggling it busts the cache cleanly.
 
 ## Failure modes & fallbacks
 
 | Failure | Behavior |
 |---|---|
 | Server not running | Hook fails open, logs, Claude finishes normally. |
-| Codex CLI missing / errors | Server returns `ESCALATE` with error message. |
-| Codex output fails schema | `ESCALATE: codex output failed schema`, raw stdout archived. |
+| Reviewer binary missing / errors | Server returns `ESCALATE` with error message. |
+| Reviewer output fails schema | `ESCALATE: <provider> output SCHEMA_INVALID`, raw stdout archived. Claude/Gemini adapters salvage a prose-wrapped JSON when possible (logged as `salvaged: true`). |
+| Reviewer exits non-zero with valid envelope | Trusted as success; warn-logged as `reviewer exited non-zero but envelope was valid; trusting envelope`. |
 | Only non-blocking findings | `GOOD_TO_GO_WITH_NOTES`, hook exits 0, notes on stderr. |
-| Hook timeout (280s) | Claude finishes normally (better than hanging the CLI). |
+| Hook fetch timeout | Default = `reviewer timeout + 60s` (auto-derived in `stop-review.mjs`). Override with `hook.fetchTimeoutSeconds`. Claude finishes normally. |
 | `maxCodexRounds` exhausted | `ESCALATE`, hook exits 0, banner on stderr. |
 | `maxBlocks` exhausted | `ESCALATE`, hook exits 0, banner on stderr. |
 | Same baseline + open issues | `NO_PROGRESS_WITH_OPEN_ISSUES`, block (until `maxBlocks`). |
-| Branch switch mid-loop | Counters + cache reset, fresh review on next call. |
-| Two sessions same context | Per-context mutex serializes; both share state intentionally. |
-| Payload > limits | Files truncated, `baseline.truncated=true`, Codex still runs. |
-| Payload empty/binary-only | `ESCALATE: payload empty or fully binary`. |
+| Server restart between reviews | Cache survives (loaded from `~/.cache/review-orchestrator/state.json`); idle reset clears only loop counters. |
+| Branch switch mid-loop | Different `contextKey`, fresh review on next call. |
+| Two stops same context concurrently | In-flight dedup: second caller attaches to the first promise, one spawn. |
+| Payload > limits | Files truncated, `baseline.truncated=true`, reviewer still runs. |
+| Payload empty/binary-only | `ESCALATE: payload empty or fully binary` (unless `payload.fallbackToHead` is on and a base commit resolves). |
 | Repo not a git repo | `ESCALATE: not a git repository`. |
 | `cwd` outside `allowedRoots` | `ESCALATE: cwd not in allowed roots`. |
 | Missing/invalid `X-Review-Token` | HTTP 401, hook fails open. |
+| `provider: "gemini"` with no key + api-key auth selected | Server exits at startup with a clear error (pre-flight check). OAuth via `~/.gemini/` is accepted. |
 
 ## Configuration
 
-`~/.config/review-orchestrator/config.json`:
+`~/.config/review-orchestrator/config.json` (all fields validated by zod; the
+example below shows every supported key and the current default):
 
 ```json
 {
   "port": 7777,
   "bind": "127.0.0.1",
   "authToken": "<generated-by-install.sh>",
-  "allowedRoots": ["/Users/leo"],
+  "allowedRoots": ["~"],
+
   "codex": {
     "binary": "codex",
-    "model": "gpt-5-codex",
+    "model": "gpt-5.5",
+    "reasoningEffort": "high",
     "ignoreProjectRules": true,
     "extraArgs": []
   },
+
+  "reviewer": {
+    "provider": "codex",
+    "claude": {
+      "binary": "claude",
+      "model": "claude-opus-4-7",
+      "effort": "high",
+      "permissionMode": "bypassPermissions",
+      "disallowedTools": ["Bash","Edit","Write","NotebookEdit","WebFetch","WebSearch","Task"],
+      "timeoutSeconds": 240,
+      "extraArgs": []
+    },
+    "gemini": {
+      "binary": "gemini",
+      "model": "auto",
+      "approvalMode": "plan",
+      "timeoutSeconds": 240,
+      "extraArgs": []
+    }
+  },
+
   "limits": {
     "maxCodexRounds": 5,
     "maxBlocks": 6,
     "idleResetMinutes": 10,
     "codexTimeoutSeconds": 240,
+    "maxCodexOutputBytes": 1048576,
     "maxPayloadBytes": 262144,
     "maxFileBytes": 65536,
     "maxFiles": 40
   },
+
   "ignorePaths": [
-    "**/node_modules/**",
-    "**/dist/**",
-    "**/.git/**",
-    "**/coverage/**",
-    "**/*.lock",
-    "**/package-lock.json",
-    "**/yarn.lock",
-    "**/pnpm-lock.yaml",
-    "**/Cargo.lock",
-    "**/*.min.js",
-    "**/*.min.css",
-    "**/generated/**"
+    "**/node_modules/**","**/dist/**","**/.git/**","**/coverage/**",
+    "**/*.lock","**/package-lock.json","**/yarn.lock","**/pnpm-lock.yaml",
+    "**/Cargo.lock","**/*.min.js","**/*.min.css","**/generated/**"
   ],
+
+  "payload": {
+    "fallbackToHead": false
+  },
+
   "blockingSeverities": ["blocker", "major"],
+  "extraReviewerInstructions": null,
   "reviewsDir": "./reviews",
   "reviewsRetentionDays": null,
+
+  "hook": {
+    "fetchTimeoutSeconds": null
+  },
+
   "logging": {
     "dir": "~/.claude/logs",
     "level": "info"
@@ -827,7 +1109,34 @@ Trade-offs of this choice (vs honoring `stop_hook_active`):
 }
 ```
 
+### Knob reference
+
+| Key | Default | Effect |
+|---|---|---|
+| `reviewer.provider` | `"codex"` | Selects the reviewer adapter: `codex`, `claude`, or `gemini`. Both sub-blocks ship pre-populated so flipping `provider` needs no other edits. |
+| `reviewer.claude.effort` | `"high"` | Maps to Claude CLI `--effort`. One of `low\|medium\|high\|xhigh\|max`. |
+| `reviewer.claude.permissionMode` | `"bypassPermissions"` | Only mode that returns a clean assistant response in non-interactive `-p` mode; `disallowedTools` is the real safety boundary. |
+| `reviewer.gemini.model` | `"auto"` | Router alias = the CLI's interactive "Auto (Gemini 3)" mode. Pin to e.g. `"gemini-2.5-pro"` for reproducibility. |
+| `reviewer.gemini.approvalMode` | `"plan"` | Read-only non-interactive mode. |
+| `payload.fallbackToHead` | `false` | Opt-in: when working tree is clean, review the last commit range instead of returning `EMPTY_PAYLOAD`. |
+| `hook.fetchTimeoutSeconds` | `null` (auto) | When null, the hook auto-derives from `max(reviewer.{provider}.timeoutSeconds, limits.codexTimeoutSeconds) + 60s`. Override to pin. |
+| `limits.idleResetMinutes` | `10` | Loop-counter idle reset interval. **Cache fields are preserved** across the reset and across server restarts (see "State persistence" above). |
+
+### Knobs that invalidate the cache when changed
+
+`reviewConfigHash` is computed from a subset of config and stored alongside
+the baseline. Flipping any of these on a server restart busts cached
+baselines without needing `/reset`: `blockingSeverities`, `ignorePaths`,
+`extraReviewerInstructions`, `limits.{maxPayloadBytes,maxFileBytes,maxFiles}`,
+`payload.fallbackToHead`.
+
 ## Implementation plan
+
+> **Historical**: this section documents the original v0.1.0 phased build.
+> All phases shipped. Subsequent changes (multi-provider, dashboard,
+> in-flight dedup, head-fallback, partial idle reset, etc.) live in the
+> *Components*, *Loop semantics*, and *Configuration* sections above —
+> those are the source of truth for current behavior.
 
 Phased so each phase is independently usable. Security, auth, and size
 limits are in v1 — not deferred.
@@ -1056,8 +1365,11 @@ practical; tests must never invoke the real `codex` binary.
 
 These are settled for v1.
 
-- **Reviewer model:** `gpt-5-codex` (Codex CLI default). Overridable via
-  `config.codex.model`.
+- **Default provider:** `codex` (`config.reviewer.provider`). Alternatives
+  are `claude` and `gemini` — see *Reviewer providers* above. Each
+  provider's model and effort/mode are configured under its own sub-key
+  (e.g. `reviewer.gemini.model`). The codex default model is `gpt-5.5`;
+  override via `config.codex.model`.
 - **Diff scope:** uncommitted only — tracked modifications + untracked
   non-ignored files. Server builds the payload itself and passes it on
   stdin to plain `codex exec` (see *Codex invocation* below).

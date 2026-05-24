@@ -476,6 +476,14 @@ const defaultSnapshotForEnv = () =>
 // from config (so a user bump of reviewer.claude.timeoutSeconds tracks
 // through to the hook without a second edit). Pass an explicit value
 // only when the caller wants to pin the timeout regardless of config.
+//
+// REVIEW_ORCH_SKIP env: when set to any non-empty value in the env the
+// hook inherits from Claude Code (which inherits from your shell), the
+// hook short-circuits before contacting the server. Use it when you
+// know a Claude session won't produce code worth reviewing — e.g. a
+// long Q&A session, a docs-only edit, scratch exploration. The skip is
+// per-claude-invocation; close the CLI and the var is gone, so it
+// can't accidentally disable review for the next session.
 export const main = async ({
     stdin = process.stdin,
     stdout = process.stdout,
@@ -487,6 +495,7 @@ export const main = async ({
     tokenReader = readToken,
     urlOverride = null,
     timeoutMs = null,
+    env = process.env,
 } = {}) => {
     let payload
     try {
@@ -504,6 +513,47 @@ export const main = async ({
                 serverResponse: null,
                 fetchError: null,
                 decision: null,
+            },
+            { now }
+        )
+        return 0
+    }
+
+    // Skip via env. Must come AFTER readStdinJSON so the snapshot can
+    // still record what Claude Code sent us (cwd / session_id) for
+    // later inspection. Must come BEFORE the cwd validation and the
+    // server fetch — by definition the user wants this turn to end
+    // without a review.
+    const skipRaw = env?.REVIEW_ORCH_SKIP
+    if (typeof skipRaw === "string" && skipRaw.length > 0) {
+        // Cap the displayed value so a long env doesn't blow up the
+        // user-facing stderr banner; the log + snapshot still record
+        // it verbatim for debugging.
+        const display =
+            skipRaw.length > 40 ? `${skipRaw.slice(0, 40)}…` : skipRaw
+        stderr.write(
+            `review-orchestrator: skipping review (REVIEW_ORCH_SKIP=${display}); ` +
+                `unset to re-enable.\n`
+        )
+        log(
+            {
+                event: "skipped_via_env",
+                env: "REVIEW_ORCH_SKIP",
+                value: skipRaw,
+            },
+            { now }
+        )
+        snapshot(
+            {
+                claudeInput: payload,
+                serverRequest: null,
+                serverResponse: null,
+                fetchError: null,
+                decision: {
+                    event: "skipped_via_env",
+                    env: "REVIEW_ORCH_SKIP",
+                    value: skipRaw,
+                },
             },
             { now }
         )

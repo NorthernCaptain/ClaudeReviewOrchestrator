@@ -1183,3 +1183,146 @@ describe("main snapshot wiring", () => {
         expect(entry.decision.event).toBe("no_token")
     })
 })
+
+describe("main — REVIEW_ORCH_SKIP env", () => {
+    const cwd = "/repo"
+
+    test("with REVIEW_ORCH_SKIP set, exits 0 without contacting the server", async () => {
+        const stdout = mkWritable()
+        const stderr = mkWritable()
+        const logSpy = jest.fn()
+        const snapSpy = jest.fn(() => "/tmp/skip-snap.json")
+        const fetchSpy = jest.fn(async () => {
+            throw new Error("server should not be called when skip is set")
+        })
+        const code = await main({
+            stdin: stdinFromJSON({ cwd, session_id: "s1" }),
+            stdout,
+            stderr,
+            fetchFn: fetchSpy,
+            tokenReader: () => ({
+                token: "T",
+                url: "http://127.0.0.1:9999/review",
+            }),
+            log: logSpy,
+            snapshot: snapSpy,
+            env: { REVIEW_ORCH_SKIP: "1" },
+        })
+        expect(code).toBe(0)
+        expect(stdout.text()).toBe("") // no decision: block JSON
+        expect(stderr.text()).toMatch(/skipping review/)
+        expect(stderr.text()).toMatch(/REVIEW_ORCH_SKIP=1/)
+        expect(fetchSpy).not.toHaveBeenCalled()
+        expect(logSpy).toHaveBeenCalledWith(
+            expect.objectContaining({
+                event: "skipped_via_env",
+                env: "REVIEW_ORCH_SKIP",
+                value: "1",
+            }),
+            expect.any(Object)
+        )
+        // The snapshot captures the Claude input even though the
+        // server was never touched — useful for grepping the
+        // ~/.claude/logs/review-hook-calls/ history.
+        const [snapEntry] = snapSpy.mock.calls[0]
+        expect(snapEntry.claudeInput).toEqual({ cwd, session_id: "s1" })
+        expect(snapEntry.serverRequest).toBeNull()
+        expect(snapEntry.serverResponse).toBeNull()
+        expect(snapEntry.decision.event).toBe("skipped_via_env")
+    })
+
+    test("any non-empty string value triggers the skip", async () => {
+        for (const value of ["1", "true", "yes", "skip-this-session", "x"]) {
+            const stderr = mkWritable()
+            const fetchSpy = jest.fn()
+            const code = await main({
+                stdin: stdinFromJSON({ cwd }),
+                stdout: mkWritable(),
+                stderr,
+                fetchFn: fetchSpy,
+                tokenReader: () => ({ token: "T", url: "u" }),
+                log: () => {},
+                snapshot: () => null,
+                env: { REVIEW_ORCH_SKIP: value },
+            })
+            expect(code).toBe(0)
+            expect(fetchSpy).not.toHaveBeenCalled()
+            expect(stderr.text()).toMatch(/skipping review/)
+        }
+    })
+
+    test("does NOT skip when REVIEW_ORCH_SKIP is empty / unset / non-string", async () => {
+        const fakeFetch = jest.fn(async () => ({
+            status: 200,
+            json: async () => ({
+                status: "GOOD_TO_GO",
+                findings: [],
+                blockingFindings: [],
+            }),
+            headers: { get: () => null },
+        }))
+        for (const env of [
+            {},
+            { REVIEW_ORCH_SKIP: "" },
+            { REVIEW_ORCH_SKIP: undefined },
+            // Non-string values shouldn't trigger — env should always
+            // be strings in practice, but defend against accidents.
+            { REVIEW_ORCH_SKIP: 0 },
+            { REVIEW_ORCH_SKIP: null },
+        ]) {
+            fakeFetch.mockClear()
+            await main({
+                stdin: stdinFromJSON({ cwd, session_id: "s1" }),
+                stdout: mkWritable(),
+                stderr: mkWritable(),
+                fetchFn: fakeFetch,
+                tokenReader: () => ({ token: "T", url: "u" }),
+                log: () => {},
+                snapshot: () => null,
+                env,
+            })
+            expect(fakeFetch).toHaveBeenCalled()
+        }
+    })
+
+    test("truncates long REVIEW_ORCH_SKIP values in the stderr banner", async () => {
+        const long = "x".repeat(120)
+        const stderr = mkWritable()
+        await main({
+            stdin: stdinFromJSON({ cwd }),
+            stdout: mkWritable(),
+            stderr,
+            fetchFn: () => {},
+            tokenReader: () => ({ token: "T", url: "u" }),
+            log: () => {},
+            snapshot: () => null,
+            env: { REVIEW_ORCH_SKIP: long },
+        })
+        // Banner has the truncated form; the full value never lands in
+        // the user's CLI output even if a hostile shell exported a huge
+        // string.
+        expect(stderr.text()).toContain(
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+        )
+        expect(stderr.text()).not.toContain(long)
+    })
+
+    test("works even when payload has no cwd (skip wins over cwd validation)", async () => {
+        // If REVIEW_ORCH_SKIP is set, we want to skip regardless of
+        // what's on stdin — even a malformed Stop payload shouldn't
+        // matter.
+        const fetchSpy = jest.fn()
+        const code = await main({
+            stdin: stdinFromJSON({}),
+            stdout: mkWritable(),
+            stderr: mkWritable(),
+            fetchFn: fetchSpy,
+            tokenReader: () => ({ token: "T", url: "u" }),
+            log: () => {},
+            snapshot: () => null,
+            env: { REVIEW_ORCH_SKIP: "1" },
+        })
+        expect(code).toBe(0)
+        expect(fetchSpy).not.toHaveBeenCalled()
+    })
+})
