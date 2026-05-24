@@ -132,6 +132,36 @@ const readBytesOrNull = (readFile, abs) => {
     }
 }
 
+// Shallow "is the working tree clean?" probe used by the change-
+// notification fast path. ONE `git status --porcelain -z` call —
+// reports modifications, additions, deletions, renames, and untracked
+// (non-ignored) files all in a single command. Empty output = clean.
+// Returns true only when stdout is empty. Any error is treated as "not
+// clean" so the fast path defers to the slow path when in doubt.
+//
+// ~5ms in practice — much cheaper than buildPayload's full sweep.
+export const isWorkingTreeClean = (repoRoot, git = defaultGit) => {
+    try {
+        const out = git(repoRoot, ["status", "--porcelain", "-z"])
+        return out.length === 0
+    } catch {
+        return false
+    }
+}
+
+// Current HEAD SHA. Used by the fast path to verify HEAD hasn't moved
+// since the cached baseline was captured — a commit / pull / rebase
+// done outside Claude (e.g. in a terminal) would leave the working
+// tree clean while invalidating the cache. Returns null on error so
+// callers must defer to the slow path when in doubt.
+export const currentHeadSha = (repoRoot, git = defaultGit) => {
+    try {
+        return git(repoRoot, ["rev-parse", "HEAD"]).trim() || null
+    } catch {
+        return null
+    }
+}
+
 // Resolve a base commit for the head-fallback. Prefer the merge-base
 // with the upstream branch (so a feature branch with N unreviewed
 // commits is reviewed as one range), fall back to HEAD~1 for branches

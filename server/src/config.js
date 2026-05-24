@@ -148,9 +148,19 @@ const ConfigSchema = z
         // when an upstream exists, otherwise HEAD~1..HEAD. Cache logic
         // is unchanged: the resulting payload is byte-deterministic
         // for a given HEAD so repeat Stop hooks hit NO_CHANGES.
+        //
+        // verifyCleanTree adds a `git status --porcelain -z` probe to
+        // the change-notification fast path. Default false — trusts
+        // the dirty flag set by the PostToolUse hook. Turn ON if you
+        // also edit files outside Claude (IDE auto-save, terminal
+        // edits) and want the fast path to defer in those cases. The
+        // HEAD-equality probe runs unconditionally either way; that
+        // one is correctness-critical (catches commit/pull/rebase
+        // outside Claude) and remains a cheap ~3ms rev-parse.
         payload: z
             .object({
                 fallbackToHead: z.boolean().default(false),
+                verifyCleanTree: z.boolean().default(false),
             })
             .default({}),
         blockingSeverities: z.array(Severity).default(["blocker", "major"]),

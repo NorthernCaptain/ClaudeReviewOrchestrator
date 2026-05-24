@@ -108,7 +108,7 @@ const DEFAULTS = {
     // when the working tree is clean. Repeat Stop hooks for the same
     // HEAD short-circuit via the existing NO_CHANGES cache so no
     // redundant reviewer spawns happen.
-    payload: { fallbackToHead: false },
+    payload: { fallbackToHead: false, verifyCleanTree: false },
     blockingSeverities: ["blocker", "major"],
     extraReviewerInstructions: null,
     reviewsDir: "./reviews",

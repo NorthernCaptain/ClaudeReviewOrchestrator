@@ -5,7 +5,12 @@
 
 import { createHash } from "node:crypto"
 import { resolveContext, ContextError } from "./context.js"
-import { buildPayload, sanitizeFindingPath } from "./diff.js"
+import {
+    buildPayload,
+    currentHeadSha,
+    isWorkingTreeClean,
+    sanitizeFindingPath,
+} from "./diff.js"
 import { pickReviewer, providerCfg, wrapPrompt } from "./reviewer.js"
 import { loadProjectConfig, mergeWithGlobal } from "./project-config.js"
 
@@ -52,6 +57,11 @@ export const computeReviewConfigHash = (config) => {
         // comparable. Including it here invalidates the cache on
         // flip, forcing a fresh review.
         fallbackToHead: config.payload?.fallbackToHead === true,
+        // Toggling verifyCleanTree changes whether the fast path is
+        // willing to short-circuit on the dirty flag alone. Bust the
+        // cache on flip so the operator sees the new behavior take
+        // effect on the very next review.
+        verifyCleanTree: config.payload?.verifyCleanTree === true,
     }
     return createHash("sha256").update(JSON.stringify(policy)).digest("hex")
 }
@@ -378,9 +388,101 @@ export const handleReview = async ({
                     ? state.priorFindings.length
                     : 0,
                 hasLastBaseline: Boolean(state.lastBaseline),
+                dirtySinceLastReview: state.dirtySinceLastReview,
             },
             "state loaded"
         )
+
+        // Change-notification fast path (v0.1.11). When the PostToolUse
+        // hook hasn't pinged /notify-change since the last terminal
+        // success AND a shallow git probe confirms the working tree is
+        // actually clean (catches IDE / out-of-Claude edits), return
+        // NO_CHANGES immediately — no payload build, no hashing.
+        //
+        // We only fast-path off of terminal-success states. ISSUES /
+        // ESCALATE / NO_PROGRESS land in the existing post-buildPayload
+        // cache logic so their semantics (cached-blocking, cached-
+        // escalate, blockCount accounting) stay intact.
+        const fastPathEligible =
+            state.dirtySinceLastReview === false &&
+            state.lastBaseline &&
+            (state.lastResultStatus === "GOOD_TO_GO" ||
+                state.lastResultStatus === "GOOD_TO_GO_WITH_NOTES")
+        if (fastPathEligible) {
+            // Shallow probe #1 (correctness-critical, always on):
+            // HEAD hasn't moved since the cached baseline was captured.
+            // Catches commit/pull/rebase done outside Claude (or via
+            // Claude's Bash tool, which doesn't fire PostToolUse:
+            // Write|Edit|MultiEdit) — those leave the working tree
+            // clean but invalidate the cached review.
+            const headSha = (deps.currentHeadSha ?? currentHeadSha)(
+                context.repoRoot,
+                deps.git
+            )
+            const cachedHead = state.lastBaseline?.headSha ?? null
+            const headMatches =
+                typeof headSha === "string" &&
+                typeof cachedHead === "string" &&
+                headSha === cachedHead
+
+            // Shallow probe #2 (optional, off by default):
+            // `git status --porcelain -z` confirms the working tree
+            // really has no uncommitted edits. Belt-and-braces against
+            // edits that bypass the PostToolUse hook (IDE auto-save,
+            // file-watcher tools, terminal edits). Toggle on via
+            // `payload.verifyCleanTree` when you also edit outside
+            // Claude. Default off — trust the dirty flag.
+            const verifyTree = config.payload?.verifyCleanTree === true
+            const treeClean =
+                headMatches && verifyTree
+                    ? (deps.isWorkingTreeClean ?? isWorkingTreeClean)(
+                          context.repoRoot,
+                          deps.git
+                      )
+                    : true
+            if (headMatches && treeClean) {
+                log.info(
+                    {
+                        lastResultStatus: state.lastResultStatus,
+                        lastChangeAt: state.lastChangeAt ?? 0,
+                        headSha: short(headSha, 12),
+                        verifyCleanTree: verifyTree,
+                    },
+                    "fast-path: no changes since last terminal success"
+                )
+                return {
+                    httpStatus: 200,
+                    body: envelope("NO_CHANGES", {
+                        context: contextSummary(context),
+                        // Re-use the cached baseline so the response
+                        // still carries the headSha / hashes the
+                        // caller may rely on.
+                        baseline: {
+                            ...(state.lastBaseline ?? {}),
+                            // Keep these in lockstep with the new
+                            // payload-built baselineSummary shape so
+                            // /status + dashboard rendering don't
+                            // choke on missing fields.
+                            source:
+                                state.lastBaseline?.source ?? "working-tree",
+                            baseSha: state.lastBaseline?.baseSha ?? null,
+                        },
+                        state: stateSummary(state),
+                    }),
+                }
+            }
+            log.info(
+                {
+                    lastResultStatus: state.lastResultStatus,
+                    headMatches,
+                    treeClean,
+                    headSha: short(headSha, 12),
+                    cachedHead: short(cachedHead, 12),
+                    verifyCleanTree: verifyTree,
+                },
+                "fast-path: deferred — HEAD moved or tree dirty"
+            )
+        }
 
         // Stop-hook-only pre-cap: if we've already issued maxBlocks worth of
         // decision:"block" instructions this loop, escalate before doing any
@@ -831,6 +933,13 @@ export const handleReview = async ({
                     : isTerminal
                       ? 0
                       : state.blockCount,
+            // Clear the change-notification flag only on terminal SUCCESS
+            // (GOOD_TO_GO / GOOD_TO_GO_WITH_NOTES). ISSUES keeps it true —
+            // there's work to do, and the next /review must run when
+            // edits land. ESCALATE handled in its own branch above.
+            dirtySinceLastReview: isTerminal
+                ? false
+                : (state.dirtySinceLastReview ?? true),
         }
 
         // Capture this round's counters BEFORE the terminal reset zeroes them,

@@ -91,6 +91,11 @@ const summarizeContext = (ctx) => ({
     priorFindingsCount: Array.isArray(ctx.priorFindings)
         ? ctx.priorFindings.length
         : 0,
+    // Change-notification fast path observability (v0.1.11).
+    dirtySinceLastReview: ctx.dirtySinceLastReview ?? null,
+    lastChangeAt: ctx.lastChangeAt
+        ? new Date(ctx.lastChangeAt).toISOString()
+        : null,
     lastBaseline: ctx.lastBaseline
         ? {
               headSha: ctx.lastBaseline.headSha?.slice(0, 12),

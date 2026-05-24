@@ -3,6 +3,7 @@
  * Author: Leo Khramov
  */
 
+import { jest } from "@jest/globals"
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import {
@@ -14,7 +15,12 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { buildPayload, __test__ } from "./diff.js"
+import {
+    buildPayload,
+    currentHeadSha,
+    isWorkingTreeClean,
+    __test__,
+} from "./diff.js"
 
 const { parseNameStatusZ, filterIgnored, matchesAny, isBinary, truncateText } =
     __test__
@@ -670,5 +676,102 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
         } finally {
             rmSync(empty, { recursive: true, force: true })
         }
+    })
+})
+
+describe("isWorkingTreeClean", () => {
+    let dir
+    beforeEach(() => {
+        dir = realpathSync(mkdtempSync(path.join(tmpdir(), "clean-")))
+        execFileSync("git", ["init", "-q", "-b", "main", dir])
+        execFileSync("git", ["-C", dir, "config", "user.email", "t@t"])
+        execFileSync("git", ["-C", dir, "config", "user.name", "t"])
+        writeFileSync(path.join(dir, "a.js"), "x\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "init"])
+    })
+    afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+    })
+
+    test("returns true on a freshly committed tree", () => {
+        expect(isWorkingTreeClean(dir)).toBe(true)
+    })
+
+    test("returns false when a tracked file is modified", () => {
+        writeFileSync(path.join(dir, "a.js"), "y\n")
+        expect(isWorkingTreeClean(dir)).toBe(false)
+    })
+
+    test("returns false when an untracked file exists", () => {
+        writeFileSync(path.join(dir, "scratch.txt"), "wip\n")
+        expect(isWorkingTreeClean(dir)).toBe(false)
+    })
+
+    test("returns false when git fails (defer to slow path)", () => {
+        const bogus = path.join(dir, "not-a-repo")
+        // No .git dir → git exits non-zero.
+        expect(isWorkingTreeClean(bogus)).toBe(false)
+    })
+
+    test("honors an injected git function (no real subprocess needed)", () => {
+        const fakeGit = jest.fn(() => "") // empty = clean
+        expect(isWorkingTreeClean("/anywhere", fakeGit)).toBe(true)
+        expect(fakeGit).toHaveBeenCalledWith("/anywhere", [
+            "status",
+            "--porcelain",
+            "-z",
+        ])
+        const dirtyGit = jest.fn(
+            () => " M file.txt\0?? scratch.txt\0"
+        )
+        expect(isWorkingTreeClean("/anywhere", dirtyGit)).toBe(false)
+    })
+})
+
+describe("currentHeadSha", () => {
+    let dir
+    beforeEach(() => {
+        dir = realpathSync(mkdtempSync(path.join(tmpdir(), "head-")))
+        execFileSync("git", ["init", "-q", "-b", "main", dir])
+        execFileSync("git", ["-C", dir, "config", "user.email", "t@t"])
+        execFileSync("git", ["-C", dir, "config", "user.name", "t"])
+        writeFileSync(path.join(dir, "a.js"), "x\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "init"])
+    })
+    afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+    })
+
+    test("returns the current HEAD SHA after a commit", () => {
+        const sha = currentHeadSha(dir)
+        const expected = execFileSync(
+            "git",
+            ["-C", dir, "rev-parse", "HEAD"],
+            { encoding: "utf8" }
+        ).trim()
+        expect(sha).toBe(expected)
+        expect(sha).toMatch(/^[0-9a-f]{40}$/)
+    })
+
+    test("reflects a new commit (HEAD moves)", () => {
+        const before = currentHeadSha(dir)
+        writeFileSync(path.join(dir, "b.js"), "y\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "second"])
+        const after = currentHeadSha(dir)
+        expect(after).not.toBe(before)
+    })
+
+    test("returns null when git fails (non-repo path)", () => {
+        const bogus = path.join(dir, "not-a-repo")
+        expect(currentHeadSha(bogus)).toBeNull()
+    })
+
+    test("honors an injected git function", () => {
+        const fakeGit = jest.fn(() => "deadbeef\n")
+        expect(currentHeadSha("/x", fakeGit)).toBe("deadbeef")
+        expect(fakeGit).toHaveBeenCalledWith("/x", ["rev-parse", "HEAD"])
     })
 })

@@ -92,6 +92,7 @@ Four components talk to one server:
 | Server logs (launchd) | `~/.claude/logs/review-server.{out,err}.log` |
 | Hook event log (per call) | `~/.claude/logs/review-hook.log` |
 | Hook per-call snapshot | `~/.claude/logs/review-hook-calls/<ts>.json` |
+| PostToolUse hook | `~/.claude/hooks/notify-change.mjs` (configured in `~/.claude/settings.json`) |
 | Archived reviews | `<config.reviewsDir>/<repo>:<branch>/<ts>.{json,md}` |
 | Replay helper | `scripts/replay-review.sh [snapshot \| --cwd <path>]` |
 | Dashboard | `http://127.0.0.1:7777/` (no auth) |
@@ -128,6 +129,7 @@ started by launchd. Binds `127.0.0.1` only.
 | POST   | `/mcp`      | yes  | MCP HTTP transport (tools listed below)       | Claude       |
 | POST   | `/review`   | yes  | Run a review, return Stop-hook decision JSON  | Stop hook    |
 | POST   | `/reset`    | yes  | Clear counter + cache for a context           | Stop hook / manual |
+| POST   | `/notify-change` | yes | Flip dirty flag for a context (used by PostToolUse hook) | `notify-change.mjs` |
 | GET    | `/status`   | yes  | Dump live contexts, version, redacted config  | Human        |
 | GET    | `/`         | **no**  | HTML dashboard (version, config, timeline, history) | Browser |
 | GET    | `/healthz`  | no   | Liveness check                                | launchd / hook fail-open |
@@ -899,6 +901,18 @@ operator should know about:
   sessions where you know no code review is needed (long Q&A, doc-only
   edits, scratch). The skip is per-claude-invocation; set the var in
   the shell that launches `claude`. See *Hook env vars* below.
+- **Change-notification fast path** — a PostToolUse hook
+  (`hooks/notify-change.mjs`) pings `POST /notify-change` whenever
+  Claude uses Write/Edit/MultiEdit. The server tracks a
+  `dirtySinceLastReview` flag per context. When the Stop hook fires
+  and the flag is `false` AND the last status was terminal-success
+  AND `git rev-parse HEAD` matches the cached baseline (always
+  checked, catches outside-Claude commits/pulls/rebases), the server
+  returns `NO_CHANGES` immediately — no payload build, no hashing, no
+  reviewer spawn. Saves ~50–200ms per Stop hook on unchanged trees.
+  Opt-in `payload.verifyCleanTree` adds a `git status --porcelain -z`
+  probe for IDE-edit safety; off by default. See
+  *Change-notification fast path* below.
 
 ### Multi-round loop
 
@@ -951,7 +965,8 @@ Three hashes drive the no-spawn short-circuit:
   hash and the no-progress check sees forward motion).
 - **`reviewConfigHash`** — sha256 of the review-policy slice of config:
   `blockingSeverities`, `ignorePaths`, `extraReviewerInstructions`,
-  `limits.maxPayloadBytes/maxFileBytes/maxFiles`, AND `payload.fallbackToHead`.
+  `limits.maxPayloadBytes/maxFileBytes/maxFiles`, `payload.fallbackToHead`,
+  AND `payload.verifyCleanTree`.
   Flipping any of these invalidates cached baselines automatically.
 
 A cache hit fires when the new `progressHash` matches `state.lastBaseline.progressHash`
@@ -984,6 +999,85 @@ This means a Stop hook fired hours after the previous review — on a clean
 tree with no commits — hits the cache and returns `NO_CHANGES` in
 milliseconds, no reviewer spawn. A `POST /reset` clears both kinds of data
 for a specific context.
+
+### Change-notification fast path (v0.1.11)
+
+A second short-circuit layered on top of the `progressHash` cache.
+Saves the 50–200ms `buildPayload` cost when a Stop hook fires on a
+truly clean tree.
+
+**Wiring** — `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "Write|Edit|MultiEdit",
+      "hooks": [{
+        "type": "command",
+        "command": "node ~/.claude/hooks/notify-change.mjs",
+        "timeout": 3000
+      }]
+    }]
+  }
+}
+```
+
+**Server endpoint** — `POST /notify-change` (auth via `X-Review-Token`).
+Body: `{cwd, tool?, file?}`. Resolves the context, flips
+`state.dirtySinceLastReview = true`, stamps `state.lastChangeAt`,
+returns `{ok, context, dirty, lastChangeAt}`. Logged as
+`change notification` at info level.
+
+**Stop-hook fast path** in `review.js`, fires after `state loaded`
+and before `buildPayload`:
+
+```
+state.dirtySinceLastReview === false
+AND state.lastBaseline
+AND state.lastResultStatus is GOOD_TO_GO or GOOD_TO_GO_WITH_NOTES
+AND currentHeadSha(repoRoot) === state.lastBaseline.headSha   ← always
+AND (payload.verifyCleanTree is false  OR  isWorkingTreeClean(repoRoot))
+```
+
+All true → returns `NO_CHANGES` with the cached `baseline`. No
+payload built, no reviewer spawn.
+
+Two shallow git probes are involved:
+
+- **HEAD probe (always on, correctness-critical).** `git rev-parse
+  HEAD` confirms the cached baseline still matches the current commit.
+  Catches commit / pull / rebase done outside Claude (in a terminal,
+  another CLI, or via Claude's Bash tool — which doesn't fire
+  PostToolUse:Write|Edit|MultiEdit). Cost ~3ms.
+- **Tree probe (optional, `payload.verifyCleanTree`, default `false`).**
+  `git status --porcelain -z` confirms the working tree has no
+  uncommitted edits. Belt-and-braces for IDE edits / file-watcher
+  tools / terminal edits that bypass the PostToolUse hook. Default
+  off — trust the dirty flag set by the hook. Turn ON if you also
+  edit outside Claude. Cost ~5ms.
+
+Either probe failing (when both are active) falls the request through
+to the existing slow path. Combined cost on the slow path is ~100ms
+for the full `buildPayload` sweep, which the fast path replaces.
+
+The flag is part of `reviewConfigHash`, so flipping `verifyCleanTree`
+busts the cache automatically.
+
+**dirty flag lifecycle**:
+
+| Event | dirty becomes |
+|---|---|
+| Fresh context | `true` (first review always runs) |
+| `POST /notify-change` | `true` |
+| Terminal success (`GOOD_TO_GO` / `GOOD_TO_GO_WITH_NOTES`) | `false` |
+| `ISSUES` / `ESCALATE` review completes | unchanged (work pending) |
+| `POST /reset` | `true` (back to default) |
+| Idle reset (10 min) | preserved (cache field) |
+| Server restart | preserved (loaded from state.json) |
+
+Both `dirtySinceLastReview` and `lastChangeAt` show up per-context in
+`/status` and `GET /` for observability.
 
 ### In-flight deduplication
 
@@ -1119,6 +1213,7 @@ example below shows every supported key and the current default):
 | `reviewer.gemini.model` | `"auto"` | Router alias = the CLI's interactive "Auto (Gemini 3)" mode. Pin to e.g. `"gemini-2.5-pro"` for reproducibility. |
 | `reviewer.gemini.approvalMode` | `"plan"` | Read-only non-interactive mode. |
 | `payload.fallbackToHead` | `false` | Opt-in: when working tree is clean, review the last commit range instead of returning `EMPTY_PAYLOAD`. |
+| `payload.verifyCleanTree` | `false` | Opt-in: when the change-notification fast path is otherwise eligible, also run `git status --porcelain -z` to confirm the tree really is clean. Off by default — trust the dirty flag set by the PostToolUse hook. Turn ON if you also edit files outside Claude. |
 | `hook.fetchTimeoutSeconds` | `null` (auto) | When null, the hook auto-derives from `max(reviewer.{provider}.timeoutSeconds, limits.codexTimeoutSeconds) + 60s`. Override to pin. |
 | `limits.idleResetMinutes` | `10` | Loop-counter idle reset interval. **Cache fields are preserved** across the reset and across server restarts (see "State persistence" above). |
 

@@ -124,6 +124,25 @@ describe("ConfigSchema", () => {
         const r = ConfigSchema.parse({ authToken: "abc" })
         expect(r.payload.fallbackToHead).toBe(false)
     })
+    test("payload.verifyCleanTree defaults to false", () => {
+        const r = ConfigSchema.parse({ authToken: "abc" })
+        expect(r.payload.verifyCleanTree).toBe(false)
+    })
+    test("payload.verifyCleanTree accepts true explicitly", () => {
+        const r = ConfigSchema.parse({
+            authToken: "x",
+            payload: { verifyCleanTree: true },
+        })
+        expect(r.payload.verifyCleanTree).toBe(true)
+    })
+    test("rejects a non-boolean payload.verifyCleanTree", () => {
+        expect(() =>
+            ConfigSchema.parse({
+                authToken: "x",
+                payload: { verifyCleanTree: "yes" },
+            })
+        ).toThrow()
+    })
     test("payload.fallbackToHead accepts true explicitly", () => {
         const r = ConfigSchema.parse({
             authToken: "x",

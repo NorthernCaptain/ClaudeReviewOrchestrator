@@ -27,6 +27,14 @@ const blankContext = ({ key, repoRoot, branch }) => ({
     lastReviewedAt: 0,
     lastResultStatus: null,
     lastEscalateReason: null,
+    // Change-notification fast path (v0.1.11). The PostToolUse hook
+    // pings POST /notify-change every time Claude edits a file; the
+    // server flips this to true and the next /review can short-circuit
+    // when dirty is false AND the working tree is shallow-clean.
+    // Default true so the FIRST review for a fresh context always
+    // runs (no notification has had a chance to land yet).
+    dirtySinceLastReview: true,
+    lastChangeAt: 0,
 })
 
 // Idle reset: clear LOOP counters but keep the content-keyed CACHE
@@ -50,6 +58,11 @@ const idleResetContext = ({ key, repoRoot, branch }, existing) => ({
     lastBaseline: existing?.lastBaseline ?? null,
     lastResultStatus: existing?.lastResultStatus ?? null,
     lastEscalateReason: existing?.lastEscalateReason ?? null,
+    // Preserve the dirty + lastChangeAt fields across idle reset for
+    // the same reason we preserve lastBaseline: they're content-keyed
+    // observational state, not loop counters.
+    dirtySinceLastReview: existing?.dirtySinceLastReview ?? true,
+    lastChangeAt: existing?.lastChangeAt ?? 0,
 })
 
 const cloneState = (state) => JSON.parse(JSON.stringify(state))

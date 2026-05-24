@@ -16,6 +16,7 @@ import { mountResetRoute } from "./reset.js"
 import { mountMcpRoute } from "./mcp.js"
 import { mountStatusRoute } from "./status.js"
 import { mountDashboardRoute } from "./dashboard.js"
+import { mountNotifyChangeRoute } from "./notify-change.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { logger } from "./logger.js"
@@ -103,6 +104,7 @@ export const createApp = ({
     app.use(authMiddleware({ token: config.authToken }))
     mountReviewRoute(app, { config, store, archive, logger: log, deps })
     mountResetRoute(app, { config, store, deps })
+    mountNotifyChangeRoute(app, { config, store, logger: log, deps })
     // Capture the MCP route's closeAllSessions so shutdown can drain
     // long-poll GETs (otherwise server.close() never resolves).
     const mcp = mountMcpRoute(app, {

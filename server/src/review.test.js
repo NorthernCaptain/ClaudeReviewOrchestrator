@@ -2216,4 +2216,387 @@ describe("computeReviewConfigHash — payload.fallbackToHead", () => {
         })
         expect(absent).toBe(off)
     })
+
+    test("flipping payload.verifyCleanTree also busts the cache", () => {
+        const off = computeReviewConfigHash({
+            blockingSeverities: ["blocker", "major"],
+            ignorePaths: [],
+            extraReviewerInstructions: null,
+            limits: {},
+            payload: { verifyCleanTree: false },
+        })
+        const on = computeReviewConfigHash({
+            blockingSeverities: ["blocker", "major"],
+            ignorePaths: [],
+            extraReviewerInstructions: null,
+            limits: {},
+            payload: { verifyCleanTree: true },
+        })
+        expect(off).not.toBe(on)
+    })
+})
+
+describe("handleReview — change-notification fast path (v0.1.11)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const seed = (overrides = {}) => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: "c",
+                files: { modified: [], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                totalBytes: 0,
+                truncated: false,
+            },
+            dirtySinceLastReview: false,
+            lastChangeAt: 1700,
+            ...overrides,
+        })
+    }
+
+    test("when dirty=false AND last status terminal-success AND HEAD matches AND tree clean → NO_CHANGES, no buildPayload", async () => {
+        seed() // seed sets lastBaseline.headSha = "abc"
+        const buildSpy = jest.fn()
+        const runSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: buildSpy,
+                runAndParse: runSpy,
+                currentHeadSha: () => "abc", // matches the cached baseline
+                isWorkingTreeClean: () => true,
+            }),
+        })
+        expect(r.body.status).toBe("NO_CHANGES")
+        // No payload was built, no reviewer was spawned.
+        expect(buildSpy).not.toHaveBeenCalled()
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+
+    test("with verifyCleanTree=true, falls through when tree probe disagrees (IDE-edit guard)", async () => {
+        // payload.verifyCleanTree must be ON for the second probe to
+        // run. HEAD matches the cached baseline but the tree is dirty
+        // — e.g. the user edited in their IDE without a PostToolUse
+        // ping. Fast path MUST defer so the edits get reviewed.
+        seed()
+        const cfg = { ...minimalConfig() }
+        cfg.payload = { ...(cfg.payload ?? {}), verifyCleanTree: true }
+        const buildSpy = jest.fn(() =>
+            makePayload({
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                },
+            })
+        )
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: cfg,
+            store,
+            deps: makeDeps({
+                buildPayload: buildSpy,
+                runAndParse: runSpy,
+                currentHeadSha: () => "abc", // matches seeded baseline
+                isWorkingTreeClean: () => false,
+            }),
+        })
+        expect(buildSpy).toHaveBeenCalled()
+        expect(r.body.status).toBe("GOOD_TO_GO")
+    })
+
+    test("with verifyCleanTree=false (default), trusts the dirty flag and skips the tree probe", async () => {
+        // Even if the tree IS dirty (e.g. an IDE edit slipped past
+        // the PostToolUse hook), with verifyCleanTree off the fast
+        // path trusts dirty=false → returns NO_CHANGES. This is the
+        // user-opted-in trade-off when they work mostly via Claude.
+        seed()
+        const treeCleanSpy = jest.fn(() => false) // would say "dirty" if asked
+        const buildSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(), // verifyCleanTree omitted → defaults off
+            store,
+            deps: makeDeps({
+                buildPayload: buildSpy,
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+                currentHeadSha: () => "abc",
+                isWorkingTreeClean: treeCleanSpy,
+            }),
+        })
+        expect(r.body.status).toBe("NO_CHANGES")
+        // Tree probe is NOT called when the setting is off.
+        expect(treeCleanSpy).not.toHaveBeenCalled()
+        expect(buildSpy).not.toHaveBeenCalled()
+    })
+
+    test("falls through when HEAD has moved (commit/pull/rebase outside Claude)", async () => {
+        // Working tree clean and dirty=false, but git rev-parse HEAD
+        // returns a different SHA than the cached baseline — the user
+        // committed in a terminal. Fast path MUST defer.
+        seed()
+        const buildSpy = jest.fn(() =>
+            makePayload({
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                },
+            })
+        )
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: buildSpy,
+                runAndParse: runSpy,
+                isWorkingTreeClean: () => true,
+                currentHeadSha: () => "def456new", // != seed's "abc"
+            }),
+        })
+        expect(buildSpy).toHaveBeenCalled()
+        expect(r.body.status).toBe("GOOD_TO_GO")
+    })
+
+    test("falls through when currentHeadSha cannot be read", async () => {
+        // Conservative: if we can't probe HEAD, defer to slow path
+        // rather than serve a possibly-stale cached NO_CHANGES.
+        seed()
+        const buildSpy = jest.fn(() =>
+            makePayload({
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                },
+            })
+        )
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: buildSpy,
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+                isWorkingTreeClean: () => true,
+                currentHeadSha: () => null,
+            }),
+        })
+        expect(buildSpy).toHaveBeenCalled()
+    })
+
+    test("does not call isWorkingTreeClean when HEAD has moved (short-circuit)", async () => {
+        // Optimization: skip the second git probe when HEAD mismatch
+        // already disqualifies the fast path.
+        seed()
+        const treeCleanSpy = jest.fn(() => true)
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+                isWorkingTreeClean: treeCleanSpy,
+                currentHeadSha: () => "different",
+            }),
+        })
+        expect(treeCleanSpy).not.toHaveBeenCalled()
+    })
+
+    test("does NOT fast-path when last status is ISSUES (even with dirty=false + clean tree)", async () => {
+        // ISSUES is terminal-with-issues, not terminal-success. The
+        // existing cache logic (NO_PROGRESS_WITH_OPEN_ISSUES) handles
+        // it correctly downstream — fast path must not steal that.
+        seed({ lastResultStatus: "ISSUES" })
+        const buildSpy = jest.fn(() =>
+            makePayload({
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                },
+            })
+        )
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: buildSpy,
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+                isWorkingTreeClean: () => true,
+            }),
+        })
+        expect(buildSpy).toHaveBeenCalled()
+    })
+
+    test("does NOT fast-path when dirty=true (notification received since last review)", async () => {
+        seed({ dirtySinceLastReview: true })
+        const buildSpy = jest.fn(() =>
+            makePayload({
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                },
+            })
+        )
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: buildSpy,
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+                isWorkingTreeClean: () => true,
+            }),
+        })
+        expect(buildSpy).toHaveBeenCalled()
+    })
+
+    test("does NOT fast-path on a fresh context (no lastBaseline yet)", async () => {
+        // No seed — context starts blank. dirty defaults to true.
+        const buildSpy = jest.fn(() =>
+            makePayload({
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                },
+            })
+        )
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: buildSpy,
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+                isWorkingTreeClean: () => true,
+            }),
+        })
+        expect(buildSpy).toHaveBeenCalled()
+    })
+
+    test("terminal success (GOOD_TO_GO) clears dirtySinceLastReview to false", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            dirtySinceLastReview: true,
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+            }),
+        })
+        // Read via the store helper (clones); the in-memory store the
+        // test uses preserves the latest value.
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.dirtySinceLastReview).toBe(false)
+    })
+
+    test("ISSUES leaves dirtySinceLastReview true (work pending)", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            dirtySinceLastReview: true,
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        {
+                            file: "a.js",
+                            line: 1,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "boom",
+                        },
+                    ],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.dirtySinceLastReview).toBe(true)
+    })
 })
