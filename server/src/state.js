@@ -35,6 +35,14 @@ const blankContext = ({ key, repoRoot, branch }) => ({
     // runs (no notification has had a chance to land yet).
     dirtySinceLastReview: true,
     lastChangeAt: 0,
+    // ESCALATE notification gate (v0.1.14). Flips true the first time
+    // the server returns an ESCALATE-class result for this context;
+    // flips back false when a non-ESCALATE terminal review completes.
+    // The Stop hook uses the paired `notifyUser` field on the
+    // response to decide whether to emit a decision:"block" reason
+    // telling Claude to surface the failure to the user. At-most-once
+    // notification per failure run.
+    escalateNotified: false,
 })
 
 // Idle reset: clear LOOP counters but keep the content-keyed CACHE
@@ -63,6 +71,7 @@ const idleResetContext = ({ key, repoRoot, branch }, existing) => ({
     // observational state, not loop counters.
     dirtySinceLastReview: existing?.dirtySinceLastReview ?? true,
     lastChangeAt: existing?.lastChangeAt ?? 0,
+    escalateNotified: existing?.escalateNotified ?? false,
 })
 
 const cloneState = (state) => JSON.parse(JSON.stringify(state))

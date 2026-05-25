@@ -2600,3 +2600,407 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
         expect(after.dirtySinceLastReview).toBe(true)
     })
 })
+
+describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadOk = () =>
+        makePayload({
+            files: {
+                modified: [{ path: "a.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    test("first CODEX_ERROR sets notifyUser=true and flips escalateNotified", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: async () => ({
+                    status: "ESCALATE",
+                    reason: "codex exited with code 1",
+                    raw: { exitCode: 1, durationMs: 10, rawStdout: "", rawStderr: "boom" },
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("ESCALATE")
+        expect(r.body.code).toBe("CODEX_ERROR")
+        expect(r.body.notifyUser).toBe(true)
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.escalateNotified).toBe(true)
+    })
+
+    test("second CODEX_ERROR_CACHED returns notifyUser=false (gate stays)", async () => {
+        // Seed prior failure: lastResultStatus=ESCALATE, escalateNotified=true.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "ESCALATE",
+            lastEscalateReason: "old fail",
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                files: { modified: [{ path: "a.js" }], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                totalBytes: 0,
+                truncated: false,
+            },
+            escalateNotified: true,
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        // Same progressHash as seeded → cache hits.
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                        },
+                        progressHash: "p",
+                    }),
+                runAndParse: async () => {
+                    throw new Error("reviewer should NOT spawn on cache hit")
+                },
+            }),
+        })
+        expect(r.body.status).toBe("ESCALATE")
+        expect(r.body.code).toBe("CODEX_ERROR_CACHED")
+        expect(r.body.notifyUser).toBe(false)
+    })
+
+    test("cached path that finds escalateNotified=false (e.g. server restart) returns notifyUser=true", async () => {
+        // Seed prior failure but with the gate cleared — simulates a
+        // server restart that loaded state but the flag was somehow
+        // missing (or a /reset before our v0.1.14 upgrade).
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "ESCALATE",
+            lastEscalateReason: "old fail",
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                files: { modified: [{ path: "a.js" }], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                totalBytes: 0,
+                truncated: false,
+            },
+            escalateNotified: false,
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                        },
+                        progressHash: "p",
+                    }),
+                runAndParse: async () => {
+                    throw new Error("should not spawn")
+                },
+            }),
+        })
+        expect(r.body.code).toBe("CODEX_ERROR_CACHED")
+        expect(r.body.notifyUser).toBe(true)
+    })
+
+    test("transient-auth CODEX_ERROR skips cache poisoning (lastBaseline not saved)", async () => {
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: async () => ({
+                    status: "ESCALATE",
+                    reason: "codex exited with code 1",
+                    raw: {
+                        exitCode: 1,
+                        durationMs: 10,
+                        rawStdout: "",
+                        rawStderr:
+                            "ERROR: You've hit your usage limit. Try again at...",
+                    },
+                }),
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        // Cache is NOT poisoned — lastResultStatus stays null / not ESCALATE.
+        expect(after.lastResultStatus).not.toBe("ESCALATE")
+        expect(after.lastBaseline).toBeNull()
+        // But the notification gate IS set so we don't re-pester.
+        expect(after.escalateNotified).toBe(true)
+    })
+
+    test("transient-auth signatures match across reason patterns", async () => {
+        const patterns = [
+            "ERROR: You've hit your usage limit",
+            "When using Gemini API, you must specify the GEMINI_API_KEY",
+            "Not logged in · Please run /login",
+            "401 Unauthorized",
+            "rate limit exceeded",
+            "quota exceeded",
+        ]
+        for (const reason of patterns) {
+            cleanupStore(store)
+            store = makeStoreInMemory()
+            await handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook" },
+                config: minimalConfig(),
+                store,
+                deps: makeDeps({
+                    buildPayload: payloadOk,
+                    runAndParse: async () => ({
+                        status: "ESCALATE",
+                        reason,
+                        raw: { exitCode: 1, durationMs: 1, rawStdout: "", rawStderr: "" },
+                    }),
+                }),
+            })
+            const after = store.get({
+                key: "/repo|main",
+                repoRoot: "/repo",
+                branch: "main",
+            })
+            expect(after.lastBaseline).toBeNull()
+        }
+    })
+
+    test("non-auth CODEX_ERROR DOES poison the cache (the original behavior)", async () => {
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: async () => ({
+                    status: "ESCALATE",
+                    reason: "schema validation failed",
+                    raw: { exitCode: 1, durationMs: 10, rawStdout: "", rawStderr: "" },
+                }),
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.lastResultStatus).toBe("ESCALATE")
+        expect(after.lastBaseline).not.toBeNull()
+    })
+
+    test("EMPTY_PAYLOAD returns notifyUser=false explicitly", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        empty: true,
+                        nonBinaryFileCount: 0,
+                    }),
+            }),
+        })
+        expect(r.body.code).toBe("EMPTY_PAYLOAD")
+        expect(r.body.notifyUser).toBe(false)
+    })
+
+    test("MAX_BLOCKS includes notifyUser and flips the gate", async () => {
+        // Pre-load blockCount at the cap so the pre-check fires.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            blockCount: 6, // default cap
+            escalateNotified: false,
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(), // maxBlocks: 6
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+            }),
+        })
+        expect(r.body.code).toBe("MAX_BLOCKS")
+        expect(r.body.notifyUser).toBe(true)
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.escalateNotified).toBe(true)
+    })
+
+    test("any non-ESCALATE terminal review clears escalateNotified (recovery)", async () => {
+        // Seed gate=true (Claude was already told about a prior fail).
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            escalateNotified: true,
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.escalateNotified).toBe(false)
+    })
+
+    test("ISSUES also clears the gate (reviewer recovered, just found things)", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            escalateNotified: true,
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        {
+                            file: "a.js",
+                            line: 1,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "boom",
+                        },
+                    ],
+                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                }),
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.escalateNotified).toBe(false)
+    })
+
+    // v0.1.15 — notifyUser gate is Stop-hook-scoped. Manual MCP
+    // request_review calls must NOT flip the gate, otherwise the
+    // Stop hook that comes after a manual call would never get its
+    // chance to block Claude with the "REVIEWER FAILURE" reason.
+    test("manual MCP ESCALATE does NOT consume the gate (Stop hook still notifies later)", async () => {
+        // Round 1: manual request_review (non-stop trigger) — reviewer
+        // explodes. Gate must stay false, response must say notifyUser=false.
+        const r1 = await handleReview({
+            body: { cwd: "/repo", trigger: "manual" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: async () => ({
+                    status: "ESCALATE",
+                    reason: "codex exited with code 1",
+                    raw: { exitCode: 1, durationMs: 10, rawStdout: "", rawStderr: "" },
+                }),
+            }),
+        })
+        expect(r1.body.code).toBe("CODEX_ERROR")
+        expect(r1.body.notifyUser).toBe(false)
+        const afterManual = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(afterManual.escalateNotified).toBe(false)
+
+        // Round 2: Stop hook fires for the same context. Cache will
+        // short-circuit (lastResultStatus=ESCALATE). Gate is still
+        // false → notifyUser must be true so Claude gets the block.
+        const r2 = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: async () => {
+                    throw new Error("cache hit expected, no spawn")
+                },
+            }),
+        })
+        expect(r2.body.code).toBe("CODEX_ERROR_CACHED")
+        expect(r2.body.notifyUser).toBe(true)
+        const afterStop = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(afterStop.escalateNotified).toBe(true)
+    })
+
+    test("MAX_CODEX_ROUNDS on manual trigger: notifyUser=false, gate untouched", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            codexRounds: 10, // default cap
+            escalateNotified: false,
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "manual" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+            }),
+        })
+        expect(r.body.code).toBe("MAX_CODEX_ROUNDS")
+        expect(r.body.notifyUser).toBe(false)
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.escalateNotified).toBe(false)
+    })
+})

@@ -166,6 +166,41 @@ const envelope = (status, extra = {}) => ({
     ...extra,
 })
 
+// ESCALATE notification gate (v0.1.14).
+//
+// Returns true only when ALL of:
+//   1. The trigger is a Stop hook — only that path can act on
+//      notifyUser=true (by emitting a decision:"block" reason).
+//      Manual MCP request_review calls hand the response straight
+//      back to Claude; gating them would silently consume the
+//      single notification per failure run before the Stop hook
+//      ever gets to use it.
+//   2. The context's gate hasn't already been set by a prior Stop
+//      hook in this failure run.
+//
+// At-most-once-per-failure-run notification, scoped to Stop hooks.
+const computeNotifyUser = (state, trigger) =>
+    isStopHook(trigger) && state.escalateNotified !== true
+
+// Auth-class transient failure detection. When CODEX_ERROR's reason
+// matches one of these patterns, the failure is almost certainly
+// going to vanish once the user fixes the credential — so we
+// deliberately DON'T save the cached-ESCALATE baseline. That way the
+// next Stop after the user re-authenticates re-spawns the reviewer
+// instead of returning the stale cached failure.
+const AUTH_ERROR_PATTERNS = [
+    /usage limit/i,
+    /api[_-]?key/i,
+    /not logged in/i,
+    /unauthor/i,
+    /rate limit/i,
+    /\bquota\b/i,
+]
+const isTransientAuthError = (reason, stderr = "") => {
+    const text = `${reason ?? ""}\n${stderr ?? ""}`
+    return AUTH_ERROR_PATTERNS.some((re) => re.test(text))
+}
+
 const errorToEscalate = (err) => {
     if (err instanceof ContextError) {
         return envelope("ESCALATE", { reason: err.message, code: err.code })
@@ -492,11 +527,19 @@ export const handleReview = async ({
             isStopHook(trigger) &&
             state.blockCount >= config.limits.maxBlocks
         ) {
+            const notifyUser = computeNotifyUser(state, trigger)
+            if (notifyUser) {
+                store.save(context.key, {
+                    ...state,
+                    escalateNotified: true,
+                })
+            }
             return {
                 httpStatus: 200,
                 body: envelope("ESCALATE", {
                     reason: `block cap (${config.limits.maxBlocks}) reached for this context`,
                     code: "MAX_BLOCKS",
+                    notifyUser,
                     context: contextSummary(context),
                     state: stateSummary(state),
                 }),
@@ -554,6 +597,9 @@ export const handleReview = async ({
                 body: envelope("ESCALATE", {
                     reason: "payload empty or fully binary",
                     code: "EMPTY_PAYLOAD",
+                    // Not a reviewer failure — nothing to tell the user
+                    // about. Hook stays silent and the turn ends.
+                    notifyUser: false,
                     context: contextSummary(context),
                     baseline: baselineSummary(payload, reviewConfigHash),
                     state: stateSummary(state),
@@ -636,16 +682,24 @@ export const handleReview = async ({
                 // prompt isn't going to help and would burn codexRounds for free.
                 // Return the cached ESCALATE; stop_hook still consumes blockCount
                 // so the loop eventually exits hard.
+                const notifyUser = computeNotifyUser(state, trigger)
                 let nextState = state
-                if (isStopHook(trigger)) {
+                if (isStopHook(trigger) || notifyUser) {
                     nextState = store.save(context.key, {
                         ...state,
-                        blockCount: state.blockCount + 1,
+                        blockCount: isStopHook(trigger)
+                            ? state.blockCount + 1
+                            : state.blockCount,
                         lastReviewedAt: now(),
+                        escalateNotified:
+                            notifyUser || state.escalateNotified === true,
                     })
                 }
                 log.warn(
-                    { lastEscalateReason: state.lastEscalateReason },
+                    {
+                        lastEscalateReason: state.lastEscalateReason,
+                        notifyUser,
+                    },
                     "short-circuit: CODEX_ERROR_CACHED"
                 )
                 return {
@@ -657,6 +711,7 @@ export const handleReview = async ({
                         // code stays CODEX_ERROR_CACHED for back-compat
                         // with hook + MCP clients that key on this symbol.
                         code: "CODEX_ERROR_CACHED",
+                        notifyUser,
                         context: contextSummary(context),
                         baseline: baselineSummary(payload, reviewConfigHash),
                         state: stateSummary(nextState),
@@ -670,10 +725,18 @@ export const handleReview = async ({
         // burn extra rounds via retries. (Internal state/config field
         // names keep the historic "codex" prefix for back-compat.)
         if (state.codexRounds >= config.limits.maxCodexRounds) {
+            const notifyUser = computeNotifyUser(state, trigger)
+            if (notifyUser) {
+                store.save(context.key, {
+                    ...state,
+                    escalateNotified: true,
+                })
+            }
             log.warn(
                 {
                     rounds: state.codexRounds,
                     cap: config.limits.maxCodexRounds,
+                    notifyUser,
                 },
                 "reviewer round cap reached — refusing to spawn"
             )
@@ -684,6 +747,7 @@ export const handleReview = async ({
                     // code stays MAX_CODEX_ROUNDS for back-compat with
                     // hook + MCP clients that key on this symbol.
                     code: "MAX_CODEX_ROUNDS",
+                    notifyUser,
                     context: contextSummary(context),
                     state: stateSummary(state),
                 }),
@@ -845,17 +909,52 @@ export const handleReview = async ({
         }
 
         if (codexResult.status === "ESCALATE") {
-            // Persist the baseline + the reason so a follow-up call without any
-            // edits short-circuits to the cached ESCALATE instead of re-spinning
-            // Codex (see the unchanged+ESCALATE branch above).
-            const nextState = store.save(context.key, {
-                ...state,
-                codexRounds: state.codexRounds + 1,
-                lastBaseline: baselineSummary(payload, reviewConfigHash),
-                lastReviewedAt: now(),
-                lastResultStatus: "ESCALATE",
-                lastEscalateReason: codexResult.reason,
-            })
+            // Auth-class transient detection. When the reason matches a
+            // known credential-style failure (usage limit, missing API
+            // key, login expired, rate limit, quota), we DELIBERATELY
+            // skip saving the cached-ESCALATE baseline — the failure
+            // is almost certainly going to vanish once the user fixes
+            // the credential, and we don't want a stale CODEX_ERROR_CACHED
+            // to mask the recovered reviewer on the next Stop. We still
+            // set escalateNotified so the loop doesn't pester Claude
+            // again until a non-ESCALATE review clears it.
+            const transientAuth = isTransientAuthError(
+                codexResult.reason,
+                codexResult.raw?.rawStderr ?? ""
+            )
+            const notifyUser = computeNotifyUser(state, trigger)
+            const saveFields = transientAuth
+                ? {
+                      ...state,
+                      codexRounds: state.codexRounds + 1,
+                      lastReviewedAt: now(),
+                      escalateNotified:
+                          notifyUser || state.escalateNotified === true,
+                      // Leave lastBaseline / lastResultStatus / lastEscalateReason
+                      // UNCHANGED so the cache short-circuit does not fire on the
+                      // next Stop — let the reviewer re-spawn after the user
+                      // refreshes credentials.
+                  }
+                : {
+                      ...state,
+                      codexRounds: state.codexRounds + 1,
+                      lastBaseline: baselineSummary(payload, reviewConfigHash),
+                      lastReviewedAt: now(),
+                      lastResultStatus: "ESCALATE",
+                      lastEscalateReason: codexResult.reason,
+                      escalateNotified:
+                          notifyUser || state.escalateNotified === true,
+                  }
+            const nextState = store.save(context.key, saveFields)
+            if (transientAuth) {
+                log.warn(
+                    {
+                        reason: codexResult.reason,
+                        notifyUser,
+                    },
+                    "reviewer failed with transient-auth reason — cache bypassed; next Stop will re-spawn"
+                )
+            }
             safeArchive(archive, {
                 context,
                 payload,
@@ -885,6 +984,8 @@ export const handleReview = async ({
                     // code stays CODEX_ERROR for back-compat with hook
                     // + MCP clients that key on this symbol.
                     code: "CODEX_ERROR",
+                    notifyUser,
+                    transientAuth,
                     context: contextSummary(context),
                     baseline: baselineSummary(payload, reviewConfigHash),
                     codex: codexSummary(codexResult, providerName),
@@ -940,6 +1041,12 @@ export const handleReview = async ({
             dirtySinceLastReview: isTerminal
                 ? false
                 : (state.dirtySinceLastReview ?? true),
+            // Any non-ESCALATE result means the reviewer ran end-to-end
+            // successfully — even ISSUES is a successful run that just
+            // happened to find blockers. Reset the notification gate
+            // so a fresh ESCALATE down the line will tell the user
+            // again.
+            escalateNotified: false,
         }
 
         // Capture this round's counters BEFORE the terminal reset zeroes them,

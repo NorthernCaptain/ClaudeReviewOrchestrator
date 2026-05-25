@@ -96,6 +96,9 @@ const summarizeContext = (ctx) => ({
     lastChangeAt: ctx.lastChangeAt
         ? new Date(ctx.lastChangeAt).toISOString()
         : null,
+    // ESCALATE notification gate (v0.1.14). True means we've already
+    // told Claude about the current failure run.
+    escalateNotified: ctx.escalateNotified ?? null,
     lastBaseline: ctx.lastBaseline
         ? {
               headSha: ctx.lastBaseline.headSha?.slice(0, 12),

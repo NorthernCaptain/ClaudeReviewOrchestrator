@@ -901,6 +901,16 @@ operator should know about:
   sessions where you know no code review is needed (long Q&A, doc-only
   edits, scratch). The skip is per-claude-invocation; set the var in
   the shell that launches `claude`. See *Hook env vars* below.
+- **ESCALATE notification (`notifyUser` gate)** — the first ESCALATE
+  for a context emits a `decision: "block"` reason to Claude telling
+  it to surface the failure to the user (and explicitly NOT to try
+  fixing the reviewer in code). Subsequent ESCALATEs in the same
+  failure run return `notifyUser: false` and stay silent so the loop
+  doesn't pester the user repeatedly. Any non-ESCALATE terminal
+  review (including `ISSUES`) clears the gate. Auth-class transient
+  errors (`usage limit`, `API_KEY`, `not logged in`, `rate limit`,
+  `quota`, `unauthor*`) deliberately skip cache poisoning so the
+  reviewer recovers automatically once the user re-authenticates.
 - **Change-notification fast path** — a PostToolUse hook
   (`hooks/notify-change.mjs`) pings `POST /notify-change` whenever
   Claude uses Write/Edit/MultiEdit. The server tracks a
@@ -1108,7 +1118,8 @@ flag is part of `reviewConfigHash` so toggling it busts the cache cleanly.
 | Failure | Behavior |
 |---|---|
 | Server not running | Hook fails open, logs, Claude finishes normally. |
-| Reviewer binary missing / errors | Server returns `ESCALATE` with error message. |
+| Reviewer binary missing / errors | Server returns `ESCALATE` with error message. First Stop-hook ESCALATE per failure run includes `notifyUser: true` and the hook blocks once with a "tell the user" reason (v0.1.14). Manual MCP `request_review` calls never set `notifyUser` or flip the gate, so a manual call before a Stop hook does not consume the single notification (v0.1.15). |
+| Reviewer auth failure (`usage limit`, `API_KEY`, `not logged in`, `rate limit`, `quota`, `unauthor*`) | `ESCALATE` with `transientAuth: true` — cache poisoning skipped so the next Stop hook after the user re-authenticates re-spawns the reviewer (v0.1.14). |
 | Reviewer output fails schema | `ESCALATE: <provider> output SCHEMA_INVALID`, raw stdout archived. Claude/Gemini adapters salvage a prose-wrapped JSON when possible (logged as `salvaged: true`). |
 | Reviewer exits non-zero with valid envelope | Trusted as success; warn-logged as `reviewer exited non-zero but envelope was valid; trusting envelope`. |
 | Only non-blocking findings | `GOOD_TO_GO_WITH_NOTES`, hook exits 0, notes on stderr. |

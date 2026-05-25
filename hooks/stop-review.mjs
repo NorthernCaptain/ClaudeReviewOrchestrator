@@ -392,6 +392,39 @@ export const decideStopHookResponse = ({
         case "ESCALATE": {
             const reason = stripControl(reviewResponse.reason ?? "")
             const code = stripControl(reviewResponse.code ?? "unknown")
+            // notifyUser is the server's at-most-once flag (v0.1.14).
+            // It's true ONLY on the first ESCALATE for a failure run —
+            // we block once with a "tell the user" reason and then go
+            // silent until the reviewer recovers (any non-ESCALATE
+            // terminal review clears the flag server-side).
+            if (reviewResponse.notifyUser === true) {
+                const blockReason = [
+                    "REVIEWER FAILURE — automatic code review could not complete.",
+                    "",
+                    `Code: ${code}`,
+                    `Reason: ${reason}`,
+                    "",
+                    "This is a tooling failure, not a problem with your code.",
+                    "Do NOT attempt to fix the reviewer in code.",
+                    "",
+                    "Briefly tell the user the review couldn't run, summarize the reason above, and ask whether they want to:",
+                    "  (a) fix the reviewer (e.g. set GEMINI_API_KEY, restart the server)",
+                    "  (b) skip review for this session (run `REVIEW_ORCH_SKIP=1 claude` next time)",
+                    "  (c) just continue without review (this turn already ends after your reply).",
+                ].join("\n")
+                return {
+                    stdoutJson: {
+                        decision: "block",
+                        reason: blockReason,
+                    },
+                    stderrLines: [],
+                    logEntry: {
+                        event: "escalate_notify",
+                        code,
+                        reason,
+                    },
+                }
+            }
             return {
                 stdoutJson: null,
                 stderrLines: [
