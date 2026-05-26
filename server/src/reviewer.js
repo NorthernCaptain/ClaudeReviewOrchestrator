@@ -71,8 +71,8 @@ const BINARY_RESOLVERS = {
     gemini: (config) => config?.reviewer?.gemini?.binary ?? "gemini",
 }
 
-export const pickReviewer = (config) => {
-    const requested = config?.reviewer?.provider ?? DEFAULT_PROVIDER
+export const pickReviewer = (config, override = null) => {
+    const requested = override ?? config?.reviewer?.provider ?? DEFAULT_PROVIDER
     const entry = PROVIDERS[requested]
     if (!entry) {
         throw new Error(

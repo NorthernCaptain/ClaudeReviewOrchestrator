@@ -4,13 +4,66 @@
  */
 
 import { spawn as nodeSpawn } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { readFileSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import Ajv from "ajv/dist/2020.js"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_SCHEMA_PATH = path.join(here, "codex-output.schema.json")
+
+// Codex passes --output-schema to the OpenAI API as a strict
+// `response_format`. Strict mode rejects several JSON Schema keywords
+// that ajv (and our richer canonical schema) rely on — notably `allOf`
+// and the `if`/`then`/`else` conditionals we use to enforce the
+// GOOD_TO_GO⇔empty / ISSUES⇔non-empty invariant. We therefore hand
+// codex a STRIPPED copy: same shape, types, enums, required, and
+// additionalProperties:false (which strict mode needs), minus the
+// unsupported conditional keywords. ajv keeps validating codex's actual
+// output against the full canonical schema, so the invariant is still
+// enforced server-side — codex just isn't asked to encode it in its
+// response_format.
+const STRICT_UNSUPPORTED_KEYS = new Set([
+    "allOf",
+    "anyOf",
+    "if",
+    "then",
+    "else",
+])
+
+export const toStrictSchema = (node) => {
+    if (Array.isArray(node)) return node.map(toStrictSchema)
+    if (!node || typeof node !== "object") return node
+    const out = {}
+    for (const [key, value] of Object.entries(node)) {
+        if (STRICT_UNSUPPORTED_KEYS.has(key)) continue
+        out[key] = toStrictSchema(value)
+    }
+    return out
+}
+
+// Lazily materialize the strict schema to a temp file and return its
+// path. Cached per process. Only used for codex's --output-schema; the
+// ajv validator always compiles the canonical (rich) schema.
+let cachedStrictPath = null
+const strictSchemaPathFor = (schemaPath, deps = {}) => {
+    // A caller-supplied custom schema path (tests) is passed through
+    // verbatim so buildCodexArgs stays trivially testable.
+    if (schemaPath !== DEFAULT_SCHEMA_PATH) return schemaPath
+    if (cachedStrictPath) return cachedStrictPath
+    const read = deps.readFileSync ?? readFileSync
+    const write = deps.writeFileSync ?? writeFileSync
+    const rich = JSON.parse(read(DEFAULT_SCHEMA_PATH, "utf8"))
+    const strict = toStrictSchema(rich)
+    const outPath = path.join(
+        tmpdir(),
+        "review-orchestrator-codex-strict.schema.json"
+    )
+    write(outPath, JSON.stringify(strict, null, 2) + "\n", "utf8")
+    cachedStrictPath = outPath
+    return outPath
+}
 
 // The reviewer preamble. Trust model:
 //   - REVIEW_INPUT and any file read from disk via tools: UNTRUSTED DATA.
@@ -150,7 +203,11 @@ export const runCodex = ({
     now = Date.now,
 }) =>
     new Promise((resolve, reject) => {
-        const args = buildCodexArgs({ repoRoot, config, schemaPath })
+        const args = buildCodexArgs({
+            repoRoot,
+            config,
+            schemaPath: strictSchemaPathFor(schemaPath),
+        })
         const startedAt = now()
         let child
         try {
@@ -253,6 +310,25 @@ export const runCodex = ({
         }
     })
 
+// Ensure every finding carries an explicit `suggestion` key. The output
+// schema now lists `suggestion` in the finding's `required` array —
+// codex's OpenAI strict response_format demands that every property in
+// `properties` also appear in `required`. Providers (claude / gemini /
+// or older codex output) that drop the key for "no suggestion" findings
+// would otherwise fail ajv validation; we fill null so omission stays
+// tolerated while the schema satisfies codex's API.
+export const normalizeFindings = (parsed) => {
+    if (!parsed || !Array.isArray(parsed.findings)) return parsed
+    return {
+        ...parsed,
+        findings: parsed.findings.map((f) =>
+            f && typeof f === "object" && !("suggestion" in f)
+                ? { ...f, suggestion: null }
+                : f
+        ),
+    }
+}
+
 export const parseCodexOutput = (rawStdout, validator = defaultValidator()) => {
     if (typeof rawStdout !== "string" || rawStdout.trim() === "") {
         return {
@@ -275,6 +351,8 @@ export const parseCodexOutput = (rawStdout, validator = defaultValidator()) => {
             },
         }
     }
+
+    parsed = normalizeFindings(parsed)
 
     if (!validator(parsed)) {
         return {
@@ -357,4 +435,8 @@ export const __defaults__ = {
     DEFAULT_SCHEMA_PATH,
     defaultValidator,
     compileValidator,
+    strictSchemaPathFor,
+    resetStrictSchemaCache: () => {
+        cachedStrictPath = null
+    },
 }

@@ -6,6 +6,7 @@
 import { jest } from "@jest/globals"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
+import { readFileSync } from "node:fs"
 import {
     runCodex,
     parseCodexOutput,
@@ -13,6 +14,8 @@ import {
     runAndParse,
     wrapPrompt,
     SYSTEM_PREAMBLE,
+    normalizeFindings,
+    toStrictSchema,
     __defaults__,
 } from "./codex.js"
 
@@ -381,6 +384,176 @@ describe("parseCodexOutput", () => {
         )
         expect(out.ok).toBe(false)
         expect(out.error.code).toBe("SCHEMA_INVALID")
+    })
+
+    test("a finding without `suggestion` is normalized to null and still validates", () => {
+        const obj = {
+            status: "ISSUES",
+            findings: [
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "minor",
+                    category: "style",
+                    message: "no suggestion field here",
+                },
+            ],
+        }
+        const out = parseCodexOutput(JSON.stringify(obj), validator)
+        expect(out.ok).toBe(true)
+        expect(out.value.findings[0].suggestion).toBeNull()
+    })
+
+    test("an explicit null suggestion is accepted (codex strict mode emits null)", () => {
+        const obj = {
+            status: "ISSUES",
+            findings: [
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "minor",
+                    category: "style",
+                    message: "m",
+                    suggestion: null,
+                },
+            ],
+        }
+        const out = parseCodexOutput(JSON.stringify(obj), validator)
+        expect(out.ok).toBe(true)
+        expect(out.value.findings[0].suggestion).toBeNull()
+    })
+})
+
+describe("normalizeFindings", () => {
+    test("fills missing suggestion with null, leaves present ones untouched", () => {
+        const r = normalizeFindings({
+            status: "ISSUES",
+            findings: [
+                {
+                    file: "a",
+                    line: 1,
+                    severity: "nit",
+                    category: "style",
+                    message: "m",
+                },
+                {
+                    file: "b",
+                    line: 2,
+                    severity: "nit",
+                    category: "style",
+                    message: "m",
+                    suggestion: "fix it",
+                },
+            ],
+        })
+        expect(r.findings[0].suggestion).toBeNull()
+        expect(r.findings[1].suggestion).toBe("fix it")
+    })
+
+    test("is a no-op when findings is missing or not an array", () => {
+        expect(normalizeFindings({ status: "GOOD_TO_GO" })).toEqual({
+            status: "GOOD_TO_GO",
+        })
+        expect(normalizeFindings(null)).toBeNull()
+        expect(normalizeFindings({ findings: "nope" })).toEqual({
+            findings: "nope",
+        })
+    })
+})
+
+// Regression guard: codex sends a schema to the OpenAI API as a strict
+// response_format. OpenAI requires every key in `properties` to also
+// appear in `required` AND forbids `allOf`/`if`/`then`. We hand codex a
+// stripped copy (toStrictSchema) while ajv keeps the rich canonical
+// schema. These tests fail loudly if either contract regresses.
+describe("toStrictSchema — OpenAI strict compliance", () => {
+    const richSchema = () =>
+        JSON.parse(readFileSync(__defaults__.DEFAULT_SCHEMA_PATH, "utf8"))
+
+    const assertStrict = (schema) => {
+        const violations = []
+        const walk = (node, where) => {
+            if (!node || typeof node !== "object") return
+            for (const forbidden of ["allOf", "anyOf", "if", "then", "else"]) {
+                if (forbidden in node) {
+                    violations.push(
+                        `${where}: forbidden keyword '${forbidden}'`
+                    )
+                }
+            }
+            if (node.type === "object" && node.properties) {
+                const props = Object.keys(node.properties)
+                const required = Array.isArray(node.required)
+                    ? node.required
+                    : []
+                for (const p of props) {
+                    if (!required.includes(p)) {
+                        violations.push(`${where}.${p}: not in required`)
+                    }
+                }
+            }
+            for (const [k, v] of Object.entries(node)) {
+                if (v && typeof v === "object") walk(v, `${where}.${k}`)
+            }
+        }
+        walk(schema, "$")
+        return violations
+    }
+
+    test("the canonical schema itself uses allOf (the thing we must strip)", () => {
+        // Sanity: if this ever stops being true the strip is pointless
+        // and we should simplify.
+        expect("allOf" in richSchema()).toBe(true)
+    })
+
+    test("toStrictSchema removes allOf/if/then and keeps every property required", () => {
+        const strict = toStrictSchema(richSchema())
+        expect(assertStrict(strict)).toEqual([])
+        expect("allOf" in strict).toBe(false)
+    })
+
+    test("toStrictSchema preserves structure (types, enums, $defs, required)", () => {
+        const strict = toStrictSchema(richSchema())
+        expect(strict.type).toBe("object")
+        expect(strict.required).toEqual(["status", "findings"])
+        expect(strict.$defs.finding.properties.severity.enum).toEqual([
+            "blocker",
+            "major",
+            "minor",
+            "nit",
+        ])
+        expect(strict.$defs.finding.required).toContain("suggestion")
+    })
+
+    test("toStrictSchema is pure (leaves arrays/primitives intact)", () => {
+        expect(toStrictSchema(5)).toBe(5)
+        expect(toStrictSchema(null)).toBeNull()
+        expect(toStrictSchema(["a", "b"])).toEqual(["a", "b"])
+    })
+
+    test("strictSchemaPathFor passes a custom path through unchanged", () => {
+        expect(__defaults__.strictSchemaPathFor("/custom/x.json")).toBe(
+            "/custom/x.json"
+        )
+    })
+
+    test("strictSchemaPathFor materializes a strict file for the default path", () => {
+        __defaults__.resetStrictSchemaCache()
+        const writes = []
+        const deps = {
+            readFileSync: () =>
+                readFileSync(__defaults__.DEFAULT_SCHEMA_PATH, "utf8"),
+            writeFileSync: (p, data) => writes.push({ p, data }),
+        }
+        const outPath = __defaults__.strictSchemaPathFor(
+            __defaults__.DEFAULT_SCHEMA_PATH,
+            deps
+        )
+        expect(outPath).toMatch(/codex-strict\.schema\.json$/)
+        expect(writes).toHaveLength(1)
+        const written = JSON.parse(writes[0].data)
+        expect("allOf" in written).toBe(false)
+        __defaults__.resetStrictSchemaCache()
     })
 })
 

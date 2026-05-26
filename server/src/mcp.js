@@ -140,6 +140,18 @@ export const REQUEST_REVIEW_INPUT_SHAPE = {
         .describe(
             "Optional caller-supplied reviewer guidance. Layered on top of any project-level extraReviewerInstructions."
         ),
+    force: z
+        .boolean()
+        .optional()
+        .describe(
+            "When true, bypass cache short-circuits (NO_CHANGES, NO_PROGRESS_WITH_OPEN_ISSUES, CODEX_ERROR_CACHED, dirty-flag fast path) and safety caps (MAX_BLOCKS, MAX_CODEX_ROUNDS). Spawns a fresh reviewer run unconditionally. Counters still increment."
+        ),
+    provider: z
+        .enum(["codex", "claude", "gemini"])
+        .optional()
+        .describe(
+            "Optional per-request reviewer override. One of: codex, claude, gemini. Falls back to the server's configured provider when omitted. If the named binary or auth is missing, the call returns ESCALATE."
+        ),
 }
 
 export const RESET_REVIEW_CONTEXT_INPUT_SHAPE = {
@@ -230,10 +242,20 @@ const applyRootsPolicy = async ({ mcpServer, logger, deps }) => {
 
 export const reviewRequestHandler = async ({
     args,
-    ctx: { config, store, archive, logger, deps = {}, now, mcpServer },
+    ctx: {
+        config,
+        store,
+        archive,
+        logger,
+        deps = {},
+        now,
+        mcpServer,
+        metrics = null,
+    },
 }) => {
     const policy = await applyRootsPolicy({ mcpServer, logger, deps })
     if (!policy.ok) {
+        if (metrics) metrics.record(policy.body)
         return asContent(summarizeReview(policy.body), policy.body)
     }
     const result = await handleReview({
@@ -241,6 +263,9 @@ export const reviewRequestHandler = async ({
             cwd: args?.cwd,
             trigger: "mcp_tool",
             extra_instructions: args?.extra_instructions,
+            force: args?.force === true,
+            provider:
+                typeof args?.provider === "string" ? args.provider : undefined,
         },
         config,
         store,
@@ -249,6 +274,7 @@ export const reviewRequestHandler = async ({
         deps: policy.deps,
         now,
     })
+    if (metrics) metrics.record(result.body)
     return asContent(summarizeReview(result.body), result.body)
 }
 
@@ -276,7 +302,14 @@ const TOOL_TITLES = {
     request_review:
         "Run a code review of the current git changes in `cwd`. " +
         "Provider (codex / claude / gemini) is selected by " +
-        "config.reviewer.provider on the server side.",
+        "config.reviewer.provider on the server side, or per-call via " +
+        "the optional `provider` input. Pass `force: true` to bypass the " +
+        "server-side cache and safety caps and force a fresh reviewer " +
+        "run. When the result contains blocking findings (severity " +
+        "`blocker` or `major`), you MUST address every one of them in " +
+        "code before responding to the user, then call request_review " +
+        "again. Repeat until the tool returns GOOD_TO_GO or " +
+        "GOOD_TO_GO_WITH_NOTES.",
     reset_review_context:
         "Clear the per-context review state (counters, baseline, prior findings) for the repo at `cwd`.",
 }

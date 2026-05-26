@@ -32,7 +32,14 @@
         "finding": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["file", "line", "severity", "category", "message"],
+            "required": [
+                "file",
+                "line",
+                "severity",
+                "category",
+                "message",
+                "suggestion"
+            ],
             "properties": {
                 "file": {
                     "type": "string",
@@ -67,8 +74,9 @@
                     "maxLength": 2000
                 },
                 "suggestion": {
-                    "type": "string",
-                    "maxLength": 4000
+                    "type": ["string", "null"],
+                    "maxLength": 4000,
+                    "description": "Optional fix suggestion, or null when none. Always present (codex strict response_format requires every property to be listed in 'required'); use null to indicate 'no suggestion'."
                 }
             }
         }

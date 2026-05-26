@@ -67,6 +67,25 @@ describe("pickReviewer", () => {
         ).toThrow(/unknown reviewer\.provider: bogus/)
     })
 
+    test("override argument wins over config.reviewer.provider", () => {
+        const cfg = minimalConfig({ reviewer: { provider: "codex" } })
+        const r = pickReviewer(cfg, "gemini")
+        expect(r.name).toBe("gemini")
+        expect(r.binary).toBe("gemini")
+    })
+
+    test("override of null/undefined falls through to config", () => {
+        const cfg = minimalConfig({ reviewer: { provider: "claude" } })
+        expect(pickReviewer(cfg, null).name).toBe("claude")
+        expect(pickReviewer(cfg, undefined).name).toBe("claude")
+    })
+
+    test("unknown override produces the same clear error as config-level", () => {
+        expect(() => pickReviewer(minimalConfig(), "bogus")).toThrow(
+            /unknown reviewer\.provider: bogus/
+        )
+    })
+
     test("binary tracks the provider", () => {
         const c = pickReviewer(minimalConfig())
         expect(c.binary).toBe("codex")

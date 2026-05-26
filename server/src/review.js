@@ -40,9 +40,18 @@ const short = (s, n = 12) =>
 //   * review-shaping limits — could cause different truncation behavior.
 // Excluded: per-call body.extra_instructions (changes per request and is
 // out of band with persistent state).
-export const computeReviewConfigHash = (config) => {
+export const computeReviewConfigHash = (config, providerOverride = null) => {
     const blockingSeverities = [...(config.blockingSeverities ?? [])].sort()
     const ignorePaths = [...(config.ignorePaths ?? [])].sort()
+    // The effective reviewer for THIS request: a per-call MCP override
+    // wins, else the server's configured provider. The provider (and
+    // its model) is part of the review policy — a different reviewer can
+    // legitimately reach a different verdict on the same diff. Omitting
+    // it let a cache hit (NO_CHANGES / NO_PROGRESS / CODEX_ERROR_CACHED)
+    // return the PREVIOUS provider's result after `setprovider.sh` or a
+    // per-call `provider` override, silently defeating the switch.
+    const provider = providerOverride ?? config.reviewer?.provider ?? "codex"
+    const providerModel = providerCfg(provider, config)?.model ?? null
     const policy = {
         blockingSeverities,
         ignorePaths,
@@ -62,6 +71,11 @@ export const computeReviewConfigHash = (config) => {
         // cache on flip so the operator sees the new behavior take
         // effect on the very next review.
         verifyCleanTree: config.payload?.verifyCleanTree === true,
+        // Effective reviewer + model. A provider switch (server-wide or
+        // per-call) invalidates the cached baseline so the newly
+        // selected reviewer actually runs.
+        provider,
+        providerModel,
     }
     return createHash("sha256").update(JSON.stringify(policy)).digest("hex")
 }
@@ -305,6 +319,12 @@ export const handleReview = async ({
         ? logger.child({ requestId, component: "review" })
         : logger
 
+    const force = body?.force === true
+    const providerOverride =
+        typeof body?.provider === "string" && body.provider.length > 0
+            ? body.provider
+            : null
+
     log.info(
         {
             cwd: body?.cwd,
@@ -313,6 +333,8 @@ export const handleReview = async ({
             hasExtraInstructions:
                 typeof body?.extra_instructions === "string" &&
                 body.extra_instructions.length > 0,
+            force,
+            providerOverride,
         },
         "review request received"
     )
@@ -377,11 +399,24 @@ export const handleReview = async ({
     // second (and Nth) caller attaches to the first promise and gets
     // the same {httpStatus, body} back. Map entries are removed in
     // finally so the next request is free to spin up a fresh review.
+    // Dedup key includes force + the EFFECTIVE provider (per-call
+    // override, else the live server default). A `force:true` or
+    // `provider`-override request promises a fresh / provider-specific
+    // run, so it must NOT attach to (or be served by) an ordinary
+    // in-flight review for the same context. Using the effective
+    // provider (not just the per-call override) also means a live
+    // `PUT /provider` switch made while a review is in flight takes
+    // effect on the next plain request instead of attaching to the
+    // old provider's running promise. Two identical plain requests
+    // under the same provider still share one pipeline.
     const inflight = deps.inflight ?? defaultInflight
-    const existing = inflight.get(context.key)
+    const effectiveProvider =
+        providerOverride ?? config.reviewer?.provider ?? "codex"
+    const inflightKey = `${context.key}|force=${force}|provider=${effectiveProvider}`
+    const existing = inflight.get(inflightKey)
     if (existing) {
         log.info(
-            { contextKey: context.key, attached: true },
+            { contextKey: context.key, inflightKey, attached: true },
             "attached to in-flight review"
         )
         return existing
@@ -398,7 +433,10 @@ export const handleReview = async ({
             logger: log,
         })
         config = mergeWithGlobal(config, projectConfig)
-        const reviewConfigHash = computeReviewConfigHash(config)
+        const reviewConfigHash = computeReviewConfigHash(
+            config,
+            providerOverride
+        )
         log.info(
             {
                 hasProjectConfig: Boolean(projectConfig),
@@ -438,9 +476,21 @@ export const handleReview = async ({
         // ESCALATE / NO_PROGRESS land in the existing post-buildPayload
         // cache logic so their semantics (cached-blocking, cached-
         // escalate, blockCount accounting) stay intact.
+        // force=true (v0.1.18): caller demanded a fresh reviewer run.
+        // Skip every short-circuit (fast-path, NO_CHANGES, NO_PROGRESS,
+        // CODEX_ERROR_CACHED) and every safety cap (MAX_BLOCKS,
+        // MAX_CODEX_ROUNDS). Counters still increment so /status
+        // reflects reality.
         const fastPathEligible =
+            !force &&
             state.dirtySinceLastReview === false &&
             state.lastBaseline &&
+            // The cached baseline must have been produced under the same
+            // review policy (provider, model, blockingSeverities, …).
+            // Without this, switching provider on an otherwise-unchanged
+            // tree would still short-circuit NO_CHANGES from the old
+            // provider instead of running the newly selected reviewer.
+            state.lastBaseline.reviewConfigHash === reviewConfigHash &&
             (state.lastResultStatus === "GOOD_TO_GO" ||
                 state.lastResultStatus === "GOOD_TO_GO_WITH_NOTES")
         if (fastPathEligible) {
@@ -524,6 +574,7 @@ export const handleReview = async ({
         // more work. Manual MCP calls bypass this cap because they don't
         // consume block budget by definition.
         if (
+            !force &&
             isStopHook(trigger) &&
             state.blockCount >= config.limits.maxBlocks
         ) {
@@ -613,6 +664,7 @@ export const handleReview = async ({
         // blockingSeverities or extraReviewerInstructions invalidates the
         // cache even when the file bytes have not changed.
         const unchanged =
+            !force &&
             state.lastBaseline &&
             state.lastBaseline.progressHash === payload.progressHash &&
             state.lastBaseline.reviewConfigHash === reviewConfigHash
@@ -724,7 +776,7 @@ export const handleReview = async ({
         // increments before the spawn so a misbehaving reviewer can't
         // burn extra rounds via retries. (Internal state/config field
         // names keep the historic "codex" prefix for back-compat.)
-        if (state.codexRounds >= config.limits.maxCodexRounds) {
+        if (!force && state.codexRounds >= config.limits.maxCodexRounds) {
             const notifyUser = computeNotifyUser(state, trigger)
             if (notifyUser) {
                 store.save(context.key, {
@@ -781,7 +833,10 @@ export const handleReview = async ({
         // rest of this function is provider-agnostic.
         let reviewerAdapter
         try {
-            reviewerAdapter = (deps.pickReviewer ?? pickReviewer)(config)
+            reviewerAdapter = (deps.pickReviewer ?? pickReviewer)(
+                config,
+                providerOverride
+            )
         } catch (err) {
             log.error(
                 { err: err?.message, configReviewer: config.reviewer ?? null },
@@ -1114,19 +1169,26 @@ export const handleReview = async ({
         }
     })() // end of pipelinePromise IIFE
 
-    inflight.set(context.key, pipelinePromise)
+    inflight.set(inflightKey, pipelinePromise)
     try {
         return await pipelinePromise
     } finally {
         // Clear the slot whether the pipeline resolved or threw. A
         // future request for the same context starts a fresh pipeline.
-        inflight.delete(context.key)
+        inflight.delete(inflightKey)
     }
 }
 
 export const mountReviewRoute = (
     app,
-    { config, store, archive = null, logger = noopLogger, deps } = {}
+    {
+        config,
+        store,
+        archive = null,
+        logger = noopLogger,
+        deps,
+        metrics = null,
+    } = {}
 ) => {
     app.post("/review", async (req, res) => {
         const result = await handleReview({
@@ -1138,6 +1200,7 @@ export const mountReviewRoute = (
             deps,
             requestId: req.requestId ?? null,
         })
+        if (metrics) metrics.record(result.body)
         res.status(result.httpStatus).json(result.body)
     })
 }

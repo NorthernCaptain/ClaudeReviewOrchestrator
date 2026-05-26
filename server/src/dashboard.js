@@ -101,6 +101,34 @@ const fmtTs = (iso) => {
     }
 }
 
+// Pick a step (in whole minutes) that yields at most ~6 ticks for the
+// observed max duration so the Y-axis stays readable on long-running
+// review fleets without crowding.
+const MAX_AXIS_TICKS = 6
+const computeAxisTicks = (maxMs) => {
+    if (typeof maxMs !== "number" || maxMs <= 0) return []
+    if (maxMs < 60000) {
+        return [0.25, 0.5, 0.75, 1].map((f) => Math.round(maxMs * f))
+    }
+    const maxMin = Math.ceil(maxMs / 60000)
+    const stepMin = Math.max(1, Math.ceil(maxMin / MAX_AXIS_TICKS))
+    const ticks = []
+    for (let m = stepMin; m * 60000 <= maxMs + 500; m += stepMin) {
+        ticks.push(m * 60000)
+    }
+    return ticks
+}
+
+// Axis label: prefer "Nm" when the value is a whole minute. Falls back
+// to the regular fmtMs so sub-minute ticks (and the unusual case of a
+// non-round minute) still render sensibly.
+const fmtAxisLabel = (ms) => {
+    if (typeof ms === "number" && ms >= 60000 && ms % 60000 === 0) {
+        return `${ms / 60000}m`
+    }
+    return fmtMs(ms)
+}
+
 // Build the inline SVG chart. Bars left-to-right are OLDEST-to-NEWEST
 // (records arrive newest-first; we reverse for the chart). Height
 // is log-scaled on durationMs; color is by status; the findings
@@ -171,16 +199,17 @@ const renderChart = (records) => {
         })
         .join("")
 
-    // Light reference lines + duration ticks on the left axis. Pick
-    // 25 / 50 / 75 / 100 % of the observed max so the linear scale
-    // has readable gridlines regardless of how slow/fast reviews are.
-    const refDurs = [0.25, 0.5, 0.75, 1].map((f) => Math.round(maxDur * f))
+    // Y-axis ticks. Above 1 minute we step in whole minutes so labels
+    // read 1m / 2m / 3m / … instead of arbitrary 25/50/75/100% values
+    // like "1m 28s". Below 1 minute we fall back to four percent-based
+    // ticks because seconds-scale reviews don't divide cleanly.
+    const refDurs = computeAxisTicks(maxDur)
     const refs = refDurs
         .map((d) => {
             const y = padT + (innerH - scale(d))
             return (
                 `<line x1="${padL}" x2="${W - padR}" y1="${y.toFixed(2)}" y2="${y.toFixed(2)}" class="ref"/>` +
-                `<text x="${padL - 6}" y="${(y + 4).toFixed(2)}" text-anchor="end" class="ref-label">${fmtMs(d)}</text>`
+                `<text x="${padL - 6}" y="${(y + 4).toFixed(2)}" text-anchor="end" class="ref-label">${fmtAxisLabel(d)}</text>`
             )
         })
         .join("")
@@ -199,6 +228,129 @@ const renderChart = (records) => {
         refs +
         bars +
         xLabels +
+        `</svg>`
+    )
+}
+
+// Pie chart of request buckets (v0.1.16). Three slices:
+//   reviewed (green)  — reviewer subprocess ran successfully
+//   short-circuit (blue) — cache / no-progress short-circuit
+//   errors (red)      — ESCALATE
+// Counts are in-process and reset on server restart.
+const PIE_COLORS = {
+    reviewed: STATUS_COLORS.GOOD_TO_GO,
+    shortCircuit: STATUS_COLORS.NO_PROGRESS_WITH_OPEN_ISSUES,
+    errors: STATUS_COLORS.ESCALATE,
+}
+const PIE_LABELS = {
+    reviewed: "reviewed",
+    shortCircuit: "short-circuit",
+    errors: "errors",
+}
+
+const polarToCartesian = (cx, cy, r, deg) => {
+    const rad = ((deg - 90) * Math.PI) / 180
+    return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) }
+}
+
+const arcPath = (cx, cy, r, startDeg, endDeg) => {
+    const start = polarToCartesian(cx, cy, r, endDeg)
+    const end = polarToCartesian(cx, cy, r, startDeg)
+    const large = endDeg - startDeg <= 180 ? 0 : 1
+    return [
+        `M ${cx} ${cy}`,
+        `L ${start.x.toFixed(2)} ${start.y.toFixed(2)}`,
+        `A ${r} ${r} 0 ${large} 0 ${end.x.toFixed(2)} ${end.y.toFixed(2)}`,
+        "Z",
+    ].join(" ")
+}
+
+export const renderRequestPie = (metrics) => {
+    const m = metrics ?? { reviewed: 0, shortCircuit: 0, errors: 0 }
+    const total = (m.reviewed ?? 0) + (m.shortCircuit ?? 0) + (m.errors ?? 0)
+    // Compact square box that sits next to the active-config grid.
+    // Generous horizontal padding for the callout labels (longest is
+    // "short-circuit"). Height stays small enough not to dominate the
+    // config row.
+    const W = 220
+    const H = 170
+    const cx = W / 2
+    const cy = H / 2
+    const r = 56
+    if (total === 0) {
+        return (
+            `<svg viewBox="0 0 ${W} ${H}" class="pie" aria-label="empty pie">` +
+            `<circle cx="${cx}" cy="${cy}" r="${r}" class="pie-empty"/>` +
+            `<text x="${cx}" y="${cy + 4}" text-anchor="middle" class="empty">no requests</text>` +
+            `</svg>`
+        )
+    }
+    const buckets = [
+        ["reviewed", m.reviewed ?? 0],
+        ["shortCircuit", m.shortCircuit ?? 0],
+        ["errors", m.errors ?? 0],
+    ].filter(([, n]) => n > 0)
+
+    // Slices. Draw them first so the callout lines/labels render on top.
+    let slices
+    const sliceMidAngles = []
+    if (buckets.length === 1) {
+        const [bucket, count] = buckets[0]
+        slices =
+            `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${PIE_COLORS[bucket]}">` +
+            `<title>${escapeHtml(PIE_LABELS[bucket])} · ${count} · 100%</title>` +
+            `</circle>`
+        // No mid-angles for a full circle — render the single callout
+        // straight down so it doesn't overlap the pie body.
+        sliceMidAngles.push({ bucket, count, midDeg: 0 })
+    } else {
+        let startDeg = 0
+        slices = buckets
+            .map(([bucket, count]) => {
+                const sweep = (count / total) * 360
+                const endDeg = startDeg + sweep
+                const midDeg = startDeg + sweep / 2
+                sliceMidAngles.push({ bucket, count, midDeg })
+                const pct = ((count / total) * 100).toFixed(1)
+                const title = escapeHtml(
+                    `${PIE_LABELS[bucket]} · ${count} · ${pct}%`
+                )
+                const d = arcPath(cx, cy, r, startDeg, endDeg)
+                startDeg = endDeg
+                return (
+                    `<path d="${d}" fill="${PIE_COLORS[bucket]}">` +
+                    `<title>${title}</title></path>`
+                )
+            })
+            .join("")
+    }
+
+    // Callout labels — short leader line from slice edge to a text
+    // anchored just outside the pie. Anchor is left/right based on
+    // which side of the pie the mid-angle falls on so labels never
+    // overlap the pie body.
+    const callouts = sliceMidAngles
+        .map(({ bucket, count, midDeg }) => {
+            const pct = ((count / total) * 100).toFixed(1)
+            const inner = polarToCartesian(cx, cy, r, midDeg)
+            const outer = polarToCartesian(cx, cy, r + 10, midDeg)
+            const onRight = outer.x >= cx
+            const labelX = onRight ? outer.x + 4 : outer.x - 4
+            const anchor = onRight ? "start" : "end"
+            return (
+                `<g class="callout">` +
+                `<line x1="${inner.x.toFixed(2)}" y1="${inner.y.toFixed(2)}" x2="${outer.x.toFixed(2)}" y2="${outer.y.toFixed(2)}" stroke="${PIE_COLORS[bucket]}" stroke-width="1"/>` +
+                `<text x="${labelX.toFixed(2)}" y="${(outer.y - 2).toFixed(2)}" text-anchor="${anchor}" class="callout-label">${escapeHtml(PIE_LABELS[bucket])}</text>` +
+                `<text x="${labelX.toFixed(2)}" y="${(outer.y + 10).toFixed(2)}" text-anchor="${anchor}" class="callout-count">${count} · ${pct}%</text>` +
+                `</g>`
+            )
+        })
+        .join("")
+
+    return (
+        `<svg viewBox="0 0 ${W} ${H}" class="pie" preserveAspectRatio="xMidYMid meet">` +
+        slices +
+        callouts +
         `</svg>`
     )
 }
@@ -432,6 +584,25 @@ svg.chart a.bar-link:hover rect { opacity: 0.75; stroke: var(--fg);
 }
 details:target { animation: flash-target 1.2s ease-out 1; }
 svg.chart .empty { fill: var(--muted); font-size: 12px; }
+svg.pie { width: 220px; height: 170px; display: block; flex: 0 0 auto; }
+svg.pie path, svg.pie circle { stroke: var(--panel); stroke-width: 1; }
+svg.pie .pie-empty { fill: var(--border); stroke: none; }
+svg.pie .callout-label { fill: var(--fg); font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+svg.pie .callout-count { fill: var(--muted); font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+svg.pie .empty { fill: var(--muted); font-size: 11px; font-style: italic; }
+.config-row { display: flex; gap: 24px; align-items: flex-start; }
+.config-row .config { flex: 1 1 auto; min-width: 0; }
+.config-row .pie-wrap { display: flex; flex-direction: column;
+  align-items: center; gap: 4px; flex: 0 0 220px; }
+.config-row .pie-wrap .label { color: var(--muted); font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+  text-align: center; }
+@media (max-width: 720px) {
+  .config-row { flex-direction: column; }
+  .config-row .pie-wrap { align-self: center; }
+}
 details { border-top: 1px solid var(--border); }
 details:first-of-type { border-top: 0; }
 summary { display: grid; grid-template-columns: 170px 1fr 110px 90px 130px 24px;
@@ -486,6 +657,7 @@ export const renderDashboard = ({
     uptimeSeconds = null,
     startedAt = null,
     records = [],
+    metrics = null,
 } = {}) => {
     // Assign a stable id per record so chart bars can deep-link to the
     // matching row in the reviews table. Index is the position in the
@@ -518,7 +690,13 @@ export const renderDashboard = ({
 
 <section aria-label="active config">
   <h2>active config</h2>
-  ${renderConfigPanel(config)}
+  <div class="config-row">
+    ${renderConfigPanel(config)}
+    <div class="pie-wrap">
+      ${renderRequestPie(metrics)}
+      <div class="label">request mix · since restart</div>
+    </div>
+  </div>
 </section>
 
 <section aria-label="timeline">
@@ -571,7 +749,7 @@ export const renderDashboard = ({
 
 export const mountDashboardRoute = (
     app,
-    { archive, config, summarize, version, startedAt } = {}
+    { archive, config, summarize, version, startedAt, metrics = null } = {}
 ) => {
     app.get("/", (_req, res) => {
         const records = archive?.readRecent
@@ -588,6 +766,7 @@ export const mountDashboardRoute = (
             uptimeSeconds,
             startedAt: startedAt ? new Date(startedAt).toISOString() : null,
             records,
+            metrics: metrics?.snapshot ? metrics.snapshot() : metrics,
         })
         res.setHeader("Content-Type", "text/html; charset=utf-8")
         res.setHeader("Cache-Control", "no-store")
@@ -600,8 +779,11 @@ export const __test__ = {
     fmtUptime,
     fmtTs,
     renderChart,
+    renderRequestPie,
     renderConfigPanel,
     renderFinding,
     renderSuccessRow,
     renderFailureRow,
+    computeAxisTicks,
+    fmtAxisLabel,
 }

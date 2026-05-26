@@ -17,8 +17,10 @@ import { mountMcpRoute } from "./mcp.js"
 import { mountStatusRoute } from "./status.js"
 import { mountDashboardRoute } from "./dashboard.js"
 import { mountNotifyChangeRoute } from "./notify-change.js"
+import { mountProviderRoute } from "./provider.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
+import { createMetrics } from "./metrics.js"
 import { logger } from "./logger.js"
 import { createHttpAccessLog, createHttpErrorHandler } from "./http-log.js"
 
@@ -74,6 +76,8 @@ export const createApp = ({
     logger: log = logger,
     deps = {},
     startedAt = Date.now(),
+    metrics = createMetrics(),
+    configPath = defaultConfigPath(),
 }) => {
     const app = express()
     app.disable("x-powered-by")
@@ -99,12 +103,21 @@ export const createApp = ({
         summarize: summarizeStartup,
         version: VERSION,
         startedAt,
+        metrics,
     })
 
     app.use(authMiddleware({ token: config.authToken }))
-    mountReviewRoute(app, { config, store, archive, logger: log, deps })
+    mountReviewRoute(app, {
+        config,
+        store,
+        archive,
+        logger: log,
+        deps,
+        metrics,
+    })
     mountResetRoute(app, { config, store, deps })
     mountNotifyChangeRoute(app, { config, store, logger: log, deps })
+    mountProviderRoute(app, { config, configPath, logger: log, deps })
     // Capture the MCP route's closeAllSessions so shutdown can drain
     // long-poll GETs (otherwise server.close() never resolves).
     const mcp = mountMcpRoute(app, {
@@ -113,6 +126,7 @@ export const createApp = ({
         archive,
         logger: log,
         deps,
+        metrics,
     })
     app.locals.mcp = mcp
     mountStatusRoute(app, {
@@ -138,6 +152,7 @@ export const startServer = ({
     deps = {},
     log = logger,
     startedAt = Date.now(),
+    configPath = defaultConfigPath(),
 } = {}) =>
     new Promise((resolve) => {
         const app = createApp({
@@ -147,6 +162,7 @@ export const startServer = ({
             logger: log,
             deps,
             startedAt,
+            configPath,
         })
         const server = app.listen(config.port, config.bind)
         let settled = false
@@ -426,7 +442,7 @@ const main = async () => {
         )
     }
 
-    const result = await startServer({ config, store, archive })
+    const result = await startServer({ config, store, archive, configPath })
     if (!result.ok) {
         process.exitCode = 1
         return

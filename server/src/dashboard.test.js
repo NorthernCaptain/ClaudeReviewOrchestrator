@@ -10,8 +10,14 @@ import {
     __test__,
 } from "./dashboard.js"
 
-const { fmtMs, fmtUptime, renderChart, renderSuccessRow, renderFailureRow } =
-    __test__
+const {
+    fmtMs,
+    fmtUptime,
+    renderChart,
+    renderRequestPie,
+    renderSuccessRow,
+    renderFailureRow,
+} = __test__
 
 const baseConfig = () => ({
     version: "0.1.3",
@@ -459,5 +465,169 @@ describe("mountDashboardRoute", () => {
         routes["GET /"]({}, res)
         expect(res.statusCode).toBe(200)
         expect(res.body).toContain("no reviews yet")
+    })
+
+    test("uses metrics.snapshot() if provided as a live object", () => {
+        const snapshots = []
+        const fakeMetrics = {
+            snapshot: () => {
+                snapshots.push("called")
+                return { reviewed: 4, shortCircuit: 1, errors: 2 }
+            },
+        }
+        const { app, routes } = mkRouteRecorder()
+        mountDashboardRoute(app, {
+            archive: null,
+            config: null,
+            summarize: () => null,
+            version: "0.1.3",
+            startedAt: 0,
+            metrics: fakeMetrics,
+        })
+        const res = mkRes()
+        routes["GET /"]({}, res)
+        expect(snapshots).toHaveLength(1)
+        expect(res.body).toContain("request mix")
+        // 4+1+2 = 7 total; reviewed = 4/7 = 57.1%
+        expect(res.body).toContain("57.1%")
+    })
+})
+
+describe("renderRequestPie", () => {
+    test("renders the empty-state circle when no requests have been recorded", () => {
+        const svg = renderRequestPie({
+            reviewed: 0,
+            shortCircuit: 0,
+            errors: 0,
+        })
+        expect(svg).toContain("no requests")
+        expect(svg).toContain("pie-empty")
+    })
+
+    test("renders one slice per non-zero bucket with the right colors", () => {
+        const svg = renderRequestPie({
+            reviewed: 5,
+            shortCircuit: 3,
+            errors: 2,
+        })
+        // STATUS_COLORS.GOOD_TO_GO = #4ade80 (reviewed)
+        expect(svg).toContain("#4ade80")
+        // STATUS_COLORS.NO_PROGRESS_WITH_OPEN_ISSUES = #6366f1 (shortCircuit)
+        expect(svg).toContain("#6366f1")
+        // STATUS_COLORS.ESCALATE = #ef4444 (errors)
+        expect(svg).toContain("#ef4444")
+        // 3 paths, one per slice.
+        expect(svg.match(/<path /g)?.length).toBe(3)
+    })
+
+    test("draws a full circle when only one bucket is non-zero (avoids degenerate 360° arc)", () => {
+        const svg = renderRequestPie({
+            reviewed: 7,
+            shortCircuit: 0,
+            errors: 0,
+        })
+        // Pie shape is a <circle>, not an SVG path arc.
+        expect(svg).toMatch(/<circle [^>]*fill="#4ade80"/)
+        expect(svg).not.toMatch(/<path /)
+    })
+
+    test("callouts only render for non-zero buckets (no clutter for empty slices)", () => {
+        const svg = renderRequestPie({
+            reviewed: 1,
+            shortCircuit: 0,
+            errors: 0,
+        })
+        expect(svg).toContain("reviewed")
+        expect(svg).toContain("100.0%")
+        // Empty buckets do NOT get a callout label.
+        expect(svg).not.toContain("short-circuit")
+        expect(svg).not.toContain("errors")
+    })
+
+    test("each visible slice has a callout with label, count, percentage", () => {
+        const svg = renderRequestPie({
+            reviewed: 2,
+            shortCircuit: 1,
+            errors: 1,
+        })
+        expect(svg).toContain("reviewed")
+        expect(svg).toContain("short-circuit")
+        expect(svg).toContain("errors")
+        expect(svg).toContain("2 · 50.0%")
+        expect(svg).toContain("1 · 25.0%")
+        // Three callout groups for three visible slices.
+        expect(svg.match(/<g class="callout">/g)?.length).toBe(3)
+    })
+
+    test("hover title carries label, count, and percentage", () => {
+        const svg = renderRequestPie({
+            reviewed: 1,
+            shortCircuit: 1,
+            errors: 0,
+        })
+        expect(svg).toMatch(/<title>reviewed · 1 · 50\.0%<\/title>/)
+        expect(svg).toMatch(/<title>short-circuit · 1 · 50\.0%<\/title>/)
+    })
+
+    test("defends against null/undefined metrics", () => {
+        const a = renderRequestPie(null)
+        const b = renderRequestPie(undefined)
+        expect(a).toContain("no requests")
+        expect(b).toContain("no requests")
+    })
+})
+
+describe("computeAxisTicks", () => {
+    const { computeAxisTicks, fmtAxisLabel } = __test__
+
+    test("returns percent ticks when max is below 1 minute", () => {
+        // 30s max → 0.25/0.5/0.75/1× ticks.
+        expect(computeAxisTicks(30000)).toEqual([7500, 15000, 22500, 30000])
+    })
+
+    test("returns whole-minute ticks when max is at least 1 minute", () => {
+        // 5m 50s → ticks at 1m, 2m, 3m, 4m, 5m.
+        expect(computeAxisTicks(350000)).toEqual([
+            60000, 120000, 180000, 240000, 300000,
+        ])
+    })
+
+    test("steps up to keep tick count bounded for very long maxes", () => {
+        // 30m max → step would be 5m (ceil(30/6)) so ticks at 5,10,15,20,25,30 min.
+        expect(computeAxisTicks(30 * 60000)).toEqual([
+            5 * 60000,
+            10 * 60000,
+            15 * 60000,
+            20 * 60000,
+            25 * 60000,
+            30 * 60000,
+        ])
+    })
+
+    test("returns [] for non-positive or non-numeric input", () => {
+        expect(computeAxisTicks(0)).toEqual([])
+        expect(computeAxisTicks(-5)).toEqual([])
+        expect(computeAxisTicks(null)).toEqual([])
+        expect(computeAxisTicks(undefined)).toEqual([])
+    })
+
+    test("fmtAxisLabel formats whole minutes as 'Nm'", () => {
+        expect(fmtAxisLabel(60000)).toBe("1m")
+        expect(fmtAxisLabel(180000)).toBe("3m")
+        // Sub-minute falls through to fmtMs.
+        expect(fmtAxisLabel(30000)).toBe("30.0s")
+        // Non-whole minute also falls through.
+        expect(fmtAxisLabel(75000)).toBe("1m 15s")
+    })
+
+    test("chart Y-axis labels use whole-minute notation for >1m maxes", () => {
+        const records = [
+            { ts: "2026-05-24T10:00:00Z", durationMs: 350000, status: "GOOD_TO_GO", findingsCount: 0, context: "x" },
+        ]
+        const svg = renderChart(records)
+        expect(svg).toContain(">1m<")
+        expect(svg).toContain(">5m<")
+        // No "1m 28s" style mid-fraction labels.
+        expect(svg).not.toMatch(/>1m \d+s</)
     })
 })

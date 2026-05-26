@@ -254,6 +254,62 @@ describe("reviewRequestHandler", () => {
         expect(out.structuredContent.status).toBe("ESCALATE")
         expect(out.structuredContent.code).toBe("INVALID_REQUEST")
     })
+
+    test("force=true bypasses the unchanged-baseline NO_CHANGES short-circuit (v0.1.18)", async () => {
+        // Seed a cached GOOD_TO_GO baseline that matches the payload
+        // progressHash; a non-forced call would short-circuit NO_CHANGES.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: "c",
+                files: { modified: [], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                totalBytes: 0,
+                truncated: false,
+            },
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0, timedOut: false },
+        }))
+        const out = await reviewRequestHandler({
+            args: { cwd: "/repo", force: true },
+            ctx: {
+                config: minimalConfig(),
+                store,
+                deps: { ...happyDeps(), runAndParse: runSpy },
+            },
+        })
+        expect(out.structuredContent.status).toBe("GOOD_TO_GO")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("provider override is threaded through to pickReviewer (v0.1.18)", async () => {
+        const pickSpy = jest.fn(() => ({
+            name: "gemini",
+            runAndParse: async () => ({
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: { durationMs: 1, exitCode: 0, timedOut: false },
+            }),
+            buildArgs: () => [],
+            binary: "gemini",
+        }))
+        await reviewRequestHandler({
+            args: { cwd: "/repo", provider: "gemini" },
+            ctx: {
+                config: minimalConfig(),
+                store,
+                deps: { ...happyDeps(), pickReviewer: pickSpy },
+            },
+        })
+        expect(pickSpy).toHaveBeenCalledTimes(1)
+        expect(pickSpy.mock.calls[0][1]).toBe("gemini")
+    })
 })
 
 describe("resetRequestHandler", () => {

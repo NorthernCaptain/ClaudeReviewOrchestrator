@@ -1545,8 +1545,7 @@ describe("handleReview — pipeline log emissions", () => {
                             priorFindingContext: [],
                         },
                         source: "head-fallback",
-                        baseSha:
-                            "deadbeef00112233445566778899aabbccddeeff",
+                        baseSha: "deadbeef00112233445566778899aabbccddeeff",
                     }),
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
@@ -1999,7 +1998,12 @@ describe("handleReview — in-flight dedup", () => {
             return {
                 status: "GOOD_TO_GO",
                 findings: [],
-                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
             }
         })
 
@@ -2124,7 +2128,12 @@ describe("handleReview — in-flight dedup", () => {
             return {
                 status: "GOOD_TO_GO",
                 findings: [],
-                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
             }
         })
         const inflight = new Map()
@@ -2234,6 +2243,292 @@ describe("computeReviewConfigHash — payload.fallbackToHead", () => {
         })
         expect(off).not.toBe(on)
     })
+
+    // v0.1.23 — provider is part of the review policy.
+    test("switching the configured provider changes the hash", () => {
+        const base = {
+            blockingSeverities: ["blocker"],
+            ignorePaths: [],
+            extraReviewerInstructions: null,
+            limits: {},
+        }
+        const codex = computeReviewConfigHash({
+            ...base,
+            reviewer: { provider: "codex" },
+        })
+        const gemini = computeReviewConfigHash({
+            ...base,
+            reviewer: { provider: "gemini" },
+        })
+        expect(codex).not.toBe(gemini)
+    })
+
+    test("a per-call provider override changes the hash even when config is unchanged", () => {
+        const cfg = {
+            blockingSeverities: ["blocker"],
+            ignorePaths: [],
+            extraReviewerInstructions: null,
+            limits: {},
+            reviewer: { provider: "codex" },
+        }
+        const noOverride = computeReviewConfigHash(cfg)
+        const overridden = computeReviewConfigHash(cfg, "gemini")
+        expect(noOverride).not.toBe(overridden)
+        // Override matching the config default is identical to no override.
+        expect(computeReviewConfigHash(cfg, "codex")).toBe(noOverride)
+    })
+
+    test("changing the provider's model busts the hash", () => {
+        const a = computeReviewConfigHash({
+            blockingSeverities: [],
+            ignorePaths: [],
+            limits: {},
+            reviewer: { provider: "codex" },
+            codex: { model: "gpt-5.5" },
+        })
+        const b = computeReviewConfigHash({
+            blockingSeverities: [],
+            ignorePaths: [],
+            limits: {},
+            reviewer: { provider: "codex" },
+            codex: { model: "gpt-6" },
+        })
+        expect(a).not.toBe(b)
+    })
+})
+
+// v0.1.23 — bugs codex flagged in the provider-switch feature.
+describe("handleReview — provider change busts the cache (v0.1.23)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadOk = () =>
+        makePayload({
+            files: {
+                modified: [{ path: "a.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+            progressHash: "p",
+        })
+
+    // Seed a clean terminal-success baseline produced under the CODEX
+    // provider, then issue a request whose effective provider is GEMINI.
+    const seedCodexBaseline = (cfg) =>
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: computeReviewConfigHash(cfg),
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
+                totalBytes: 0,
+                truncated: false,
+            },
+            dirtySinceLastReview: false,
+        })
+
+    test("dirty-flag fast path does NOT fire after a provider override (runs the new reviewer)", async () => {
+        const cfg = { ...minimalConfig(), reviewer: { provider: "codex" } }
+        seedCodexBaseline(cfg)
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        const pickSpy = jest.fn(() => ({
+            name: "gemini",
+            runAndParse: runSpy,
+            buildArgs: () => [],
+            binary: "gemini",
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", provider: "gemini" },
+            config: cfg,
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: runSpy,
+                pickReviewer: pickSpy,
+                currentHeadSha: () => "abc",
+                isWorkingTreeClean: () => true,
+            }),
+        })
+        // Fast path would have returned NO_CHANGES without spawning; the
+        // provider override must bust it and actually run gemini.
+        expect(r.body.status).not.toBe("NO_CHANGES")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+        expect(pickSpy.mock.calls[0][1]).toBe("gemini")
+    })
+
+    test("post-payload NO_CHANGES short-circuit also busts on provider override", async () => {
+        const cfg = { ...minimalConfig(), reviewer: { provider: "codex" } }
+        // Mark dirty so the fast path is skipped and we reach the
+        // unchanged-baseline check (which compares reviewConfigHash).
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: computeReviewConfigHash(cfg),
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
+                totalBytes: 0,
+                truncated: false,
+            },
+            dirtySinceLastReview: true,
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", provider: "gemini" },
+            config: cfg,
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: runSpy,
+            }),
+        })
+        expect(r.body.status).not.toBe("NO_CHANGES")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("same provider on an unchanged tree still fast-paths NO_CHANGES (no regression)", async () => {
+        const cfg = { ...minimalConfig(), reviewer: { provider: "codex" } }
+        seedCodexBaseline(cfg)
+        const runSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" }, // no override → codex
+            config: cfg,
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: runSpy,
+                currentHeadSha: () => "abc",
+                isWorkingTreeClean: () => true,
+            }),
+        })
+        expect(r.body.status).toBe("NO_CHANGES")
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+})
+
+describe("handleReview — in-flight dedup keys force/provider (v0.1.23)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const spawnPayload = () =>
+        makePayload({
+            files: {
+                modified: [{ path: "a.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    test("a force request does not attach to an ordinary in-flight review", async () => {
+        const inflight = new Map()
+        // Pre-seed an in-flight entry under the PLAIN key (effective
+        // provider = codex for minimalConfig). If the force request
+        // attached to it, it'd resolve to this sentinel.
+        const sentinel = Promise.resolve({
+            httpStatus: 200,
+            body: { status: "SENTINEL_ATTACHED" },
+        })
+        inflight.set("/repo|main|force=false|provider=codex", sentinel)
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", force: true },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: spawnPayload,
+                runAndParse: runSpy,
+                inflight,
+            }),
+        })
+        expect(r.body.status).not.toBe("SENTINEL_ATTACHED")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("the dedup key uses the EFFECTIVE provider, so a live PUT /provider switch is not attached to the old in-flight run", async () => {
+        const inflight = new Map()
+        // An in-flight review is running under the OLD provider (codex).
+        const sentinel = Promise.resolve({
+            httpStatus: 200,
+            body: { status: "OLD_PROVIDER_RESULT" },
+        })
+        inflight.set("/repo|main|force=false|provider=codex", sentinel)
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        // The config provider has since been switched to gemini (as a
+        // PUT /provider would mutate the live config). A plain request
+        // (no per-call override) must key on the effective provider
+        // (gemini) and therefore NOT attach to the codex in-flight run.
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: { ...minimalConfig(), reviewer: { provider: "gemini" } },
+            store,
+            deps: makeDeps({
+                buildPayload: spawnPayload,
+                runAndParse: runSpy,
+                inflight,
+            }),
+        })
+        expect(r.body.status).not.toBe("OLD_PROVIDER_RESULT")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("two plain requests under the same provider DO share one pipeline (dedup intact)", async () => {
+        const inflight = new Map()
+        const sentinel = Promise.resolve({
+            httpStatus: 200,
+            body: { status: "SHARED_RESULT" },
+        })
+        inflight.set("/repo|main|force=false|provider=codex", sentinel)
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(), // effective provider = codex
+            store,
+            deps: makeDeps({ inflight }),
+        })
+        expect(r.body.status).toBe("SHARED_RESULT")
+    })
 })
 
 describe("handleReview — change-notification fast path (v0.1.11)", () => {
@@ -2251,8 +2546,16 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             lastBaseline: {
                 headSha: "abc",
                 progressHash: "p",
-                reviewConfigHash: "c",
-                files: { modified: [], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                // Must match the effective review policy hash for the
+                // fast path to fire (v0.1.23 — provider is part of it).
+                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                files: {
+                    modified: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
                 totalBytes: 0,
                 truncated: false,
             },
@@ -2295,7 +2598,10 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             makePayload({
                 files: {
                     modified: [{ path: "a.js" }],
-                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
                 },
             })
         )
@@ -2336,7 +2642,12 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
                 currentHeadSha: () => "abc",
                 isWorkingTreeClean: treeCleanSpy,
@@ -2357,7 +2668,10 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             makePayload({
                 files: {
                     modified: [{ path: "a.js" }],
-                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
                 },
             })
         )
@@ -2389,7 +2703,10 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             makePayload({
                 files: {
                     modified: [{ path: "a.js" }],
-                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
                 },
             })
         )
@@ -2402,7 +2719,12 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
                 isWorkingTreeClean: () => true,
                 currentHeadSha: () => null,
@@ -2425,13 +2747,21 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                     makePayload({
                         files: {
                             modified: [{ path: "a.js" }],
-                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
                         },
                     }),
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
                 isWorkingTreeClean: treeCleanSpy,
                 currentHeadSha: () => "different",
@@ -2449,7 +2779,10 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             makePayload({
                 files: {
                     modified: [{ path: "a.js" }],
-                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
                 },
             })
         )
@@ -2462,7 +2795,12 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
                 isWorkingTreeClean: () => true,
             }),
@@ -2476,7 +2814,10 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             makePayload({
                 files: {
                     modified: [{ path: "a.js" }],
-                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
                 },
             })
         )
@@ -2489,7 +2830,12 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
                 isWorkingTreeClean: () => true,
             }),
@@ -2503,7 +2849,10 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             makePayload({
                 files: {
                     modified: [{ path: "a.js" }],
-                    untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
                 },
             })
         )
@@ -2516,7 +2865,12 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
                 isWorkingTreeClean: () => true,
             }),
@@ -2539,13 +2893,21 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                     makePayload({
                         files: {
                             modified: [{ path: "a.js" }],
-                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
                         },
                     }),
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
             }),
         })
@@ -2574,7 +2936,10 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                     makePayload({
                         files: {
                             modified: [{ path: "a.js" }],
-                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
                         },
                     }),
                 runAndParse: async () => ({
@@ -2588,7 +2953,12 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                             message: "boom",
                         },
                     ],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
             }),
         })
@@ -2629,7 +2999,12 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                 runAndParse: async () => ({
                     status: "ESCALATE",
                     reason: "codex exited with code 1",
-                    raw: { exitCode: 1, durationMs: 10, rawStdout: "", rawStderr: "boom" },
+                    raw: {
+                        exitCode: 1,
+                        durationMs: 10,
+                        rawStdout: "",
+                        rawStderr: "boom",
+                    },
                 }),
             }),
         })
@@ -2655,7 +3030,13 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                 headSha: "abc",
                 progressHash: "p",
                 reviewConfigHash: computeReviewConfigHash(minimalConfig()),
-                files: { modified: [{ path: "a.js" }], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
                 totalBytes: 0,
                 truncated: false,
             },
@@ -2671,7 +3052,10 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                         // Same progressHash as seeded → cache hits.
                         files: {
                             modified: [{ path: "a.js" }],
-                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
                         },
                         progressHash: "p",
                     }),
@@ -2698,7 +3082,13 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                 headSha: "abc",
                 progressHash: "p",
                 reviewConfigHash: computeReviewConfigHash(minimalConfig()),
-                files: { modified: [{ path: "a.js" }], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
                 totalBytes: 0,
                 truncated: false,
             },
@@ -2713,7 +3103,10 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                     makePayload({
                         files: {
                             modified: [{ path: "a.js" }],
-                            untracked: [], deleted: [], renamed: [], priorFindingContext: [],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
                         },
                         progressHash: "p",
                     }),
@@ -2779,7 +3172,12 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                     runAndParse: async () => ({
                         status: "ESCALATE",
                         reason,
-                        raw: { exitCode: 1, durationMs: 1, rawStdout: "", rawStderr: "" },
+                        raw: {
+                            exitCode: 1,
+                            durationMs: 1,
+                            rawStdout: "",
+                            rawStderr: "",
+                        },
                     }),
                 }),
             })
@@ -2802,7 +3200,12 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                 runAndParse: async () => ({
                     status: "ESCALATE",
                     reason: "schema validation failed",
-                    raw: { exitCode: 1, durationMs: 10, rawStdout: "", rawStderr: "" },
+                    raw: {
+                        exitCode: 1,
+                        durationMs: 10,
+                        rawStdout: "",
+                        rawStderr: "",
+                    },
                 }),
             }),
         })
@@ -2849,7 +3252,12 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
             }),
         })
@@ -2879,7 +3287,12 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                 runAndParse: async () => ({
                     status: "GOOD_TO_GO",
                     findings: [],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
             }),
         })
@@ -2914,7 +3327,12 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                             message: "boom",
                         },
                     ],
-                    raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
                 }),
             }),
         })
@@ -2942,7 +3360,12 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
                 runAndParse: async () => ({
                     status: "ESCALATE",
                     reason: "codex exited with code 1",
-                    raw: { exitCode: 1, durationMs: 10, rawStdout: "", rawStderr: "" },
+                    raw: {
+                        exitCode: 1,
+                        durationMs: 10,
+                        rawStdout: "",
+                        rawStderr: "",
+                    },
                 }),
             }),
         })
@@ -3002,5 +3425,268 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
             branch: "main",
         })
         expect(after.escalateNotified).toBe(false)
+    })
+})
+
+// v0.1.18 — Forced reviews bypass every short-circuit and every
+// safety cap. Used by the MCP `request_review` tool when the user
+// explicitly asks Claude for a fresh review.
+describe("handleReview — force: true (v0.1.18)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadOk = () =>
+        makePayload({
+            files: {
+                modified: [{ path: "a.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    test("bypasses the dirty-flag fast path (still spawns reviewer)", async () => {
+        // Seed a state that would normally fast-path NO_CHANGES.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: "c",
+                files: {
+                    modified: [],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
+                totalBytes: 0,
+                truncated: false,
+            },
+            dirtySinceLastReview: false,
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", force: true },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                runAndParse: runSpy,
+                currentHeadSha: () => "abc",
+                isWorkingTreeClean: () => true,
+            }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("bypasses the unchanged-baseline NO_CHANGES short-circuit", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: seededBaseline("p"),
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", force: true },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                // Same progressHash as cached → would normally NO_CHANGES.
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                        progressHash: "p",
+                    }),
+                runAndParse: runSpy,
+            }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("bypasses the CODEX_ERROR_CACHED short-circuit", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "ESCALATE",
+            lastEscalateReason: "old fail",
+            lastBaseline: seededBaseline("p"),
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", force: true },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                        progressHash: "p",
+                    }),
+                runAndParse: runSpy,
+            }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("bypasses MAX_BLOCKS even on stop_hook trigger", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            blockCount: 6,
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook", force: true },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: payloadOk, runAndParse: runSpy }),
+        })
+        expect(r.body.code).not.toBe("MAX_BLOCKS")
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("bypasses MAX_CODEX_ROUNDS", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            codexRounds: 10,
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { durationMs: 1, exitCode: 0 },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", force: true },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: payloadOk, runAndParse: runSpy }),
+        })
+        expect(r.body.code).not.toBe("MAX_CODEX_ROUNDS")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("force=false (default) still short-circuits NO_CHANGES (regression)", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: seededBaseline("p"),
+        })
+        const runSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                        progressHash: "p",
+                    }),
+                runAndParse: runSpy,
+            }),
+        })
+        expect(r.body.status).toBe("NO_CHANGES")
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+
+    test("provider override is forwarded to pickReviewer", async () => {
+        const pickSpy = jest.fn(() => ({
+            name: "gemini",
+            runAndParse: async () => ({
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: { durationMs: 1, exitCode: 0 },
+            }),
+            buildArgs: () => ["gemini-arg"],
+            binary: "gemini",
+        }))
+        await handleReview({
+            body: {
+                cwd: "/repo",
+                trigger: "mcp_tool",
+                provider: "gemini",
+            },
+            // Server is configured for codex; the override should win.
+            config: { ...minimalConfig(), reviewer: { provider: "codex" } },
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                pickReviewer: pickSpy,
+            }),
+        })
+        expect(pickSpy).toHaveBeenCalledTimes(1)
+        // Second arg = override.
+        expect(pickSpy.mock.calls[0][1]).toBe("gemini")
+    })
+
+    test("missing provider override falls through to config default", async () => {
+        const pickSpy = jest.fn(() => ({
+            name: "codex",
+            runAndParse: async () => ({
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: { durationMs: 1, exitCode: 0 },
+            }),
+            buildArgs: () => [],
+            binary: "codex",
+        }))
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadOk,
+                pickReviewer: pickSpy,
+            }),
+        })
+        expect(pickSpy.mock.calls[0][1]).toBeNull()
     })
 })

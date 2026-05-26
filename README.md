@@ -130,6 +130,7 @@ started by launchd. Binds `127.0.0.1` only.
 | POST   | `/review`   | yes  | Run a review, return Stop-hook decision JSON  | Stop hook    |
 | POST   | `/reset`    | yes  | Clear counter + cache for a context           | Stop hook / manual |
 | POST   | `/notify-change` | yes | Flip dirty flag for a context (used by PostToolUse hook) | `notify-change.mjs` |
+| PUT    | `/provider` | yes  | Switch reviewer provider on the fly (live + persisted) | `scripts/setprovider.sh` |
 | GET    | `/status`   | yes  | Dump live contexts, version, redacted config  | Human        |
 | GET    | `/`         | **no**  | HTML dashboard (version, config, timeline, history) | Browser |
 | GET    | `/healthz`  | no   | Liveness check                                | launchd / hook fail-open |
@@ -837,6 +838,22 @@ both in `GET /status.config.reviewer.provider` and in the dashboard at
 `GET /`. The /review response body's `codex.provider` field carries the
 actual provider that ran, which the Stop hook uses to render its block
 reason header (e.g. "Code review by gemini").
+
+**Switching providers on the fly (v0.1.20).** `PUT /provider { provider }`
+swaps the reviewer without a restart: it mutates the live in-memory config
+(the next review uses it immediately) and best-effort persists the change
+back to the on-disk config file so it survives a restart. The response
+reports `{ ok, provider, previous, persisted }`; if the file write fails the
+in-memory switch still succeeds and `persisted` is `false`. Convenience
+wrapper:
+
+```bash
+scripts/setprovider.sh gemini     # or claude / codex
+```
+
+A single review can also override the provider for just that call via the
+`request_review` MCP tool's `provider` input (v0.1.18) — that's a one-shot
+override and does not change the server default.
 
 ### 7. Dashboard (`server/src/dashboard.js`, served at `GET /`)
 

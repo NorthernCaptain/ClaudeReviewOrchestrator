@@ -56,6 +56,7 @@ import { readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import Ajv from "ajv/dist/2020.js"
+import { normalizeFindings } from "./codex.js"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_SCHEMA_PATH = path.join(here, "codex-output.schema.json")
@@ -427,6 +428,8 @@ export const parseClaudeOutput = (
             parsed.status = STATUS_COERCE[parsed.status]
         }
     }
+
+    parsed = normalizeFindings(parsed)
 
     if (!validator(parsed)) {
         return {
