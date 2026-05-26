@@ -2531,6 +2531,97 @@ describe("handleReview — in-flight dedup keys force/provider (v0.1.23)", () =>
     })
 })
 
+// v0.1.24 — distinct result-sharing keys must NOT let two state-mutating
+// pipelines for the same context run concurrently (they'd race the
+// store.get → store.save read-modify-write). A force/provider request
+// serializes BEHIND any in-flight same-context review.
+describe("handleReview — same-context pipelines are serialized (v0.1.24)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadFor = () =>
+        makePayload({
+            files: {
+                modified: [{ path: "a.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+        })
+
+    const flush = () => new Promise((r) => setTimeout(r, 0))
+
+    test("a force request does not run its reviewer until the in-flight plain review finishes", async () => {
+        let active = 0
+        let maxActive = 0
+        let releaseFirst
+        const firstGate = new Promise((r) => {
+            releaseFirst = r
+        })
+        let firstCall = true
+        const runAndParse = jest.fn(async () => {
+            active += 1
+            maxActive = Math.max(maxActive, active)
+            if (firstCall) {
+                firstCall = false
+                await firstGate // hold the plain review open
+            }
+            active -= 1
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+            }
+        })
+        const inflight = new Map()
+        const contextChains = new Map()
+        const deps = makeDeps({
+            buildPayload: payloadFor,
+            runAndParse,
+            inflight,
+            contextChains,
+        })
+
+        const pPlain = handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        const pForce = handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", force: true },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+
+        await flush()
+        // Only the plain review's reviewer is running; the force request
+        // is queued behind the context chain, not spawning concurrently.
+        expect(runAndParse).toHaveBeenCalledTimes(1)
+        expect(active).toBe(1)
+        // Two distinct result-sharing slots exist (plain + force)…
+        expect(inflight.size).toBe(2)
+        // …but only one chain tail per context.
+        expect(contextChains.size).toBe(1)
+
+        releaseFirst()
+        await Promise.all([pPlain, pForce])
+
+        // Both pipelines ran, but never at the same time — the core
+        // guarantee: no concurrent store.get → store.save race.
+        expect(runAndParse).toHaveBeenCalledTimes(2)
+        expect(maxActive).toBe(1)
+        // Slots cleaned up.
+        expect(inflight.size).toBe(0)
+        expect(contextChains.size).toBe(0)
+    })
+})
+
 describe("handleReview — change-notification fast path (v0.1.11)", () => {
     let store
     beforeEach(() => {

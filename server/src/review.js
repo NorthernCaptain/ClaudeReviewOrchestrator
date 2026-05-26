@@ -289,16 +289,32 @@ const safeArchive = (archive, args) => {
 
 const noopLogger = { info() {}, warn() {}, error() {} }
 
-// In-flight review tracker. Maps context.key → Promise<{httpStatus,body}>.
-// When a second /review arrives for the same context while the first is
-// still spawning the reviewer / waiting for it to finish, the second
-// caller attaches to the first promise instead of starting a parallel
-// reviewer. Cleared in `finally` so a failed review doesn't poison the
-// slot — the next caller is free to retry.
+// In-flight review tracker. Maps the full result-sharing key
+// (context|force|provider) → Promise<{httpStatus,body}>. When a second
+// IDENTICAL /review arrives while the first is still running, the
+// second caller attaches to the first promise instead of starting a
+// parallel reviewer. Cleared in `finally` so a failed review doesn't
+// poison the slot.
 //
 // Module-scope by design: this is per-server-process. Tests inject their
 // own Map via `deps.inflight` for isolation.
 export const defaultInflight = new Map()
+
+// Per-context serialization chain. Maps context.key → Promise of the
+// last-queued pipeline for that context. A review's read-modify-write of
+// stored state (store.get → store.save full-replacement) is NOT safe to
+// run concurrently with another review for the same context: the last
+// finisher would clobber counters / priorFindings / lastBaseline. The
+// result-sharing key (above) intentionally differs by force/provider, so
+// a force or provider-switched request does NOT attach — it would
+// otherwise run a second state-mutating pipeline in parallel. To keep
+// state mutations serialized while still allowing distinct results, each
+// non-attaching pipeline chains AFTER the current context tail and only
+// touches state once its predecessor has finished. Distinct contexts
+// keep independent tails and still run in parallel.
+//
+// Tests inject their own Map via `deps.contextChains` for isolation.
+export const defaultContextChains = new Map()
 
 export const handleReview = async ({
     body,
@@ -410,6 +426,7 @@ export const handleReview = async ({
     // old provider's running promise. Two identical plain requests
     // under the same provider still share one pipeline.
     const inflight = deps.inflight ?? defaultInflight
+    const contextChains = deps.contextChains ?? defaultContextChains
     const effectiveProvider =
         providerOverride ?? config.reviewer?.provider ?? "codex"
     const inflightKey = `${context.key}|force=${force}|provider=${effectiveProvider}`
@@ -422,7 +439,24 @@ export const handleReview = async ({
         return existing
     }
 
+    // Serialize against any pipeline already queued for this context.
+    // We capture the current tail BEFORE installing ourselves as the new
+    // tail, then await it (ignoring its outcome) before touching state.
+    const prevTail = contextChains.get(context.key) ?? Promise.resolve()
+    const serialized = prevTail !== undefined && contextChains.has(context.key)
+
     const pipelinePromise = (async () => {
+        // Wait for any in-progress same-context review to finish so our
+        // store.get → store.save sequence never races with theirs. We
+        // swallow the predecessor's result/errors — we only care that it
+        // has released the context.
+        await prevTail.catch(() => {})
+        if (serialized) {
+            log.info(
+                { contextKey: context.key, inflightKey },
+                "serialized behind in-flight same-context review"
+            )
+        }
         // Per-repo overrides via .review-orchestrator.json at the repo root.
         // The file is optional; loadProjectConfig returns null when missing or
         // invalid (after logging) so the loop keeps running on the global
@@ -1170,12 +1204,20 @@ export const handleReview = async ({
     })() // end of pipelinePromise IIFE
 
     inflight.set(inflightKey, pipelinePromise)
+    // Become the new tail of this context's serialization chain so the
+    // next non-attaching request queues behind us.
+    contextChains.set(context.key, pipelinePromise)
     try {
         return await pipelinePromise
     } finally {
-        // Clear the slot whether the pipeline resolved or threw. A
-        // future request for the same context starts a fresh pipeline.
+        // Clear the result-sharing slot whether the pipeline resolved or
+        // threw. A future identical request starts a fresh pipeline.
         inflight.delete(inflightKey)
+        // Only clear the chain tail if we're still it — a later request
+        // may have already chained behind us and become the new tail.
+        if (contextChains.get(context.key) === pipelinePromise) {
+            contextChains.delete(context.key)
+        }
     }
 }
 
