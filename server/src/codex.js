@@ -220,12 +220,21 @@ export const runCodex = ({
         }
 
         const timeoutMs = config.limits.codexTimeoutSeconds * 1000
-        const maxOutputBytes = config.limits.maxCodexOutputBytes ?? 1024 * 1024
+        // STDOUT is the contract: codex must emit exactly one JSON object
+        // here, which is tiny even with 200 findings. A multi-MB stdout
+        // means a runaway / hostile result, so we cap it and kill.
+        const maxStdoutBytes = config.limits.maxCodexOutputBytes ?? 1024 * 1024
+        // STDERR is diagnostic chatter — codex's tool output, repo
+        // searches, and reasoning summaries. On a large repo this can
+        // legitimately stream megabytes and must NOT kill the run; we
+        // keep only a bounded rolling tail so memory stays bounded while
+        // the review completes. (Counting stderr toward the kill cap was
+        // what killed verbose-but-valid reviews — the oversize CODEX_ERROR.)
+        const STDERR_TAIL_BYTES = 64 * 1024
         let finished = false
         let stdout = ""
         let stderr = ""
         let stdoutBytes = 0
-        let stderrBytes = 0
         let timedOut = false
         let oversize = false
 
@@ -267,29 +276,31 @@ export const runCodex = ({
             })
         }
 
-        // Append a chunk to one of the output buffers, enforcing
-        // maxCodexOutputBytes across both streams combined. Codex can stream
-        // unbounded data; a bug or hostile model output could exhaust
-        // memory and then bloat priorFindings/archive on the next round.
-        const appendCapped = (chunk, stream) => {
+        // STDOUT: accumulate the result, killing only if it blows past
+        // the cap (a runaway / hostile result — never a normal review).
+        const appendStdout = (chunk) => {
             const text = chunk.toString("utf8")
             const len = Buffer.byteLength(text, "utf8")
-            const total = stdoutBytes + stderrBytes + len
-            if (total > maxOutputBytes) {
+            if (stdoutBytes + len > maxStdoutBytes) {
                 if (!oversize) killChild("oversize")
                 return
             }
-            if (stream === "stdout") {
-                stdout += text
-                stdoutBytes += len
-            } else {
-                stderr += text
-                stderrBytes += len
+            stdout += text
+            stdoutBytes += len
+        }
+
+        // STDERR: keep a rolling tail, dropping the oldest bytes once it
+        // exceeds STDERR_TAIL_BYTES. Never kills the run — verbose tool
+        // exploration is normal and the tail is plenty for debugging.
+        const appendStderrTail = (chunk) => {
+            stderr += chunk.toString("utf8")
+            if (stderr.length > STDERR_TAIL_BYTES) {
+                stderr = stderr.slice(stderr.length - STDERR_TAIL_BYTES)
             }
         }
 
-        child.stdout?.on("data", (chunk) => appendCapped(chunk, "stdout"))
-        child.stderr?.on("data", (chunk) => appendCapped(chunk, "stderr"))
+        child.stdout?.on("data", appendStdout)
+        child.stderr?.on("data", appendStderrTail)
         child.on("error", (err) => {
             if (finished) return
             finished = true
@@ -402,7 +413,7 @@ export const runAndParse = async ({
         const cap = config.limits.maxCodexOutputBytes ?? 1024 * 1024
         return {
             status: "ESCALATE",
-            reason: `codex output exceeded ${cap} bytes (combined stdout+stderr); killed`,
+            reason: `codex stdout exceeded ${cap} bytes; killed (runaway result)`,
             raw,
         }
     }

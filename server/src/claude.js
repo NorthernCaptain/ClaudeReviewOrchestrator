@@ -216,13 +216,17 @@ export const runClaude = ({
             (config.reviewer?.claude?.timeoutSeconds ??
                 config.limits?.codexTimeoutSeconds ??
                 240) * 1000
-        const maxOutputBytes = config.limits?.maxCodexOutputBytes ?? 1024 * 1024
+        // STDOUT is the contract (one JSON object, tiny). STDERR is
+        // diagnostic chatter — tool output / reasoning — which can run to
+        // megabytes on a large repo and must NOT kill the run. Cap stdout
+        // (kill a runaway result); keep stderr as a bounded rolling tail.
+        const maxStdoutBytes = config.limits?.maxCodexOutputBytes ?? 1024 * 1024
+        const STDERR_TAIL_BYTES = 64 * 1024
 
         let finished = false
         let stdout = ""
         let stderr = ""
         let stdoutBytes = 0
-        let stderrBytes = 0
         let timedOut = false
         let oversize = false
 
@@ -262,25 +266,26 @@ export const runClaude = ({
             })
         }
 
-        const appendCapped = (chunk, stream) => {
+        const appendStdout = (chunk) => {
             const text = chunk.toString("utf8")
             const len = Buffer.byteLength(text, "utf8")
-            const total = stdoutBytes + stderrBytes + len
-            if (total > maxOutputBytes) {
+            if (stdoutBytes + len > maxStdoutBytes) {
                 if (!oversize) killChild("oversize")
                 return
             }
-            if (stream === "stdout") {
-                stdout += text
-                stdoutBytes += len
-            } else {
-                stderr += text
-                stderrBytes += len
+            stdout += text
+            stdoutBytes += len
+        }
+
+        const appendStderrTail = (chunk) => {
+            stderr += chunk.toString("utf8")
+            if (stderr.length > STDERR_TAIL_BYTES) {
+                stderr = stderr.slice(stderr.length - STDERR_TAIL_BYTES)
             }
         }
 
-        child.stdout?.on("data", (chunk) => appendCapped(chunk, "stdout"))
-        child.stderr?.on("data", (chunk) => appendCapped(chunk, "stderr"))
+        child.stdout?.on("data", appendStdout)
+        child.stderr?.on("data", appendStderrTail)
         child.on("error", (err) => {
             if (finished) return
             finished = true
@@ -483,7 +488,7 @@ export const runAndParse = async ({
         const cap = config.limits?.maxCodexOutputBytes ?? 1024 * 1024
         return {
             status: "ESCALATE",
-            reason: `claude output exceeded ${cap} bytes (combined stdout+stderr); killed`,
+            reason: `claude stdout exceeded ${cap} bytes; killed (runaway result)`,
             raw,
         }
     }

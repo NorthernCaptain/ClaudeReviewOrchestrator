@@ -669,6 +669,55 @@ describe("runCodex (mocked spawn)", () => {
         expect(r.reason).toMatch(/exceeded 100 bytes/)
     })
 
+    test("verbose STDERR does not trigger oversize; stderr kept as a bounded tail", async () => {
+        const cfg = baseConfig()
+        cfg.limits.maxCodexOutputBytes = 100 // small STDOUT cap
+        const spawn = fakeSpawn((child) => {
+            // Codex tool/search chatter on stderr, far beyond the cap.
+            child.stderr.write("E".repeat(200000))
+            // …but a tiny valid result on stdout.
+            child.stdout.write('{"status":"GOOD_TO_GO","findings":[]}')
+            setImmediate(() => {
+                child.stdout.end()
+                child.stderr.end()
+                child.emit("close", 0, null)
+            })
+        })
+        const out = await runCodex({
+            repoRoot: "/r",
+            prompt: "p",
+            config: cfg,
+            spawn,
+        })
+        // The run completes — stderr volume must NOT kill it.
+        expect(out.oversize).toBe(false)
+        expect(out.exitCode).toBe(0)
+        expect(out.rawStdout).toContain("GOOD_TO_GO")
+        // stderr is bounded to the rolling tail (64 KB), not the full 200 KB.
+        expect(out.rawStderr.length).toBeGreaterThan(0)
+        expect(out.rawStderr.length).toBeLessThanOrEqual(64 * 1024)
+    })
+
+    test("runAndParse returns the parsed result despite megabytes of stderr chatter", async () => {
+        const cfg = baseConfig()
+        const spawn = fakeSpawn((child) => {
+            child.stderr.write("chatter\n".repeat(100000)) // ~800 KB
+            child.stdout.write('{"status":"GOOD_TO_GO","findings":[]}')
+            setImmediate(() => {
+                child.stdout.end()
+                child.stderr.end()
+                child.emit("close", 0, null)
+            })
+        })
+        const r = await runAndParse({
+            repoRoot: "/r",
+            prompt: "p",
+            config: cfg,
+            spawn,
+        })
+        expect(r.status).toBe("GOOD_TO_GO")
+    })
+
     test("rejects when child emits error", async () => {
         const spawn = fakeSpawn((child) => {
             child.emit("error", new Error("nope"))

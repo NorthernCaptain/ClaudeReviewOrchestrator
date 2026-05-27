@@ -402,6 +402,43 @@ describe("runAndParse", () => {
         expect(result.raw.exitCode).toBe(0)
     })
 
+    test("verbose stderr does not trigger oversize; succeeds with a valid envelope", async () => {
+        const cfg = {
+            ...baseConfig(),
+            // Cap comfortably fits the tiny envelope but is ≪ the 200 KB
+            // of stderr chatter below — proving stderr is not counted.
+            limits: { codexTimeoutSeconds: 60, maxCodexOutputBytes: 4096 },
+        }
+        const result = await runAndParse({
+            repoRoot: "/r",
+            prompt: "ignored",
+            config: cfg,
+            spawn: fakeSpawn((child) => {
+                // Way more than the cap on STDERR (tool chatter).
+                child.stderr.write("E".repeat(200000))
+                child.stdout.write(
+                    JSON.stringify({
+                        type: "result",
+                        subtype: "success",
+                        result: JSON.stringify({
+                            status: "GOOD_TO_GO",
+                            findings: [],
+                        }),
+                        is_error: false,
+                    })
+                )
+                setImmediate(() => {
+                    child.stdout.end()
+                    child.stderr.end()
+                    child.emit("close", 0, null)
+                })
+            }),
+        })
+        expect(result.status).toBe("GOOD_TO_GO")
+        expect(result.raw.oversize).toBe(false)
+        expect(result.raw.rawStderr.length).toBeLessThanOrEqual(64 * 1024)
+    })
+
     test("non-zero exit with unparseable stdout maps to ESCALATE with the exit code", async () => {
         const result = await runAndParse({
             repoRoot: "/r",
