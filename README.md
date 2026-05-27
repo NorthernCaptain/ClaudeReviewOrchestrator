@@ -128,7 +128,7 @@ started by launchd. Binds `127.0.0.1` only.
 |--------|-------------|------|-----------------------------------------------|--------------|
 | POST   | `/mcp`      | yes  | MCP HTTP transport (tools listed below)       | Claude       |
 | POST   | `/review`   | yes  | Run a review, return Stop-hook decision JSON  | Stop hook    |
-| POST   | `/reset`    | yes  | Clear counter + cache for a context           | Stop hook / manual |
+| POST   | `/reset`    | yes  | Clear counter + cache for a context           | Stop hook / manual / `scripts/reset-review.sh` |
 | POST   | `/notify-change` | yes | Flip dirty flag for a context (used by PostToolUse hook) | `notify-change.mjs` |
 | PUT    | `/provider` | yes  | Switch reviewer provider on the fly (live + persisted) | `scripts/setprovider.sh` |
 | GET    | `/status`   | yes  | Dump live contexts, version, redacted config  | Human        |
@@ -854,6 +854,17 @@ scripts/setprovider.sh gemini     # or claude / codex
 A single review can also override the provider for just that call via the
 `request_review` MCP tool's `provider` input (v0.1.18) — that's a one-shot
 override and does not change the server default.
+
+**Resetting the loop counters (v0.1.27).** When a context hits
+`MAX_CODEX_ROUNDS` / `MAX_BLOCKS`, or when you start an unrelated task in
+the same repo, clear its `codexRounds` / `blockCount` / prior findings via
+`POST /reset`. Convenience wrapper resolves the repo+branch from a path
+(defaults to the current directory):
+
+```bash
+scripts/reset-review.sh                 # current repo+branch
+scripts/reset-review.sh /path/to/repo   # a specific repo
+```
 
 ### 7. Dashboard (`server/src/dashboard.js`, served at `GET /`)
 
