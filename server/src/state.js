@@ -46,12 +46,21 @@ const blankContext = ({ key, repoRoot, branch }) => ({
 })
 
 // Idle reset: clear LOOP counters but keep the content-keyed CACHE
-// (lastBaseline + lastResultStatus + lastEscalateReason). The cache
-// only short-circuits when progressHash + reviewConfigHash match, so
-// retaining it across an arbitrarily long idle period is safe — it
-// will simply miss when something has actually changed on disk. The
-// counters are loop state (the verify-finding cycle, the block cap)
-// and shouldn't persist past quiet periods, so those still reset.
+// (lastBaseline + lastResultStatus + lastEscalateReason +
+// priorFindings). The cache only short-circuits when progressHash +
+// reviewConfigHash match, so retaining it across an arbitrarily long
+// idle period is safe — it will simply miss when something has
+// actually changed on disk. The counters are loop state (the verify-
+// finding cycle, the block cap) and shouldn't persist past quiet
+// periods, so those still reset.
+//
+// priorFindings was previously zeroed here, which silently broke the
+// NO_PROGRESS_WITH_OPEN_ISSUES short-circuit: after a 10-minute idle,
+// lastResultStatus stayed "ISSUES" but priorFindings became [], so the
+// Stop hook saw "issues remain" with no findings to show, Claude had
+// nothing to fix, and blockCount climbed to MAX_BLOCKS without
+// progress. priorFindings is part of the cached ISSUES result, not a
+// loop counter, so it must persist alongside lastResultStatus.
 //
 // lastReviewedAt is set to 0 so a follow-up get() doesn't trigger a
 // second idle reset until a real review writes a new value.
@@ -61,7 +70,7 @@ const idleResetContext = ({ key, repoRoot, branch }, existing) => ({
     branch,
     codexRounds: 0,
     blockCount: 0,
-    priorFindings: [],
+    priorFindings: existing?.priorFindings ?? [],
     lastReviewedAt: 0,
     lastBaseline: existing?.lastBaseline ?? null,
     lastResultStatus: existing?.lastResultStatus ?? null,

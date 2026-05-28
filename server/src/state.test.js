@@ -135,12 +135,15 @@ describe("createStateStore — idle reset", () => {
 
         t = 2000 // 1000ms idle, > 500ms threshold
         const s = store.get(ctxKey)
-        // Loop counters + priorFindings cleared.
+        // Loop counters cleared.
         expect(s.codexRounds).toBe(0)
         expect(s.blockCount).toBe(0)
-        expect(s.priorFindings).toEqual([])
         // Cache fields PRESERVED so the next /review can short-circuit
-        // on a matching progressHash + reviewConfigHash.
+        // on a matching progressHash + reviewConfigHash. priorFindings
+        // belongs with the cache (it IS the cached ISSUES result that
+        // the NO_PROGRESS short-circuit returns) — clearing it while
+        // keeping lastResultStatus="ISSUES" silently broke that path.
+        expect(s.priorFindings).toEqual([{ file: "f" }])
         expect(s.lastBaseline).toEqual({ progressHash: "p" })
         expect(s.lastResultStatus).toBe("ISSUES")
         expect(s.lastEscalateReason).toBe("boom")

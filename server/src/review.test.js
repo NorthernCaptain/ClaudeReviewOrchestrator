@@ -3893,3 +3893,122 @@ describe("snapshotInFlight (v0.1.28)", () => {
         expect(snapshotInFlight(() => 0, inflightMeta)).toEqual([])
     })
 })
+
+// v0.1.30 — defensive: if the cached ISSUES result has empty
+// priorFindings (legacy idle-reset wiped them, downgrade, sanitize
+// dropped every path), the NO_PROGRESS short-circuit returning an empty
+// findings list silently broke the loop — the Stop hook surfaced
+// nothing actionable and blockCount climbed to MAX_BLOCKS while Claude
+// had nothing to fix. The server must fall through to a real review and
+// NOT consume the block budget.
+describe("handleReview — NO_PROGRESS fall-through when priorFindings empty (v0.1.30)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const payloadSamePH = () =>
+        makePayload({
+            files: {
+                modified: [{ path: "a.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+            progressHash: "p",
+        })
+
+    test("empty priorFindings → fall through to spawn, blockCount NOT incremented, status not NO_PROGRESS", async () => {
+        // Seed: lastResultStatus=ISSUES but priorFindings=[] (the exact
+        // state idle-reset used to produce). progressHash matches → the
+        // unchanged-baseline branch is taken.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            // Seed below minimalConfig().limits.maxBlocks (=2) so the
+            // MAX_BLOCKS pre-cap doesn't fire before we exercise the
+            // empty-cache-fall-through path.
+            blockCount: 1,
+            lastResultStatus: "ISSUES",
+            priorFindings: [],
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
+                totalBytes: 0,
+                truncated: false,
+            },
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadSamePH,
+                runAndParse: runSpy,
+            }),
+        })
+        // Did NOT return NO_PROGRESS_WITH_OPEN_ISSUES; ran a real review.
+        expect(r.body.status).not.toBe("NO_PROGRESS_WITH_OPEN_ISSUES")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("non-empty priorFindings still short-circuits NO_PROGRESS (no regression)", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            blockCount: 0,
+            lastResultStatus: "ISSUES",
+            priorFindings: [
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "boom",
+                },
+            ],
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
+                totalBytes: 0,
+                truncated: false,
+            },
+        })
+        const runSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: payloadSamePH,
+                runAndParse: runSpy,
+            }),
+        })
+        expect(r.body.status).toBe("NO_PROGRESS_WITH_OPEN_ISSUES")
+        expect(r.body.blockingFindings).toHaveLength(1)
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+})

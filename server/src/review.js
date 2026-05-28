@@ -763,30 +763,52 @@ export const handleReview = async ({
                     state.priorFindings,
                     context.repoRoot
                 )
-                let nextState = state
-                if (isStopHook(trigger)) {
-                    nextState = store.save(context.key, {
-                        ...state,
-                        blockCount: state.blockCount + 1,
-                        lastReviewedAt: now(),
-                    })
-                }
-                log.info(
-                    { cachedBlockingCount: cachedBlocking.length },
-                    "short-circuit: NO_PROGRESS_WITH_OPEN_ISSUES"
-                )
-                return {
-                    httpStatus: 200,
-                    body: {
-                        status: "NO_PROGRESS_WITH_OPEN_ISSUES",
-                        findings: cachedBlocking,
-                        blockingFindings: cachedBlocking,
-                        droppedFindings: [],
-                        reason: "No on-disk progress on flagged files since the last review.",
-                        context: contextSummary(context),
-                        baseline: baselineSummary(payload, reviewConfigHash),
-                        state: stateSummary(nextState),
-                    },
+                // Defensive: if the cache says ISSUES but has nothing to
+                // show (legacy idle-reset wiped priorFindings, state-file
+                // downgrade, sanitize dropped every path), returning an
+                // empty NO_PROGRESS_WITH_OPEN_ISSUES would tell Claude
+                // "issues remain" with no findings to fix — blockCount
+                // would climb to MAX_BLOCKS without progress. Fall
+                // through to a real review instead, and DO NOT consume
+                // the block budget.
+                if (cachedBlocking.length === 0) {
+                    log.warn(
+                        {
+                            priorFindingsLen: Array.isArray(state.priorFindings)
+                                ? state.priorFindings.length
+                                : 0,
+                        },
+                        "cache says ISSUES but priorFindings is empty after sanitize; falling through to a real review"
+                    )
+                } else {
+                    let nextState = state
+                    if (isStopHook(trigger)) {
+                        nextState = store.save(context.key, {
+                            ...state,
+                            blockCount: state.blockCount + 1,
+                            lastReviewedAt: now(),
+                        })
+                    }
+                    log.info(
+                        { cachedBlockingCount: cachedBlocking.length },
+                        "short-circuit: NO_PROGRESS_WITH_OPEN_ISSUES"
+                    )
+                    return {
+                        httpStatus: 200,
+                        body: {
+                            status: "NO_PROGRESS_WITH_OPEN_ISSUES",
+                            findings: cachedBlocking,
+                            blockingFindings: cachedBlocking,
+                            droppedFindings: [],
+                            reason: "No on-disk progress on flagged files since the last review.",
+                            context: contextSummary(context),
+                            baseline: baselineSummary(
+                                payload,
+                                reviewConfigHash
+                            ),
+                            state: stateSummary(nextState),
+                        },
+                    }
                 }
             }
             if (state.lastResultStatus === "ESCALATE") {
