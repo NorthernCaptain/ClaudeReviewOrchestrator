@@ -706,3 +706,127 @@ describe("renderInFlight", () => {
         expect(html).not.toContain("<x>:b")
     })
 })
+
+describe("fmtHms", () => {
+    const { fmtHms } = __test__
+    test("always emits H:MM:SS with zero-padded m/s", () => {
+        expect(fmtHms(0)).toBe("0:00:00")
+        expect(fmtHms(45000)).toBe("0:00:45")
+        expect(fmtHms(725000)).toBe("0:12:05")
+        expect(fmtHms(3725000)).toBe("1:02:05")
+    })
+    test("guards non-numbers and negatives", () => {
+        expect(fmtHms(undefined)).toBe("0:00:00")
+        expect(fmtHms(null)).toBe("0:00:00")
+        expect(fmtHms(-5)).toBe("0:00:00")
+    })
+    test("sub-second durations round down to zero", () => {
+        expect(fmtHms(999)).toBe("0:00:00")
+        expect(fmtHms(1000)).toBe("0:00:01")
+    })
+})
+
+describe("sumDurationByStatus", () => {
+    const { sumDurationByStatus } = __test__
+    test("only the four archived statuses count toward the total", () => {
+        const out = sumDurationByStatus([
+            { status: "GOOD_TO_GO", durationMs: 1000 },
+            { status: "ISSUES", durationMs: 2000 },
+            { status: "GOOD_TO_GO_WITH_NOTES", durationMs: 3000 },
+            { status: "ESCALATE", durationMs: 4000 },
+            // Non-archived statuses do not contribute.
+            { status: "NO_CHANGES", durationMs: 99999 },
+            { status: "NO_PROGRESS_WITH_OPEN_ISSUES", durationMs: 99999 },
+            // Garbage skipped.
+            { durationMs: 50 },
+            null,
+            { status: "GOOD_TO_GO", durationMs: -1 },
+            { status: "GOOD_TO_GO", durationMs: "nope" },
+        ])
+        expect(out.total).toBe(10000)
+        expect(out.totals).toEqual({
+            GOOD_TO_GO: 1000,
+            GOOD_TO_GO_WITH_NOTES: 3000,
+            ISSUES: 2000,
+            ESCALATE: 4000,
+        })
+    })
+})
+
+describe("renderDurationPie", () => {
+    const { renderDurationPie } = __test__
+
+    test("empty input renders an empty-state circle, no slices", () => {
+        const svg = renderDurationPie([])
+        expect(svg).toContain("no reviews yet")
+        expect(svg).not.toContain("<path ")
+    })
+
+    test("zero-only durations render the empty state", () => {
+        const svg = renderDurationPie([
+            { status: "GOOD_TO_GO", durationMs: 0 },
+            { status: "ISSUES", durationMs: 0 },
+        ])
+        expect(svg).toContain("no reviews yet")
+    })
+
+    test("single non-zero bucket renders as a full circle (avoids degenerate arc)", () => {
+        const svg = renderDurationPie([
+            { status: "ESCALATE", durationMs: 60000 },
+        ])
+        expect(svg).toMatch(/<circle [^>]*fill="#ef4444"/)
+        expect(svg).not.toContain("<path ")
+        // h:m:s label present.
+        expect(svg).toContain("0:01:00")
+    })
+
+    test("four non-zero buckets render four paths colored to STATUS_COLORS", () => {
+        const svg = renderDurationPie([
+            { status: "GOOD_TO_GO", durationMs: 1000 },
+            { status: "GOOD_TO_GO_WITH_NOTES", durationMs: 1000 },
+            { status: "ISSUES", durationMs: 1000 },
+            { status: "ESCALATE", durationMs: 1000 },
+        ])
+        // 4 slice paths, one per bucket.
+        expect(svg.match(/<path /g)?.length).toBe(4)
+        // STATUS_COLORS: green / yellow / blue / red.
+        expect(svg).toContain("#4ade80")
+        expect(svg).toContain("#facc15")
+        expect(svg).toContain("#3b82f6")
+        expect(svg).toContain("#ef4444")
+    })
+
+    test("callouts show h:m:s and percentage per slice", () => {
+        const svg = renderDurationPie([
+            { status: "GOOD_TO_GO", durationMs: 3 * 60 * 1000 }, // 0:03:00
+            { status: "ISSUES", durationMs: 1 * 60 * 1000 }, // 0:01:00
+        ])
+        // 75% vs 25%
+        expect(svg).toContain("0:03:00")
+        expect(svg).toContain("75.0%")
+        expect(svg).toContain("0:01:00")
+        expect(svg).toContain("25.0%")
+    })
+
+    test("aggregates multiple records of the same status", () => {
+        const svg = renderDurationPie([
+            { status: "GOOD_TO_GO", durationMs: 30000 },
+            { status: "GOOD_TO_GO", durationMs: 30000 },
+            { status: "GOOD_TO_GO", durationMs: 60000 },
+        ])
+        // 30 + 30 + 60 = 120s = 0:02:00.
+        expect(svg).toContain("0:02:00")
+        expect(svg).toContain('data-total-ms="120000"')
+    })
+
+    test("ignores non-archived statuses (NO_CHANGES / NO_PROGRESS)", () => {
+        const svg = renderDurationPie([
+            { status: "GOOD_TO_GO", durationMs: 60000 },
+            { status: "NO_CHANGES", durationMs: 999999 },
+            { status: "NO_PROGRESS_WITH_OPEN_ISSUES", durationMs: 999999 },
+        ])
+        expect(svg).toContain('data-total-ms="60000"')
+        // Total minus garbage; pie remains a single-bucket full circle.
+        expect(svg).toMatch(/<circle [^>]*fill="#4ade80"/)
+    })
+})

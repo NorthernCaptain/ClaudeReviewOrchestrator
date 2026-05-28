@@ -355,6 +355,139 @@ export const renderRequestPie = (metrics) => {
     )
 }
 
+// "h:m:s" formatter for total durations on the time-by-status pie.
+// Always three colon-separated segments so the units are unambiguous:
+// 45 s → "0:00:45", 12m 5s → "0:12:05", 1h 2m 5s → "1:02:05".
+const pad2 = (n) => String(n).padStart(2, "0")
+const fmtHms = (ms) => {
+    const total = Math.max(
+        0,
+        Math.floor((typeof ms === "number" ? ms : 0) / 1000)
+    )
+    const h = Math.floor(total / 3600)
+    const m = Math.floor((total % 3600) / 60)
+    const s = total % 60
+    return `${h}:${pad2(m)}:${pad2(s)}`
+}
+
+// Time-by-status pie: aggregates durationMs across the dashboard's
+// records (last 200) into the four status buckets the archive holds —
+// GOOD_TO_GO / GOOD_TO_GO_WITH_NOTES / ISSUES / ESCALATE. NO_CHANGES
+// and NO_PROGRESS_WITH_OPEN_ISSUES are cache hits and don't reach the
+// archive, so they're not represented. Reuses STATUS_COLORS so the
+// slices match the timeline bars at a glance.
+const DURATION_STATUSES = [
+    "GOOD_TO_GO",
+    "GOOD_TO_GO_WITH_NOTES",
+    "ISSUES",
+    "ESCALATE",
+]
+const DURATION_LABELS = {
+    GOOD_TO_GO: "good-to-go",
+    GOOD_TO_GO_WITH_NOTES: "with notes",
+    ISSUES: "issues",
+    ESCALATE: "escalate",
+}
+
+// Aggregate durationMs by status across the records. Exported so the
+// dashboard caption ("total H:MM:SS") can reuse the same total the pie
+// computed instead of re-walking the array.
+export const sumDurationByStatus = (records = []) => {
+    const totals = {
+        GOOD_TO_GO: 0,
+        GOOD_TO_GO_WITH_NOTES: 0,
+        ISSUES: 0,
+        ESCALATE: 0,
+    }
+    for (const r of records ?? []) {
+        if (!r || typeof r.durationMs !== "number" || r.durationMs <= 0)
+            continue
+        if (totals[r.status] !== undefined) totals[r.status] += r.durationMs
+    }
+    const total = DURATION_STATUSES.reduce((s, k) => s + totals[k], 0)
+    return { totals, total }
+}
+
+export const renderDurationPie = (records = []) => {
+    const { totals, total: grandTotal } = sumDurationByStatus(records)
+
+    const W = 220
+    const H = 170
+    const cx = W / 2
+    const cy = H / 2
+    const r = 56
+
+    if (grandTotal === 0) {
+        return (
+            `<svg viewBox="0 0 ${W} ${H}" class="pie" aria-label="empty duration pie">` +
+            `<circle cx="${cx}" cy="${cy}" r="${r}" class="pie-empty"/>` +
+            `<text x="${cx}" y="${cy + 4}" text-anchor="middle" class="empty">no reviews yet</text>` +
+            `</svg>`
+        )
+    }
+
+    const buckets = DURATION_STATUSES.filter((k) => totals[k] > 0).map((k) => [
+        k,
+        totals[k],
+    ])
+
+    let slices
+    const sliceMidAngles = []
+    if (buckets.length === 1) {
+        const [status, ms] = buckets[0]
+        slices =
+            `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${STATUS_COLORS[status]}">` +
+            `<title>${escapeHtml(DURATION_LABELS[status])} · ${fmtHms(ms)} · 100%</title>` +
+            `</circle>`
+        sliceMidAngles.push({ status, ms, midDeg: 0 })
+    } else {
+        let startDeg = 0
+        slices = buckets
+            .map(([status, ms]) => {
+                const sweep = (ms / grandTotal) * 360
+                const endDeg = startDeg + sweep
+                const midDeg = startDeg + sweep / 2
+                sliceMidAngles.push({ status, ms, midDeg })
+                const pct = ((ms / grandTotal) * 100).toFixed(1)
+                const title = escapeHtml(
+                    `${DURATION_LABELS[status]} · ${fmtHms(ms)} · ${pct}%`
+                )
+                const d = arcPath(cx, cy, r, startDeg, endDeg)
+                startDeg = endDeg
+                return (
+                    `<path d="${d}" fill="${STATUS_COLORS[status]}">` +
+                    `<title>${title}</title></path>`
+                )
+            })
+            .join("")
+    }
+
+    const callouts = sliceMidAngles
+        .map(({ status, ms, midDeg }) => {
+            const pct = ((ms / grandTotal) * 100).toFixed(1)
+            const inner = polarToCartesian(cx, cy, r, midDeg)
+            const outer = polarToCartesian(cx, cy, r + 10, midDeg)
+            const onRight = outer.x >= cx
+            const labelX = onRight ? outer.x + 4 : outer.x - 4
+            const anchor = onRight ? "start" : "end"
+            return (
+                `<g class="callout">` +
+                `<line x1="${inner.x.toFixed(2)}" y1="${inner.y.toFixed(2)}" x2="${outer.x.toFixed(2)}" y2="${outer.y.toFixed(2)}" stroke="${STATUS_COLORS[status]}" stroke-width="1"/>` +
+                `<text x="${labelX.toFixed(2)}" y="${(outer.y - 2).toFixed(2)}" text-anchor="${anchor}" class="callout-label">${escapeHtml(DURATION_LABELS[status])}</text>` +
+                `<text x="${labelX.toFixed(2)}" y="${(outer.y + 10).toFixed(2)}" text-anchor="${anchor}" class="callout-count">${escapeHtml(fmtHms(ms))} · ${pct}%</text>` +
+                `</g>`
+            )
+        })
+        .join("")
+
+    return (
+        `<svg viewBox="0 0 ${W} ${H}" class="pie" preserveAspectRatio="xMidYMid meet" data-total-ms="${grandTotal}">` +
+        slices +
+        callouts +
+        `</svg>`
+    )
+}
+
 // Compact elapsed formatter for running reviews: "12s", "3m 05s",
 // "1h 02m". Mirrored in the client poll script below — keep them in sync.
 const fmtElapsed = (ms) => {
@@ -743,6 +876,7 @@ export const renderDashboard = ({
     const allRecords = recordsWithIds
     const failures = recordsWithIds.filter((r) => r.status === "ESCALATE")
     const startedAtStr = startedAt ? fmtTs(startedAt) : "—"
+    const totalDurationMs = sumDurationByStatus(records).total
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -767,6 +901,10 @@ ${renderInFlight(inFlight)}
     <div class="pie-wrap">
       ${renderRequestPie(metrics)}
       <div class="label">request mix · since restart</div>
+    </div>
+    <div class="pie-wrap">
+      ${renderDurationPie(records)}
+      <div class="label">time by result · last ${records.length} · total ${escapeHtml(fmtHms(totalDurationMs))}</div>
     </div>
   </div>
 </section>
@@ -915,8 +1053,11 @@ export const __test__ = {
     fmtUptime,
     fmtTs,
     fmtElapsed,
+    fmtHms,
     renderChart,
     renderRequestPie,
+    renderDurationPie,
+    sumDurationByStatus,
     renderInFlight,
     renderConfigPanel,
     renderFinding,
