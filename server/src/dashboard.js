@@ -268,12 +268,14 @@ const arcPath = (cx, cy, r, startDeg, endDeg) => {
 export const renderRequestPie = (metrics) => {
     const m = metrics ?? { reviewed: 0, shortCircuit: 0, errors: 0 }
     const total = (m.reviewed ?? 0) + (m.shortCircuit ?? 0) + (m.errors ?? 0)
-    // Compact square box that sits next to the active-config grid.
-    // Generous horizontal padding for the callout labels (longest is
-    // "short-circuit"). Height stays small enough not to dominate the
-    // config row.
-    const W = 220
-    const H = 170
+    // Sized for the longest callout label across both pies. The
+    // duration pie's "H:MM:SS · 99.9%" runs ~15 chars at ~7px/char of
+    // monospace text on each side of the pie body — the previous
+    // 220×170 viewBox clipped those. cx=180 leaves ~124px of headroom
+    // on each side, which fits the labels without overlapping the
+    // slices.
+    const W = 360
+    const H = 190
     const cx = W / 2
     const cy = H / 2
     const r = 56
@@ -411,8 +413,11 @@ export const sumDurationByStatus = (records = []) => {
 export const renderDurationPie = (records = []) => {
     const { totals, total: grandTotal } = sumDurationByStatus(records)
 
-    const W = 220
-    const H = 170
+    // Matches renderRequestPie's viewBox so both pies render at the
+    // same size on the dashboard, and so the H:MM:SS · pct% callouts
+    // don't clip at the SVG edge.
+    const W = 360
+    const H = 190
     const cx = W / 2
     const cy = H / 2
     const r = 56
@@ -763,7 +768,7 @@ svg.chart a.bar-link:hover rect { opacity: 0.75; stroke: var(--fg);
 }
 details:target { animation: flash-target 1.2s ease-out 1; }
 svg.chart .empty { fill: var(--muted); font-size: 12px; }
-svg.pie { width: 220px; height: 170px; display: block; flex: 0 0 auto; }
+svg.pie { width: 100%; max-width: 360px; height: auto; display: block; flex: 0 0 auto; }
 svg.pie path, svg.pie circle { stroke: var(--panel); stroke-width: 1; }
 svg.pie .pie-empty { fill: var(--border); stroke: none; }
 svg.pie .callout-label { fill: var(--fg); font-size: 10px;
@@ -774,7 +779,7 @@ svg.pie .empty { fill: var(--muted); font-size: 11px; font-style: italic; }
 .config-row { display: flex; gap: 24px; align-items: flex-start; }
 .config-row .config { flex: 1 1 auto; min-width: 0; }
 .config-row .pie-wrap { display: flex; flex-direction: column;
-  align-items: center; gap: 4px; flex: 0 0 220px; }
+  align-items: center; gap: 4px; flex: 0 0 320px; min-width: 0; }
 .config-row .pie-wrap .label { color: var(--muted); font-size: 10px;
   text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
   text-align: center; }
