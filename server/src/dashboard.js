@@ -533,11 +533,15 @@ const renderInFlightRows = (inFlight = []) => {
         .join("")
 }
 
+// Rendered as a slot inside the active-config row (v0.1.34). The IDs
+// (#inflight-count, #inflight-body) are kept stable so the existing
+// client-side poll script still targets the same elements regardless
+// of where the slot lives in the DOM.
 export const renderInFlight = (inFlight = []) =>
-    `<section aria-label="in flight" class="inflight">` +
-    `<h2>in flight · <span id="inflight-count">${inFlight.length}</span></h2>` +
+    `<div class="inflight-slot" aria-label="in flight">` +
+    `<div class="slot-title">in flight · <span id="inflight-count">${inFlight.length}</span></div>` +
     `<div id="inflight-body">${renderInFlightRows(inFlight)}</div>` +
-    `</section>`
+    `</div>`
 
 const renderConfigPanel = (config) => {
     if (!config) return ""
@@ -776,19 +780,30 @@ svg.pie .callout-label { fill: var(--fg); font-size: 10px;
 svg.pie .callout-count { fill: var(--muted); font-size: 10px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 svg.pie .empty { fill: var(--muted); font-size: 11px; font-style: italic; }
+/* Active config + in-flight slot (compact, side-by-side). */
+section.compact > h2 { margin-bottom: 8px; }
 .config-row { display: flex; gap: 24px; align-items: flex-start; }
 .config-row .config { flex: 1 1 auto; min-width: 0; }
-.config-row .pie-wrap { display: flex; flex-direction: column;
-  align-items: center; gap: 4px; flex: 0 0 320px; min-width: 0; }
-.config-row .pie-wrap .label { color: var(--muted); font-size: 10px;
+.inflight-slot { flex: 0 0 300px; min-width: 0; border-left: 2px solid var(--accent);
+  padding-left: 16px; }
+.inflight-slot .slot-title { color: var(--muted); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+  margin: 0 0 8px; }
+/* Charts row (the two pies, their own section). */
+.charts-row { display: flex; gap: 24px; align-items: flex-start;
+  flex-wrap: wrap; justify-content: center; }
+.charts-row .pie-wrap { display: flex; flex-direction: column;
+  align-items: center; gap: 4px; flex: 0 0 360px; min-width: 0; }
+.charts-row .pie-wrap .label { color: var(--muted); font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
   text-align: center; }
 @media (max-width: 720px) {
   .config-row { flex-direction: column; }
-  .config-row .pie-wrap { align-self: center; }
+  .inflight-slot { border-left: 0; border-top: 2px solid var(--accent);
+    padding-left: 0; padding-top: 12px; flex: 0 0 auto; }
+  .charts-row .pie-wrap { align-self: center; flex: 0 0 auto; }
 }
-/* In-flight panel */
-section.inflight { border-color: var(--accent); }
+/* In-flight rows */
 #inflight-body { display: flex; flex-direction: column; gap: 8px; }
 .inflight-row { display: flex; align-items: center; gap: 10px; }
 .inflight-row .if-ctx { font-family: ui-monospace, SFMono-Regular, Menlo,
@@ -897,12 +912,17 @@ export const renderDashboard = ({
   <div class="meta">started ${escapeHtml(startedAtStr)} · uptime ${escapeHtml(fmtUptime(uptimeSeconds))} · ${records.length} record${records.length === 1 ? "" : "s"} (${failures.length} failed)</div>
 </header>
 
-${renderInFlight(inFlight)}
-
-<section aria-label="active config">
+<section aria-label="active config" class="compact">
   <h2>active config</h2>
   <div class="config-row">
     ${renderConfigPanel(config)}
+    ${renderInFlight(inFlight)}
+  </div>
+</section>
+
+<section aria-label="charts">
+  <h2>charts</h2>
+  <div class="charts-row">
     <div class="pie-wrap">
       ${renderRequestPie(metrics)}
       <div class="label">request mix · since restart</div>
