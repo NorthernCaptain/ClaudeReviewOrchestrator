@@ -634,8 +634,22 @@ export const handleReview = async ({
         // decision:"block" instructions this loop, escalate before doing any
         // more work. Manual MCP calls bypass this cap because they don't
         // consume block budget by definition.
+        //
+        // Recovery exemption (v0.1.31): when the cached result is
+        // `ISSUES` but priorFindings is empty (sanitize dropped them,
+        // legacy idle-reset wiped them, downgrade, …), the
+        // post-payload branch is designed to FALL THROUGH to a real
+        // review without consuming the block budget. Returning
+        // MAX_BLOCKS here would slam that escape hatch shut — a context
+        // that already hit the cap on the empty-cache loop would never
+        // recover. Skip the pre-cap in that exact case so the
+        // fall-through can do its job.
+        const needsEmptyCacheRecovery =
+            state.lastResultStatus === "ISSUES" &&
+            resanitizeCached(state.priorFindings, context.repoRoot).length === 0
         if (
             !force &&
+            !needsEmptyCacheRecovery &&
             isStopHook(trigger) &&
             state.blockCount >= config.limits.maxBlocks
         ) {

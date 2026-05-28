@@ -415,7 +415,18 @@ describe("handleReview — cap escalations", () => {
             blockCount: cfg.limits.maxBlocks,
             lastReviewedAt: 1,
             lastResultStatus: "ISSUES",
-            priorFindings: [],
+            // Realistic seed: a real ISSUES context has its findings.
+            // An empty-priorFindings shape is the broken state that the
+            // v0.1.31 recovery exemption is designed to escape from.
+            priorFindings: [
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "boom",
+                },
+            ],
             lastBaseline: { progressHash: "g" },
         })
         const r = await handleReview({
@@ -1150,7 +1161,17 @@ describe("handleReview — archive integration", () => {
             blockCount: cfg.limits.maxBlocks,
             lastReviewedAt: 1,
             lastResultStatus: "ISSUES",
-            priorFindings: [],
+            // Realistic non-empty priorFindings; an empty list would
+            // trigger the v0.1.31 recovery exemption and fall through.
+            priorFindings: [
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "boom",
+                },
+            ],
             lastBaseline: { progressHash: "g" },
         })
         const r = await handleReview({
@@ -4009,6 +4030,119 @@ describe("handleReview — NO_PROGRESS fall-through when priorFindings empty (v0
         })
         expect(r.body.status).toBe("NO_PROGRESS_WITH_OPEN_ISSUES")
         expect(r.body.blockingFindings).toHaveLength(1)
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+})
+
+// v0.1.31 — the MAX_BLOCKS pre-cap must not slam shut the empty-cache
+// recovery hatch. A context that already hit the cap on the broken
+// empty-cache loop (the exact mobile:tmi-chat-fixes-and-such failure
+// mode) must still self-heal: lastResultStatus=ISSUES + empty
+// priorFindings → fall through to a real review even when
+// blockCount >= maxBlocks.
+describe("handleReview — MAX_BLOCKS recovery exemption for empty-cache (v0.1.31)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const samePH = () =>
+        makePayload({
+            files: {
+                modified: [{ path: "a.js" }],
+                untracked: [],
+                deleted: [],
+                renamed: [],
+                priorFindingContext: [],
+            },
+            progressHash: "p",
+        })
+
+    test("blockCount AT cap + lastResultStatus=ISSUES + empty priorFindings → real review (not MAX_BLOCKS)", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            blockCount: 2, // minimalConfig().limits.maxBlocks
+            lastResultStatus: "ISSUES",
+            priorFindings: [],
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                files: { modified: [{ path: "a.js" }], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                totalBytes: 0,
+                truncated: false,
+            },
+        })
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: samePH, runAndParse: runSpy }),
+        })
+        // The pre-cap MUST NOT fire — fall through to a real review.
+        expect(r.body.code).not.toBe("MAX_BLOCKS")
+        expect(r.body.status).not.toBe("NO_PROGRESS_WITH_OPEN_ISSUES")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("blockCount AT cap + lastResultStatus=ISSUES with REAL priorFindings still escalates MAX_BLOCKS (no regression)", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            blockCount: 2,
+            lastResultStatus: "ISSUES",
+            priorFindings: [
+                {
+                    file: "a.js",
+                    line: 1,
+                    severity: "blocker",
+                    category: "bug",
+                    message: "boom",
+                },
+            ],
+            lastBaseline: {
+                headSha: "abc",
+                progressHash: "p",
+                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                files: { modified: [{ path: "a.js" }], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                totalBytes: 0,
+                truncated: false,
+            },
+        })
+        const runSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: samePH, runAndParse: runSpy }),
+        })
+        expect(r.body.code).toBe("MAX_BLOCKS")
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+
+    test("blockCount AT cap + lastResultStatus=GOOD_TO_GO still escalates MAX_BLOCKS (recovery is ISSUES-specific)", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            blockCount: 2,
+            lastResultStatus: "GOOD_TO_GO",
+            priorFindings: [],
+        })
+        const runSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: samePH, runAndParse: runSpy }),
+        })
+        expect(r.body.code).toBe("MAX_BLOCKS")
         expect(runSpy).not.toHaveBeenCalled()
     })
 })
