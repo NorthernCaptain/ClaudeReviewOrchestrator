@@ -99,7 +99,7 @@ export const createApp = ({
     // no diff or finding content.
     app.get("/inflight", (_req, res) => {
         res.setHeader("Cache-Control", "no-store")
-        res.json({ ok: true, inFlight: snapshotInFlight(Date.now()) })
+        res.json({ ok: true, inFlight: snapshotInFlight(Date.now) })
     })
 
     // GET / — public dashboard. Mounted BEFORE the auth middleware so
@@ -113,7 +113,7 @@ export const createApp = ({
         version: VERSION,
         startedAt,
         metrics,
-        inFlight: () => snapshotInFlight(Date.now()),
+        inFlight: () => snapshotInFlight(Date.now),
     })
 
     app.use(authMiddleware({ token: config.authToken }))

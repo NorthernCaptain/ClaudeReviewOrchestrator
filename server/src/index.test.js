@@ -164,6 +164,22 @@ describe("createApp wiring", () => {
         }
     })
 
+    test("/inflight is open and returns JSON without a token (v0.1.28)", async () => {
+        // Regression: the route must pass Date.now (the function) to
+        // snapshotInFlight, not Date.now(). Passing the number threw
+        // "now is not a function" and 500'd the endpoint.
+        const { url, close } = await start(minimalConfig(), happyDeps)
+        try {
+            const r = await fetch(`${url}/inflight`)
+            expect(r.status).toBe(200)
+            const body = await r.json()
+            expect(body.ok).toBe(true)
+            expect(Array.isArray(body.inFlight)).toBe(true)
+        } finally {
+            await close()
+        }
+    })
+
     test("/review rejects with 401 when token is missing", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
