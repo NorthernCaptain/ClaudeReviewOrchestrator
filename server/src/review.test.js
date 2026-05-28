@@ -11,6 +11,7 @@ import {
     handleReview,
     computeReviewConfigHash,
     defaultInflight,
+    snapshotInFlight,
 } from "./review.js"
 import { ContextError } from "./context.js"
 import { createStateStore } from "./state.js"
@@ -2574,7 +2575,12 @@ describe("handleReview — same-context pipelines are serialized (v0.1.24)", () 
             return {
                 status: "GOOD_TO_GO",
                 findings: [],
-                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
             }
         })
         const inflight = new Map()
@@ -3779,5 +3785,111 @@ describe("handleReview — force: true (v0.1.18)", () => {
             }),
         })
         expect(pickSpy.mock.calls[0][1]).toBeNull()
+    })
+})
+
+// v0.1.28 — in-flight observability registry feeding the dashboard.
+describe("snapshotInFlight (v0.1.28)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("empty registry snapshots to []", () => {
+        expect(snapshotInFlight(() => 0, new Map())).toEqual([])
+    })
+
+    test("maps entries to {repo,branch,provider,force,startedAt,elapsedMs}, oldest first", () => {
+        const meta = new Map([
+            [
+                "k2",
+                {
+                    contextKey: "/b|main",
+                    repo: "b",
+                    branch: "main",
+                    provider: "codex",
+                    force: false,
+                    startedAt: 2000,
+                },
+            ],
+            [
+                "k1",
+                {
+                    contextKey: "/a|dev",
+                    repo: "a",
+                    branch: "dev",
+                    provider: "gemini",
+                    force: true,
+                    startedAt: 1000,
+                },
+            ],
+        ])
+        const out = snapshotInFlight(() => 5000, meta)
+        expect(out).toHaveLength(2)
+        // Sorted by startedAt ascending.
+        expect(out[0].repo).toBe("a")
+        expect(out[0].elapsedMs).toBe(4000)
+        expect(out[0].force).toBe(true)
+        expect(out[1].repo).toBe("b")
+        expect(out[1].elapsedMs).toBe(3000)
+    })
+
+    test("a running review registers, then clears on completion", async () => {
+        let release
+        const gate = new Promise((r) => {
+            release = r
+        })
+        const runAndParse = jest.fn(async () => {
+            await gate
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }
+        })
+        const inflightMeta = new Map()
+        const deps = makeDeps({
+            buildPayload: () =>
+                makePayload({
+                    files: {
+                        modified: [{ path: "a.js" }],
+                        untracked: [],
+                        deleted: [],
+                        renamed: [],
+                        priorFindingContext: [],
+                    },
+                }),
+            runAndParse,
+            inflight: new Map(),
+            contextChains: new Map(),
+            inflightMeta,
+        })
+        const p = handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+            now: () => 10000,
+        })
+        // Let the pipeline register before the gated reviewer call.
+        await Promise.resolve()
+        await Promise.resolve()
+        const mid = snapshotInFlight(() => 12500, inflightMeta)
+        expect(mid).toHaveLength(1)
+        expect(mid[0].repo).toBe("repo")
+        expect(mid[0].branch).toBe("main")
+        expect(mid[0].startedAt).toBe(10000)
+        expect(mid[0].elapsedMs).toBe(2500)
+
+        release()
+        await p
+        // Cleared once the pipeline settles.
+        expect(snapshotInFlight(() => 0, inflightMeta)).toEqual([])
     })
 })

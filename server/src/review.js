@@ -316,6 +316,32 @@ export const defaultInflight = new Map()
 // Tests inject their own Map via `deps.contextChains` for isolation.
 export const defaultContextChains = new Map()
 
+// Observability registry for in-flight reviews (v0.1.28). Parallel to
+// `inflight` (which holds promises for dedup), this maps the same
+// result-sharing key → { contextKey, repo, branch, provider, force,
+// startedAt } so the dashboard can show what's running right now without
+// unwrapping promises. Entry added when a pipeline registers, removed in
+// the same `finally` as the inflight slot.
+//
+// Tests inject their own Map via `deps.inflightMeta`.
+export const defaultInflightMeta = new Map()
+
+// Snapshot the in-flight registry for the dashboard / GET /inflight.
+// Returns one row per running review with elapsedMs computed against
+// `now`, oldest first.
+export const snapshotInFlight = (now = Date.now, meta = defaultInflightMeta) =>
+    [...meta.values()]
+        .map((m) => ({
+            contextKey: m.contextKey,
+            repo: m.repo,
+            branch: m.branch,
+            provider: m.provider,
+            force: m.force === true,
+            startedAt: m.startedAt,
+            elapsedMs: Math.max(0, now() - m.startedAt),
+        }))
+        .sort((a, b) => a.startedAt - b.startedAt)
+
 export const handleReview = async ({
     body,
     config,
@@ -427,6 +453,7 @@ export const handleReview = async ({
     // under the same provider still share one pipeline.
     const inflight = deps.inflight ?? defaultInflight
     const contextChains = deps.contextChains ?? defaultContextChains
+    const inflightMeta = deps.inflightMeta ?? defaultInflightMeta
     const effectiveProvider =
         providerOverride ?? config.reviewer?.provider ?? "codex"
     const inflightKey = `${context.key}|force=${force}|provider=${effectiveProvider}`
@@ -1207,12 +1234,22 @@ export const handleReview = async ({
     // Become the new tail of this context's serialization chain so the
     // next non-attaching request queues behind us.
     contextChains.set(context.key, pipelinePromise)
+    // Register observability metadata for the dashboard / GET /inflight.
+    inflightMeta.set(inflightKey, {
+        contextKey: context.key,
+        repo: context.repo,
+        branch: context.branch,
+        provider: effectiveProvider,
+        force,
+        startedAt: now(),
+    })
     try {
         return await pipelinePromise
     } finally {
         // Clear the result-sharing slot whether the pipeline resolved or
         // threw. A future identical request starts a fresh pipeline.
         inflight.delete(inflightKey)
+        inflightMeta.delete(inflightKey)
         // Only clear the chain tail if we're still it — a later request
         // may have already chained behind us and become the new tail.
         if (contextChains.get(context.key) === pipelinePromise) {

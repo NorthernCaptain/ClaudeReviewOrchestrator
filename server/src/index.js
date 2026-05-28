@@ -11,7 +11,7 @@ import { VERSION } from "./version.js"
 
 export { VERSION }
 import { authMiddleware } from "./auth.js"
-import { mountReviewRoute } from "./review.js"
+import { mountReviewRoute, snapshotInFlight } from "./review.js"
 import { mountResetRoute } from "./reset.js"
 import { mountMcpRoute } from "./mcp.js"
 import { mountStatusRoute } from "./status.js"
@@ -93,6 +93,15 @@ export const createApp = ({
         res.json({ ok: true })
     })
 
+    // GET /inflight — live snapshot of running reviews. Public (mounted
+    // before auth) because the dashboard page polls it without a token,
+    // same trust boundary as GET /. Exposes only repo/branch/elapsed,
+    // no diff or finding content.
+    app.get("/inflight", (_req, res) => {
+        res.setHeader("Cache-Control", "no-store")
+        res.json({ ok: true, inFlight: snapshotInFlight(Date.now()) })
+    })
+
     // GET / — public dashboard. Mounted BEFORE the auth middleware so
     // it's reachable without the x-review-token. Safe because the
     // server binds 127.0.0.1 by default — the trust boundary is the
@@ -104,6 +113,7 @@ export const createApp = ({
         version: VERSION,
         startedAt,
         metrics,
+        inFlight: () => snapshotInFlight(Date.now()),
     })
 
     app.use(authMiddleware({ token: config.authToken }))

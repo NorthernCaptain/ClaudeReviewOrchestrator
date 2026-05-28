@@ -355,6 +355,52 @@ export const renderRequestPie = (metrics) => {
     )
 }
 
+// Compact elapsed formatter for running reviews: "12s", "3m 05s",
+// "1h 02m". Mirrored in the client poll script below — keep them in sync.
+const fmtElapsed = (ms) => {
+    const s = Math.max(0, Math.floor((typeof ms === "number" ? ms : 0) / 1000))
+    if (s < 60) return `${s}s`
+    const m = Math.floor(s / 60)
+    if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`
+    const h = Math.floor(m / 60)
+    return `${h}h ${String(m % 60).padStart(2, "0")}m`
+}
+
+// One row per running review: blinking green dot, repo:branch, optional
+// provider/force tags, elapsed. `data-started` (epoch ms) lets the
+// client script tick the elapsed text live between polls.
+const renderInFlightRows = (inFlight = []) => {
+    if (!inFlight.length) {
+        return `<div class="empty">no reviews in flight</div>`
+    }
+    return inFlight
+        .map((r) => {
+            const ctx = `${r.repo ?? "?"}:${r.branch ?? "?"}`
+            const prov = r.provider
+                ? `<span class="if-tag">${escapeHtml(r.provider)}</span>`
+                : ""
+            const force = r.force
+                ? `<span class="if-tag force">force</span>`
+                : ""
+            return (
+                `<div class="inflight-row" data-started="${Number(r.startedAt) || 0}">` +
+                `<span class="dot" title="running"></span>` +
+                `<span class="if-ctx">${escapeHtml(ctx)}</span>` +
+                prov +
+                force +
+                `<span class="if-elapsed">${escapeHtml(fmtElapsed(r.elapsedMs))}</span>` +
+                `</div>`
+            )
+        })
+        .join("")
+}
+
+export const renderInFlight = (inFlight = []) =>
+    `<section aria-label="in flight" class="inflight">` +
+    `<h2>in flight · <span id="inflight-count">${inFlight.length}</span></h2>` +
+    `<div id="inflight-body">${renderInFlightRows(inFlight)}</div>` +
+    `</section>`
+
 const renderConfigPanel = (config) => {
     if (!config) return ""
     const provider = config.provider ?? "codex"
@@ -603,6 +649,29 @@ svg.pie .empty { fill: var(--muted); font-size: 11px; font-style: italic; }
   .config-row { flex-direction: column; }
   .config-row .pie-wrap { align-self: center; }
 }
+/* In-flight panel */
+section.inflight { border-color: var(--accent); }
+#inflight-body { display: flex; flex-direction: column; gap: 8px; }
+.inflight-row { display: flex; align-items: center; gap: 10px; }
+.inflight-row .if-ctx { font-family: ui-monospace, SFMono-Regular, Menlo,
+  monospace; font-size: 14px; }
+.inflight-row .if-tag { font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.04em; color: var(--muted); border: 1px solid var(--border);
+  border-radius: 3px; padding: 0 5px; }
+.inflight-row .if-tag.force { color: #c2410c; border-color: #c2410c; }
+.inflight-row .if-elapsed { margin-left: auto; font-family: ui-monospace,
+  SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--muted); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: #22c55e;
+  flex: 0 0 auto; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6);
+  animation: pulse 1.4s ease-out infinite; }
+@keyframes pulse {
+  0% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6); }
+  70% { opacity: 0.4; box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
+  100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dot { animation: none; opacity: 1; }
+}
 details { border-top: 1px solid var(--border); }
 details:first-of-type { border-top: 0; }
 summary { display: grid; grid-template-columns: 170px 1fr 110px 90px 130px 24px;
@@ -658,6 +727,7 @@ export const renderDashboard = ({
     startedAt = null,
     records = [],
     metrics = null,
+    inFlight = [],
 } = {}) => {
     // Assign a stable id per record so chart bars can deep-link to the
     // matching row in the reviews table. Index is the position in the
@@ -687,6 +757,8 @@ export const renderDashboard = ({
   <h1>review-orchestrator <span class="version">v${escapeHtml(version)}</span></h1>
   <div class="meta">started ${escapeHtml(startedAtStr)} · uptime ${escapeHtml(fmtUptime(uptimeSeconds))} · ${records.length} record${records.length === 1 ? "" : "s"} (${failures.length} failed)</div>
 </header>
+
+${renderInFlight(inFlight)}
 
 <section aria-label="active config">
   <h2>active config</h2>
@@ -742,6 +814,60 @@ export const renderDashboard = ({
   window.addEventListener("hashchange", openTarget)
   window.addEventListener("load", openTarget)
 })();
+
+// In-flight panel: tick the elapsed text every second (smooth) and poll
+// GET /inflight every 2s (authoritative — adds/removes running reviews).
+(function () {
+  function fmtElapsed(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    if (s < 60) return s + "s";
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + "m " + String(s % 60).padStart(2, "0") + "s";
+    var h = Math.floor(m / 60);
+    return h + "h " + String(m % 60).padStart(2, "0") + "m";
+  }
+  function esc(v) {
+    return String(v == null ? "" : v).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+  function rowHtml(r) {
+    var ctx = (r.repo || "?") + ":" + (r.branch || "?");
+    var prov = r.provider ? '<span class="if-tag">' + esc(r.provider) + "</span>" : "";
+    var force = r.force ? '<span class="if-tag force">force</span>' : "";
+    return (
+      '<div class="inflight-row" data-started="' + (Number(r.startedAt) || 0) + '">' +
+      '<span class="dot" title="running"></span>' +
+      '<span class="if-ctx">' + esc(ctx) + "</span>" + prov + force +
+      '<span class="if-elapsed">' + esc(fmtElapsed(r.elapsedMs)) + "</span></div>"
+    );
+  }
+  function tick() {
+    var now = Date.now();
+    document.querySelectorAll(".inflight-row").forEach(function (row) {
+      var started = Number(row.getAttribute("data-started")) || 0;
+      var el = row.querySelector(".if-elapsed");
+      if (started && el) el.textContent = fmtElapsed(now - started);
+    });
+  }
+  function render(list) {
+    var body = document.getElementById("inflight-body");
+    var count = document.getElementById("inflight-count");
+    if (!body) return;
+    if (count) count.textContent = list.length;
+    body.innerHTML = list.length
+      ? list.map(rowHtml).join("")
+      : '<div class="empty">no reviews in flight</div>';
+  }
+  function poll() {
+    fetch("/inflight", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) { if (j && Array.isArray(j.inFlight)) render(j.inFlight); })
+      .catch(function () {});
+  }
+  setInterval(tick, 1000);
+  setInterval(poll, 2000);
+})();
 </script>
 </body>
 </html>`
@@ -749,7 +875,15 @@ export const renderDashboard = ({
 
 export const mountDashboardRoute = (
     app,
-    { archive, config, summarize, version, startedAt, metrics = null } = {}
+    {
+        archive,
+        config,
+        summarize,
+        version,
+        startedAt,
+        metrics = null,
+        inFlight = null,
+    } = {}
 ) => {
     app.get("/", (_req, res) => {
         const records = archive?.readRecent
@@ -767,6 +901,8 @@ export const mountDashboardRoute = (
             startedAt: startedAt ? new Date(startedAt).toISOString() : null,
             records,
             metrics: metrics?.snapshot ? metrics.snapshot() : metrics,
+            inFlight:
+                typeof inFlight === "function" ? inFlight() : (inFlight ?? []),
         })
         res.setHeader("Content-Type", "text/html; charset=utf-8")
         res.setHeader("Cache-Control", "no-store")
@@ -778,8 +914,10 @@ export const __test__ = {
     fmtMs,
     fmtUptime,
     fmtTs,
+    fmtElapsed,
     renderChart,
     renderRequestPie,
+    renderInFlight,
     renderConfigPanel,
     renderFinding,
     renderSuccessRow,

@@ -13,8 +13,10 @@ import {
 const {
     fmtMs,
     fmtUptime,
+    fmtElapsed,
     renderChart,
     renderRequestPie,
+    renderInFlight,
     renderSuccessRow,
     renderFailureRow,
 } = __test__
@@ -342,7 +344,9 @@ describe("renderDashboard", () => {
             records: [goodRecord(), issuesRecord()],
         })
         // Two anchors, one per record.
-        expect(html.match(/<a href="#review-\d+" class="bar-link">/g)).toHaveLength(2)
+        expect(
+            html.match(/<a href="#review-\d+" class="bar-link">/g)
+        ).toHaveLength(2)
         // The matching rows carry the same ids.
         expect(html).toContain('<details id="review-0">')
         expect(html).toContain('<details id="review-1">')
@@ -622,12 +626,83 @@ describe("computeAxisTicks", () => {
 
     test("chart Y-axis labels use whole-minute notation for >1m maxes", () => {
         const records = [
-            { ts: "2026-05-24T10:00:00Z", durationMs: 350000, status: "GOOD_TO_GO", findingsCount: 0, context: "x" },
+            {
+                ts: "2026-05-24T10:00:00Z",
+                durationMs: 350000,
+                status: "GOOD_TO_GO",
+                findingsCount: 0,
+                context: "x",
+            },
         ]
         const svg = renderChart(records)
         expect(svg).toContain(">1m<")
         expect(svg).toContain(">5m<")
         // No "1m 28s" style mid-fraction labels.
         expect(svg).not.toMatch(/>1m \d+s</)
+    })
+})
+
+describe("fmtElapsed", () => {
+    test("seconds under a minute", () => {
+        expect(fmtElapsed(0)).toBe("0s")
+        expect(fmtElapsed(12000)).toBe("12s")
+        expect(fmtElapsed(59000)).toBe("59s")
+    })
+    test("minutes with zero-padded seconds", () => {
+        expect(fmtElapsed(60000)).toBe("1m 00s")
+        expect(fmtElapsed(185000)).toBe("3m 05s")
+    })
+    test("hours with zero-padded minutes", () => {
+        expect(fmtElapsed(3600000)).toBe("1h 00m")
+        expect(fmtElapsed(3720000)).toBe("1h 02m")
+    })
+    test("guards non-numbers and negatives", () => {
+        expect(fmtElapsed(undefined)).toBe("0s")
+        expect(fmtElapsed(-5)).toBe("0s")
+    })
+})
+
+describe("renderInFlight", () => {
+    test("empty state shows 'no reviews in flight' and zero count", () => {
+        const html = renderInFlight([])
+        expect(html).toContain("no reviews in flight")
+        expect(html).toContain('id="inflight-count">0<')
+        // No blinking dots when idle.
+        expect(html).not.toContain('class="dot"')
+    })
+
+    test("renders a blinking dot, repo:branch, elapsed, and data-started per row", () => {
+        const html = renderInFlight([
+            {
+                repo: "mobile",
+                branch: "tmi",
+                provider: "codex",
+                force: false,
+                startedAt: 1000,
+                elapsedMs: 42000,
+            },
+        ])
+        expect(html).toContain('id="inflight-count">1<')
+        expect(html).toContain('class="dot"')
+        expect(html).toContain("mobile:tmi")
+        expect(html).toContain('data-started="1000"')
+        expect(html).toContain("42s")
+        expect(html).toContain("codex")
+    })
+
+    test("marks force requests and escapes context", () => {
+        const html = renderInFlight([
+            {
+                repo: "<x>",
+                branch: "b",
+                provider: "gemini",
+                force: true,
+                startedAt: 5,
+                elapsedMs: 1000,
+            },
+        ])
+        expect(html).toContain('if-tag force">force')
+        expect(html).toContain("&lt;x&gt;:b")
+        expect(html).not.toContain("<x>:b")
     })
 })
