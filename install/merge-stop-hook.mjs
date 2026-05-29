@@ -42,16 +42,6 @@ const backupIfDifferent = (filePath, newContent, nowStr) => {
     return bak
 }
 
-// True iff the given Stop matcher block contains a `hooks[].command`
-// pointing at the install target path.
-const matcherTargetsHook = (matcher, hookPath) => {
-    if (!isObj(matcher) || !Array.isArray(matcher.hooks)) return false
-    for (const h of matcher.hooks) {
-        if (h?.command === hookPath) return true
-    }
-    return false
-}
-
 export const mergeStopHook = ({
     settingsPath,
     hookPath,
@@ -67,19 +57,11 @@ export const mergeStopHook = ({
     writeAtomicFn = writeAtomic,
     backup = backupIfDifferent,
 }) => {
-    const ourMatcher = {
-        matcher: "",
-        hooks: [
-            {
-                type: "command",
-                command: hookPath,
-                timeout,
-            },
-        ],
-    }
+    const ourEntry = { type: "command", command: hookPath, timeout }
+    const ourMatcher = { matcher: "", hooks: [ourEntry] }
 
     let root = {}
-    let existed = existsFn(settingsPath)
+    const existed = existsFn(settingsPath)
     if (existed) {
         const raw = readFile(settingsPath, "utf8")
         if (raw.trim() === "") {
@@ -101,24 +83,35 @@ export const mergeStopHook = ({
     }
 
     const hooks = isObj(root.hooks) ? { ...root.hooks } : {}
-    const stopList = Array.isArray(hooks.Stop) ? [...hooks.Stop] : []
+    const stopList = Array.isArray(hooks.Stop) ? hooks.Stop.map((m) => m) : []
 
-    // Already present?
-    const existingIdx = stopList.findIndex((m) =>
-        matcherTargetsHook(m, hookPath)
-    )
-    if (existingIdx !== -1) {
-        // Compare deeply against ourMatcher; if identical → unchanged.
-        if (
-            JSON.stringify(stopList[existingIdx]) === JSON.stringify(ourMatcher)
-        ) {
-            return { action: "unchanged", path: settingsPath }
+    // Find OUR command inside each block's hooks[] — operate at the
+    // hook-entry level, not the matcher-block level, so co-located
+    // user hooks in the same matcher block are preserved.
+    let changed = false
+    let found = false
+    for (let i = 0; i < stopList.length; i++) {
+        const block = stopList[i]
+        if (!isObj(block) || !Array.isArray(block.hooks)) continue
+        const hookIdx = block.hooks.findIndex((h) => h?.command === hookPath)
+        if (hookIdx === -1) continue
+        found = true
+        const existingEntry = block.hooks[hookIdx]
+        if (JSON.stringify(existingEntry) !== JSON.stringify(ourEntry)) {
+            const nextHooks = block.hooks.slice()
+            nextHooks[hookIdx] = ourEntry
+            stopList[i] = { ...block, hooks: nextHooks }
+            changed = true
         }
-        // Existing entry points at our hook but with different shape (e.g.
-        // older timeout) — refresh it.
-        stopList[existingIdx] = ourMatcher
-    } else {
+        break
+    }
+    if (!found) {
         stopList.push(ourMatcher)
+        changed = true
+    }
+
+    if (!changed) {
+        return { action: "unchanged", path: settingsPath }
     }
 
     hooks.Stop = stopList

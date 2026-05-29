@@ -176,6 +176,34 @@ describe("removeStopHook", () => {
             "unchanged"
         )
     })
+
+    test("preserves co-located sibling hooks in the same matcher block", () => {
+        // Filter at the hook-entry level — never drop a whole block
+        // (and the user's other hooks with it).
+        const p = path.join(dir, "settings.json")
+        const sibling = { type: "command", command: "/users/x/their-hook" }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    Stop: [
+                        {
+                            matcher: "",
+                            hooks: [
+                                sibling,
+                                { type: "command", command: HOOK },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        const r = removeStopHook({ settingsPath: p, hookPath: HOOK })
+        expect(r.action).toBe("removed")
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.Stop).toHaveLength(1)
+        expect(s.hooks.Stop[0].hooks).toEqual([sibling])
+    })
 })
 
 describe("removePostToolUseHook", () => {
@@ -274,6 +302,36 @@ describe("removePostToolUseHook", () => {
         expect(
             removePostToolUseHook({ settingsPath: p, hookPath: NOTIFY }).action
         ).toBe("unchanged")
+    })
+
+    test("preserves co-located sibling hooks in the same matcher block", () => {
+        const p = path.join(dir, "settings.json")
+        const sibling = {
+            type: "command",
+            command: "/users/x/their-tool",
+            timeout: 5000,
+        }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [
+                                sibling,
+                                { type: "command", command: NOTIFY },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        const r = removePostToolUseHook({ settingsPath: p, hookPath: NOTIFY })
+        expect(r.action).toBe("removed")
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.PostToolUse).toHaveLength(1)
+        expect(s.hooks.PostToolUse[0].hooks).toEqual([sibling])
     })
 })
 

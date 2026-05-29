@@ -128,6 +128,45 @@ describe("mergeStopHook", () => {
         ).toThrow(/not an object/)
     })
 
+    test("preserves co-located sibling hooks inside the same matcher block", () => {
+        // Operate at the hook-entry level, not the matcher-block level
+        // — never blow away a sibling command the user put alongside
+        // ours.
+        const p = path.join(dir, "settings.json")
+        const sibling = {
+            type: "command",
+            command: "/users/x/hooks/their-stop.sh",
+            timeout: 5000,
+        }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    Stop: [
+                        {
+                            matcher: "",
+                            hooks: [
+                                sibling,
+                                {
+                                    type: "command",
+                                    command: HOOK,
+                                    timeout: 60000, // stale
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergeStopHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.Stop).toHaveLength(1)
+        expect(s.hooks.Stop[0].hooks).toHaveLength(2)
+        expect(s.hooks.Stop[0].hooks[0]).toEqual(sibling)
+        expect(s.hooks.Stop[0].hooks[1].command).toBe(HOOK)
+        expect(s.hooks.Stop[0].hooks[1].timeout).toBe(720000)
+    })
+
     test("writes a backup only when bytes change", () => {
         const p = path.join(dir, "settings.json")
         writeFileSync(p, JSON.stringify({ hooks: { Stop: [] } }))

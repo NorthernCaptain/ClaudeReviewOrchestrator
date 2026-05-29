@@ -101,7 +101,12 @@ describe("mergePostToolUseHook", () => {
         expect(r.action).toBe("unchanged")
     })
 
-    test("refreshes an entry pointing at our hook with a different shape", () => {
+    test("refreshes our hook entry's shape but leaves the user's matcher pattern intact", () => {
+        // If a user widened or narrowed the matcher pattern, the
+        // installer treats that as deliberate and only updates OUR
+        // hook entry (type / command / timeout) inside the block.
+        // The codex sibling-preservation contract demands we never
+        // overwrite a whole block we didn't author.
         const p = path.join(dir, "settings.json")
         writeFileSync(
             p,
@@ -109,7 +114,7 @@ describe("mergePostToolUseHook", () => {
                 hooks: {
                     PostToolUse: [
                         {
-                            matcher: "Write|Edit", // stale, missing MultiEdit
+                            matcher: "Write|Edit", // user-customized pattern
                             hooks: [
                                 {
                                     type: "command",
@@ -125,8 +130,43 @@ describe("mergePostToolUseHook", () => {
         const r = mergePostToolUseHook({ settingsPath: p, hookPath: HOOK })
         expect(r.action).toBe("updated")
         const s = JSON.parse(readFileSync(p, "utf8"))
-        expect(s.hooks.PostToolUse[0].matcher).toBe("Write|Edit|MultiEdit")
+        expect(s.hooks.PostToolUse[0].matcher).toBe("Write|Edit")
         expect(s.hooks.PostToolUse[0].hooks[0].timeout).toBe(3000)
+    })
+
+    test("preserves co-located sibling hooks inside the same matcher block", () => {
+        // Codex bug: replacing the whole block clobbered sibling hooks
+        // the user put alongside ours. The merger must operate at the
+        // hook-entry level, not the matcher-block level.
+        const p = path.join(dir, "settings.json")
+        const sibling = {
+            type: "command",
+            command: "/users/x/hooks/their-tool.sh",
+            timeout: 5000,
+        }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [
+                                sibling,
+                                { type: "command", command: HOOK, timeout: 1 },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergePostToolUseHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.PostToolUse).toHaveLength(1)
+        expect(s.hooks.PostToolUse[0].hooks).toHaveLength(2)
+        expect(s.hooks.PostToolUse[0].hooks[0]).toEqual(sibling)
+        expect(s.hooks.PostToolUse[0].hooks[1].command).toBe(HOOK)
+        expect(s.hooks.PostToolUse[0].hooks[1].timeout).toBe(3000)
     })
 
     test("rejects invalid JSON instead of clobbering", () => {

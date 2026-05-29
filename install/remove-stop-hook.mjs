@@ -28,11 +28,6 @@ const backupIfDifferent = (filePath, newContent, nowStr) => {
     return bak
 }
 
-const matcherTargetsHook = (matcher, hookPath) => {
-    if (!isObj(matcher) || !Array.isArray(matcher.hooks)) return false
-    return matcher.hooks.some((h) => h?.command === hookPath)
-}
-
 export const removeStopHook = ({
     settingsPath,
     hookPath,
@@ -62,18 +57,36 @@ export const removeStopHook = ({
         return { action: "unchanged", path: settingsPath }
     }
 
-    const filtered = root.hooks.Stop.filter(
-        (m) => !matcherTargetsHook(m, hookPath)
-    )
-    if (filtered.length === root.hooks.Stop.length) {
+    // Filter OUR command out of each matcher block's hooks[] — never
+    // drop a whole block (and the user's co-located hooks with it).
+    // Empty blocks (where ours was the only hook) are then pruned.
+    let removed = false
+    const nextStop = []
+    for (const block of root.hooks.Stop) {
+        if (!isObj(block) || !Array.isArray(block.hooks)) {
+            nextStop.push(block)
+            continue
+        }
+        const kept = block.hooks.filter((h) => h?.command !== hookPath)
+        if (kept.length === block.hooks.length) {
+            nextStop.push(block)
+        } else {
+            removed = true
+            if (kept.length > 0) {
+                nextStop.push({ ...block, hooks: kept })
+            }
+            // else: drop the now-empty block.
+        }
+    }
+    if (!removed) {
         return { action: "unchanged", path: settingsPath }
     }
 
     const nextHooks = { ...root.hooks }
-    if (filtered.length === 0) {
+    if (nextStop.length === 0) {
         delete nextHooks.Stop
     } else {
-        nextHooks.Stop = filtered
+        nextHooks.Stop = nextStop
     }
     const next = { ...root }
     if (Object.keys(nextHooks).length === 0) {

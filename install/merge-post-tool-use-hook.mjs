@@ -32,11 +32,6 @@ const backupIfDifferent = (filePath, newContent, nowStr) => {
     return bak
 }
 
-const matcherTargetsHook = (matcher, hookPath) => {
-    if (!isObj(matcher) || !Array.isArray(matcher.hooks)) return false
-    return matcher.hooks.some((h) => h?.command === hookPath)
-}
-
 export const mergePostToolUseHook = ({
     settingsPath,
     hookPath,
@@ -48,10 +43,8 @@ export const mergePostToolUseHook = ({
     writeAtomicFn = writeAtomic,
     backup = backupIfDifferent,
 }) => {
-    const ourMatcher = {
-        matcher: matcherPattern,
-        hooks: [{ type: "command", command: hookPath, timeout }],
-    }
+    const ourEntry = { type: "command", command: hookPath, timeout }
+    const ourMatcher = { matcher: matcherPattern, hooks: [ourEntry] }
 
     let root = {}
     const existed = existsFn(settingsPath)
@@ -76,16 +69,36 @@ export const mergePostToolUseHook = ({
     }
 
     const hooks = isObj(root.hooks) ? { ...root.hooks } : {}
-    const list = Array.isArray(hooks.PostToolUse) ? [...hooks.PostToolUse] : []
+    const list = Array.isArray(hooks.PostToolUse)
+        ? hooks.PostToolUse.map((m) => m)
+        : []
 
-    const existingIdx = list.findIndex((m) => matcherTargetsHook(m, hookPath))
-    if (existingIdx !== -1) {
-        if (JSON.stringify(list[existingIdx]) === JSON.stringify(ourMatcher)) {
-            return { action: "unchanged", path: settingsPath }
+    // Operate at the hook-entry level inside each matcher block —
+    // never blow away a sibling command the user put alongside ours.
+    let changed = false
+    let found = false
+    for (let i = 0; i < list.length; i++) {
+        const block = list[i]
+        if (!isObj(block) || !Array.isArray(block.hooks)) continue
+        const hookIdx = block.hooks.findIndex((h) => h?.command === hookPath)
+        if (hookIdx === -1) continue
+        found = true
+        const existingEntry = block.hooks[hookIdx]
+        if (JSON.stringify(existingEntry) !== JSON.stringify(ourEntry)) {
+            const nextHooks = block.hooks.slice()
+            nextHooks[hookIdx] = ourEntry
+            list[i] = { ...block, hooks: nextHooks }
+            changed = true
         }
-        list[existingIdx] = ourMatcher
-    } else {
+        break
+    }
+    if (!found) {
         list.push(ourMatcher)
+        changed = true
+    }
+
+    if (!changed) {
+        return { action: "unchanged", path: settingsPath }
     }
 
     hooks.PostToolUse = list

@@ -28,11 +28,6 @@ const backupIfDifferent = (filePath, newContent, nowStr) => {
     return bak
 }
 
-const matcherTargetsHook = (matcher, hookPath) => {
-    if (!isObj(matcher) || !Array.isArray(matcher.hooks)) return false
-    return matcher.hooks.some((h) => h?.command === hookPath)
-}
-
 export const removePostToolUseHook = ({
     settingsPath,
     hookPath,
@@ -62,18 +57,35 @@ export const removePostToolUseHook = ({
         return { action: "unchanged", path: settingsPath }
     }
 
-    const filtered = root.hooks.PostToolUse.filter(
-        (m) => !matcherTargetsHook(m, hookPath)
-    )
-    if (filtered.length === root.hooks.PostToolUse.length) {
+    // Filter at the hook-entry level inside each matcher block.
+    // Co-located user hooks survive; blocks that lose their last hook
+    // are dropped.
+    let removed = false
+    const nextList = []
+    for (const block of root.hooks.PostToolUse) {
+        if (!isObj(block) || !Array.isArray(block.hooks)) {
+            nextList.push(block)
+            continue
+        }
+        const kept = block.hooks.filter((h) => h?.command !== hookPath)
+        if (kept.length === block.hooks.length) {
+            nextList.push(block)
+        } else {
+            removed = true
+            if (kept.length > 0) {
+                nextList.push({ ...block, hooks: kept })
+            }
+        }
+    }
+    if (!removed) {
         return { action: "unchanged", path: settingsPath }
     }
 
     const nextHooks = { ...root.hooks }
-    if (filtered.length === 0) {
+    if (nextList.length === 0) {
         delete nextHooks.PostToolUse
     } else {
-        nextHooks.PostToolUse = filtered
+        nextHooks.PostToolUse = nextList
     }
     const next = { ...root }
     if (Object.keys(nextHooks).length === 0) {
