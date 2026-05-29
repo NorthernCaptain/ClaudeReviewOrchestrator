@@ -4,23 +4,13 @@
  * Author: Leo Khramov
  */
 
-// Add the Stop hook entry to ~/.claude/settings.json. Idempotent: if a
-// Stop-event handler with the matching `command` path already exists, we
-// leave the file alone. Other Stop handlers are preserved verbatim.
-//
-// Schema shape (per Claude Code's hooks contract):
-//   {
-//     "hooks": {
-//       "Stop": [
-//         {
-//           "matcher": "",
-//           "hooks": [
-//             { "type": "command", "command": "<hookPath>", "timeout": 300000 }
-//           ]
-//         }
-//       ]
-//     }
-//   }
+// Add the PostToolUse hook entry to ~/.claude/settings.json. Mirrors
+// merge-stop-hook.mjs but hardcodes event="PostToolUse",
+// matcher="Write|Edit|MultiEdit", timeout=3000 — the trio the
+// notify-change.mjs hook expects. Idempotent: if a matcher block with
+// the matching `command` path already exists for PostToolUse, the file
+// is left alone. Other PostToolUse handlers (and every other event)
+// are preserved.
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import path from "node:path"
@@ -42,25 +32,16 @@ const backupIfDifferent = (filePath, newContent, nowStr) => {
     return bak
 }
 
-// True iff the given Stop matcher block contains a `hooks[].command`
-// pointing at the install target path.
 const matcherTargetsHook = (matcher, hookPath) => {
     if (!isObj(matcher) || !Array.isArray(matcher.hooks)) return false
-    for (const h of matcher.hooks) {
-        if (h?.command === hookPath) return true
-    }
-    return false
+    return matcher.hooks.some((h) => h?.command === hookPath)
 }
 
-export const mergeStopHook = ({
+export const mergePostToolUseHook = ({
     settingsPath,
     hookPath,
-    // 12 minutes. Codex high-effort reviews on a large repo can run
-    // 2–5 minutes; multiple rounds plus the server's own wait push
-    // total Stop-hook time toward 10+. Claude Code kills the hook
-    // process at this timeout regardless of what the server is doing,
-    // so this needs to be larger than any realistic review.
-    timeout = 720000,
+    timeout = 3000,
+    matcherPattern = "Write|Edit|MultiEdit",
     now = () => new Date().toISOString().replace(/[:.]/g, "-"),
     existsFn = existsSync,
     readFile = readFileSync,
@@ -68,18 +49,12 @@ export const mergeStopHook = ({
     backup = backupIfDifferent,
 }) => {
     const ourMatcher = {
-        matcher: "",
-        hooks: [
-            {
-                type: "command",
-                command: hookPath,
-                timeout,
-            },
-        ],
+        matcher: matcherPattern,
+        hooks: [{ type: "command", command: hookPath, timeout }],
     }
 
     let root = {}
-    let existed = existsFn(settingsPath)
+    const existed = existsFn(settingsPath)
     if (existed) {
         const raw = readFile(settingsPath, "utf8")
         if (raw.trim() === "") {
@@ -101,27 +76,19 @@ export const mergeStopHook = ({
     }
 
     const hooks = isObj(root.hooks) ? { ...root.hooks } : {}
-    const stopList = Array.isArray(hooks.Stop) ? [...hooks.Stop] : []
+    const list = Array.isArray(hooks.PostToolUse) ? [...hooks.PostToolUse] : []
 
-    // Already present?
-    const existingIdx = stopList.findIndex((m) =>
-        matcherTargetsHook(m, hookPath)
-    )
+    const existingIdx = list.findIndex((m) => matcherTargetsHook(m, hookPath))
     if (existingIdx !== -1) {
-        // Compare deeply against ourMatcher; if identical → unchanged.
-        if (
-            JSON.stringify(stopList[existingIdx]) === JSON.stringify(ourMatcher)
-        ) {
+        if (JSON.stringify(list[existingIdx]) === JSON.stringify(ourMatcher)) {
             return { action: "unchanged", path: settingsPath }
         }
-        // Existing entry points at our hook but with different shape (e.g.
-        // older timeout) — refresh it.
-        stopList[existingIdx] = ourMatcher
+        list[existingIdx] = ourMatcher
     } else {
-        stopList.push(ourMatcher)
+        list.push(ourMatcher)
     }
 
-    hooks.Stop = stopList
+    hooks.PostToolUse = list
     const next = { ...root, hooks }
     const serialized = JSON.stringify(next, null, 2) + "\n"
     const ts = now()
@@ -148,11 +115,11 @@ if (isDirectInvocation()) {
         const hookPath = process.argv[3]
         if (!settingsPath || !hookPath) {
             process.stderr.write(
-                "usage: merge-stop-hook.mjs <settingsPath> <hookPath>\n"
+                "usage: merge-post-tool-use-hook.mjs <settingsPath> <hookPath>\n"
             )
             process.exit(1)
         }
-        const r = mergeStopHook({ settingsPath, hookPath })
+        const r = mergePostToolUseHook({ settingsPath, hookPath })
         process.stdout.write(`${r.action}:${r.path}\n`)
     } catch (err) {
         process.stderr.write(`error:${err.message}\n`)

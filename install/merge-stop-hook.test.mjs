@@ -65,7 +65,7 @@ describe("mergeStopHook", () => {
                 {
                     type: "command",
                     command: HOOK,
-                    timeout: 300000,
+                    timeout: 720000,
                 },
             ],
         }
@@ -101,7 +101,7 @@ describe("mergeStopHook", () => {
         const r = mergeStopHook({ settingsPath: p, hookPath: HOOK })
         expect(r.action).toBe("updated")
         const s = JSON.parse(readFileSync(p, "utf8"))
-        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(300000)
+        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(720000)
     })
 
     test("preserves unrelated top-level keys", () => {

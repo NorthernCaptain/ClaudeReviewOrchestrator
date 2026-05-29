@@ -8,6 +8,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { removeMcp } from "./remove-mcp.mjs"
 import { removeStopHook } from "./remove-stop-hook.mjs"
+import { removePostToolUseHook } from "./remove-post-tool-use-hook.mjs"
 import { removeClaudeMd } from "./remove-claude-md.mjs"
 
 const makeTmp = () => mkdtempSync(path.join(tmpdir(), "remove-"))
@@ -174,6 +175,105 @@ describe("removeStopHook", () => {
         expect(removeStopHook({ settingsPath: p, hookPath: HOOK }).action).toBe(
             "unchanged"
         )
+    })
+})
+
+describe("removePostToolUseHook", () => {
+    const NOTIFY = "/Users/x/.claude/hooks/notify-change.mjs"
+    let dir
+    beforeEach(() => {
+        dir = makeTmp()
+    })
+    afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+    test("absent → absent action", () => {
+        const r = removePostToolUseHook({
+            settingsPath: path.join(dir, "absent.json"),
+            hookPath: NOTIFY,
+        })
+        expect(r.action).toBe("absent")
+    })
+
+    test("unchanged when no PostToolUse list", () => {
+        const p = path.join(dir, "settings.json")
+        writeFileSync(p, JSON.stringify({ hooks: { Stop: [] } }))
+        expect(
+            removePostToolUseHook({ settingsPath: p, hookPath: NOTIFY }).action
+        ).toBe("unchanged")
+    })
+
+    test("removes only our matcher and keeps others (Bash matcher untouched)", () => {
+        const p = path.join(dir, "settings.json")
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        {
+                            matcher: "Bash",
+                            hooks: [{ type: "command", command: "/other" }],
+                        },
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [{ type: "command", command: NOTIFY }],
+                        },
+                    ],
+                },
+            })
+        )
+        const r = removePostToolUseHook({ settingsPath: p, hookPath: NOTIFY })
+        expect(r.action).toBe("removed")
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.PostToolUse).toHaveLength(1)
+        expect(s.hooks.PostToolUse[0].matcher).toBe("Bash")
+    })
+
+    test("leaves the Stop hook block intact when removing PostToolUse", () => {
+        const p = path.join(dir, "settings.json")
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    Stop: [
+                        {
+                            matcher: "",
+                            hooks: [{ type: "command", command: "/stop" }],
+                        },
+                    ],
+                    PostToolUse: [
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [{ type: "command", command: NOTIFY }],
+                        },
+                    ],
+                },
+            })
+        )
+        removePostToolUseHook({ settingsPath: p, hookPath: NOTIFY })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.Stop).toHaveLength(1)
+        expect("PostToolUse" in s.hooks).toBe(false)
+    })
+
+    test("rerun is unchanged (idempotent)", () => {
+        const p = path.join(dir, "settings.json")
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [{ type: "command", command: NOTIFY }],
+                        },
+                    ],
+                },
+            })
+        )
+        removePostToolUseHook({ settingsPath: p, hookPath: NOTIFY })
+        expect(
+            removePostToolUseHook({ settingsPath: p, hookPath: NOTIFY }).action
+        ).toBe("unchanged")
     })
 })
 

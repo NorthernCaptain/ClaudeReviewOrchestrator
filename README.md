@@ -661,13 +661,25 @@ required.
    writes it into `~/.config/review-orchestrator/config.json` (mode
    `0600`).
 2. Writes `~/.config/review-orchestrator/mcp-headers.sh` (mode `0700`).
-3. Merges the MCP block into `~/.claude.json` (with `.bak` backup).
+3. Copies `~/.claude/hooks/stop-review.mjs` (Stop hook) and
+   `~/.claude/hooks/notify-change.mjs` (PostToolUse hook) into place
+   (mode `0700`).
+4. Merges the MCP block into `~/.claude.json` (with `.bak` backup).
+5. Merges both hook entries (Stop with 12-min timeout, PostToolUse on
+   `Write|Edit|MultiEdit` with 3s timeout) into
+   `~/.claude/settings.json` (with `.bak` backup).
+6. Appends the `claude-md-snippet.md` block to `~/.claude/CLAUDE.md`.
 
-Tools the server advertises:
+Pass `--launch` to also drop the launchd plist into
+`~/Library/LaunchAgents` and bootstrap the daemon.
+
+Tools the MCP server advertises (v1.0):
 
 - `request_review` — input
-  `{ cwd: string, scope?: "uncommitted", extra_instructions?: string }`,
-  returns review result.
+  `{ cwd: string, scope?: "uncommitted", extra_instructions?: string,
+  force?: boolean, provider?: "codex" | "claude" | "gemini" }`,
+  returns review result. `force: true` bypasses cache + safety caps;
+  `provider` is a one-shot reviewer override.
 - `reset_review_context` — input `{ cwd: string }`, returns `{ ok: true }`.
 
 ### 3. Stop hook (`hooks/stop-review.mjs`)
@@ -1447,17 +1459,23 @@ limits are in v1 — not deferred.
     that emits a JSON object `{"X-Review-Token":"<token>"}` on stdout by
     reading the config file (Claude Code's `headersHelper` contract).
     Overwrites on rerun (deterministic content; safe).
-  - Copies hook to `~/.claude/hooks/stop-review.mjs` (mode 0700).
-    Overwrites only if the source content differs from what's already
-    installed (skip-and-log on rerun when bytes match).
+  - Copies two hooks to `~/.claude/hooks/` (mode 0700): `stop-review.mjs`
+    (Stop hook) and `notify-change.mjs` (PostToolUse change-notification
+    hook, drives the fast path). Overwrites only if the source content
+    differs from what's already installed (skip-and-log on rerun when
+    bytes match).
   - Patches `~/.claude.json` to add the MCP `review` entry with
     `headersHelper` pointing at the script. On rerun, replaces just
     the `mcpServers.review` subtree if it's already present; leaves
     other servers untouched. Backup `~/.claude.json.bak.<ts>` only when
     bytes change.
-  - Patches `~/.claude/settings.json` to add the Stop hook entry. On
-    rerun, matches by command path and skips if already present;
-    otherwise appends. Same `<ts>` backup rule.
+  - Patches `~/.claude/settings.json` to add BOTH hook entries: the
+    Stop hook (matcher `""`, 720-second timeout to accommodate slow
+    reviews) and the PostToolUse hook (matcher `Write|Edit|MultiEdit`,
+    3-second timeout — fire-and-forget). On rerun, each matches by
+    command path and is left alone if identical; otherwise the matching
+    entry is refreshed in place. Other event hooks (and unrelated
+    matchers) are preserved verbatim. Same `<ts>` backup rule.
   - Appends `claude-md-snippet.md` into `~/.claude/CLAUDE.md` between
     `<!-- review-orchestrator:begin -->` / `<!-- review-orchestrator:end -->`
     markers. On rerun: if markers exist, replaces the block in place;

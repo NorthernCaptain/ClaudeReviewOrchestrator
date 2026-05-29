@@ -7,9 +7,11 @@
 # Default mode wires up:
 #   - ~/.config/review-orchestrator/config.json (with a generated authToken)
 #   - ~/.config/review-orchestrator/mcp-headers.sh
-#   - ~/.claude/hooks/stop-review.mjs
+#   - ~/.claude/hooks/stop-review.mjs            (Stop hook)
+#   - ~/.claude/hooks/notify-change.mjs          (PostToolUse hook —
+#     change-notification fast path for the review server)
 #   - the mcpServers.review entry in ~/.claude.json
-#   - the Stop hook entry in ~/.claude/settings.json
+#   - the Stop + PostToolUse hook entries in ~/.claude/settings.json
 #   - the review-orchestrator block in ~/.claude/CLAUDE.md
 #
 # Pass --launch to also drop the launchd plist into
@@ -69,6 +71,7 @@ HEADERS_SCRIPT="$CONFIG_DIR/mcp-headers.sh"
 CLAUDE_DIR="$HOME_DIR/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 HOOK_PATH="$HOOKS_DIR/stop-review.mjs"
+NOTIFY_HOOK_PATH="$HOOKS_DIR/notify-change.mjs"
 CLAUDE_JSON="$HOME_DIR/.claude.json"
 SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
@@ -201,8 +204,12 @@ run_helper "config.json" "$REPO_ROOT/install/ensure-token.mjs" "$CONFIG_PATH" "$
 # 2. mcp-headers.sh
 write_headers_script "$HEADERS_SCRIPT" "$CONFIG_PATH"
 
-# 3. Stop hook
+# 3a. Stop hook
 install_file_idempotent "$REPO_ROOT/hooks/stop-review.mjs" "$HOOK_PATH" 0700 "Stop hook"
+
+# 3b. PostToolUse hook — drives the change-notification fast path so
+# the server can short-circuit redundant reviews when nothing changed.
+install_file_idempotent "$REPO_ROOT/hooks/notify-change.mjs" "$NOTIFY_HOOK_PATH" 0700 "PostToolUse hook"
 
 # 4a. Read the actual port/bind out of the config so the MCP URL we wire
 # into ~/.claude.json (and the /healthz probe under --launch) point at the
@@ -230,8 +237,12 @@ echo "  endpoint:  $BIND:$PORT (client URL host: $CLIENT_HOST)"
 run_helper "~/.claude.json (MCP entry)" "$REPO_ROOT/install/merge-mcp.mjs" \
     "$CLAUDE_JSON" "$HEADERS_SCRIPT" "$PORT" "$CLIENT_HOST"
 
-# 5. Stop hook entry in ~/.claude/settings.json
+# 5a. Stop hook entry in ~/.claude/settings.json
 run_helper "~/.claude/settings.json (Stop hook)" "$REPO_ROOT/install/merge-stop-hook.mjs" "$SETTINGS_JSON" "$HOOK_PATH"
+
+# 5b. PostToolUse hook entry in ~/.claude/settings.json (Write|Edit|MultiEdit,
+# 3s timeout — see install/merge-post-tool-use-hook.mjs).
+run_helper "~/.claude/settings.json (PostToolUse hook)" "$REPO_ROOT/install/merge-post-tool-use-hook.mjs" "$SETTINGS_JSON" "$NOTIFY_HOOK_PATH"
 
 # 6. claude-md-snippet.md into ~/.claude/CLAUDE.md
 run_helper "~/.claude/CLAUDE.md (snippet)" "$REPO_ROOT/install/merge-claude-md.mjs" "$CLAUDE_MD" "$REPO_ROOT/claude-md-snippet.md"

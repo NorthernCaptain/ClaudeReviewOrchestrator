@@ -55,6 +55,7 @@ CONFIG_PATH="$CONFIG_DIR/config.json"
 HEADERS_SCRIPT="$CONFIG_DIR/mcp-headers.sh"
 CLAUDE_DIR="$HOME_DIR/.claude"
 HOOK_PATH="$CLAUDE_DIR/hooks/stop-review.mjs"
+NOTIFY_HOOK_PATH="$CLAUDE_DIR/hooks/notify-change.mjs"
 CLAUDE_JSON="$HOME_DIR/.claude.json"
 SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
@@ -115,8 +116,11 @@ if [ "$LAUNCH" -eq 1 ]; then
     remove_file_idempotent "$PLIST_DST" "launchd plist"
 fi
 
-# 2. Stop hook entry in settings.json
+# 2a. Stop hook entry in settings.json
 run_helper "~/.claude/settings.json (Stop hook)" "$REPO_ROOT/install/remove-stop-hook.mjs" "$SETTINGS_JSON" "$HOOK_PATH"
+
+# 2b. PostToolUse hook entry in settings.json
+run_helper "~/.claude/settings.json (PostToolUse hook)" "$REPO_ROOT/install/remove-post-tool-use-hook.mjs" "$SETTINGS_JSON" "$NOTIFY_HOOK_PATH"
 
 # 3. MCP entry in ~/.claude.json
 run_helper "~/.claude.json (MCP entry)" "$REPO_ROOT/install/remove-mcp.mjs" "$CLAUDE_JSON"
@@ -124,8 +128,9 @@ run_helper "~/.claude.json (MCP entry)" "$REPO_ROOT/install/remove-mcp.mjs" "$CL
 # 4. CLAUDE.md snippet
 run_helper "~/.claude/CLAUDE.md (snippet)" "$REPO_ROOT/install/remove-claude-md.mjs" "$CLAUDE_MD"
 
-# 5. Hook file
+# 5. Hook files
 remove_file_idempotent "$HOOK_PATH" "Stop hook"
+remove_file_idempotent "$NOTIFY_HOOK_PATH" "PostToolUse hook"
 
 # 6. Headers script + config dir.
 if [ "$KEEP_CONFIG" -eq 1 ]; then
