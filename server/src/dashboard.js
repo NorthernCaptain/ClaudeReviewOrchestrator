@@ -623,12 +623,16 @@ const renderConfigPanel = (config) => {
         ["allowed roots", config.allowedRootsCount ?? "—"],
         ["port / bind", `${config.port ?? "—"} · ${config.bind ?? "—"}`],
     ]
+    // Tag each cell with a stable data-key so the client can poke a
+    // single field in place (e.g. the provider switcher updates the
+    // PROVIDER value cell without a full refetch).
+    const slug = (k) => k.replace(/[^a-z0-9]+/gi, "-").toLowerCase()
     return (
         `<dl class="config">` +
         cells
             .map(
                 ([k, v]) =>
-                    `<div><dt>${escapeHtml(k)}</dt><dd>${escapeHtml(String(v))}</dd></div>`
+                    `<div><dt>${escapeHtml(k)}</dt><dd data-config-key="${slug(k)}">${escapeHtml(String(v))}</dd></div>`
             )
             .join("") +
         `</dl>`
@@ -1050,9 +1054,23 @@ export const renderDashboard = ({
   window.addEventListener("load", openTarget)
 })();
 
-// In-flight panel: tick the elapsed text every second (smooth) and poll
-// GET /inflight every 2s (authoritative — adds/removes running reviews).
+// Live dashboard updates (v0.1.37):
+//
+//   * Tick: every 1s, recompute each in-flight row's elapsed text from
+//     its data-started attribute so the timer climbs smoothly between
+//     polls.
+//   * Poll: every 2s, GET /inflight; render the in-flight rows. If the
+//     count DROPPED (a review just finished), trigger a section
+//     refresh so the timeline / charts / reviews / failed grids pick
+//     up the new archive entry without a full page reload.
+//   * Controls: provider switcher PUTs /dashboard/provider and pokes
+//     the live PROVIDER value cell in the active-config grid; reset
+//     button POSTs /dashboard/reset and refreshes sections afterwards.
+//   * Both poll-driven refreshes and reset triggers share the same
+//     refreshSections() which fetches GET / and swaps selected
+//     sections by aria-label, re-wiring controls after the swap.
 (function () {
+  /* ---------- helpers ---------- */
   function fmtElapsed(ms) {
     var s = Math.max(0, Math.floor(ms / 1000));
     if (s < 60) return s + "s";
@@ -1077,6 +1095,12 @@ export const renderDashboard = ({
       '<span class="if-elapsed">' + esc(fmtElapsed(r.elapsedMs)) + "</span></div>"
     );
   }
+
+  /* ---------- in-flight: tick + poll, with completion-triggered refresh ---------- */
+  var lastInflightCount = (function () {
+    var c = document.getElementById("inflight-count");
+    return c ? Number(c.textContent) || 0 : 0;
+  })();
   function tick() {
     var now = Date.now();
     document.querySelectorAll(".inflight-row").forEach(function (row) {
@@ -1085,89 +1109,145 @@ export const renderDashboard = ({
       if (started && el) el.textContent = fmtElapsed(now - started);
     });
   }
-  function render(list) {
+  function renderInflight(list) {
     var body = document.getElementById("inflight-body");
     var count = document.getElementById("inflight-count");
     if (!body) return;
+    var prev = lastInflightCount;
     if (count) count.textContent = list.length;
     body.innerHTML = list.length
       ? list.map(rowHtml).join("")
       : '<div class="empty">no reviews in flight</div>';
+    if (list.length < prev) {
+      // A review just finished → pull fresh archive / metrics into
+      // the timeline, pies, and review lists.
+      refreshSections();
+    }
+    lastInflightCount = list.length;
   }
   function poll() {
     fetch("/inflight", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (j) { if (j && Array.isArray(j.inFlight)) render(j.inFlight); })
+      .then(function (j) { if (j && Array.isArray(j.inFlight)) renderInflight(j.inFlight); })
       .catch(function () {});
   }
-  setInterval(tick, 1000);
-  setInterval(poll, 2000);
-})();
 
-// Dashboard controls (v0.1.35): provider switcher + reset counter
-// button. Both POST to /dashboard/* localhost-only convenience routes.
-(function () {
-  var statusEl = document.getElementById("controls-status");
-  var statusTimer = null;
+  /* ---------- section refresh (fetches / and swaps in-place) ---------- */
+  var refreshing = false;
+  function refreshSections() {
+    if (refreshing) return;
+    refreshing = true;
+    fetch("/", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.text() : null; })
+      .then(function (text) {
+        if (!text) return;
+        var doc = new DOMParser().parseFromString(text, "text/html");
+        // Stable sections that have no JS-attached listeners — swap
+        // wholesale by aria-label.
+        ["charts", "timeline", "reviews", "failed"].forEach(function (label) {
+          var sel = 'section[aria-label="' + label + '"]';
+          var fresh = doc.querySelector(sel);
+          var cur = document.querySelector(sel);
+          if (fresh && cur) cur.replaceWith(fresh);
+        });
+        // Active config: refresh the config grid (provider/model
+        // mirror) and the controls bar (contexts dropdown may have
+        // grown). The in-flight slot is NOT touched here — it's
+        // driven by the /inflight poll and replacing it would race
+        // with whatever the latest tick rendered.
+        var freshCfg = doc.querySelector(".config-row .config");
+        var curCfg = document.querySelector(".config-row .config");
+        if (freshCfg && curCfg) curCfg.replaceWith(freshCfg);
+        var freshCtrl = doc.querySelector(".controls");
+        var curCtrl = document.querySelector(".controls");
+        if (freshCtrl && curCtrl) {
+          curCtrl.replaceWith(freshCtrl);
+          wireControls();
+        }
+      })
+      .catch(function () {})
+      .finally(function () { refreshing = false; });
+  }
+
+  /* ---------- controls: provider switcher + reset button ---------- */
   function setStatus(msg, ok) {
-    if (!statusEl) return;
-    statusEl.textContent = msg;
-    statusEl.className = "status " + (ok ? "ok" : "err");
-    if (statusTimer) clearTimeout(statusTimer);
-    statusTimer = setTimeout(function () {
-      statusEl.textContent = "";
-      statusEl.className = "status";
+    var el = document.getElementById("controls-status");
+    if (!el) return;
+    el.textContent = msg;
+    el.className = "status " + (ok ? "ok" : "err");
+    if (setStatus._t) clearTimeout(setStatus._t);
+    setStatus._t = setTimeout(function () {
+      var e = document.getElementById("controls-status");
+      if (e) { e.textContent = ""; e.className = "status"; }
     }, 4000);
   }
   function bodyToOk(r) {
     return r.json().then(function (j) { return { ok: r.ok, j: j }; });
   }
-  var provSel = document.getElementById("provider-select");
-  if (provSel) {
-    provSel.addEventListener("change", function () {
-      var picked = provSel.value;
-      fetch("/dashboard/provider", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ provider: picked }),
-      })
-        .then(bodyToOk)
-        .then(function (r) {
-          if (r.ok) {
-            setStatus("provider → " + (r.j.provider || picked) +
-              (r.j.persisted ? "" : " (in-memory only)"), true);
-          } else {
-            setStatus("error: " + (r.j.error || "failed"), false);
-          }
-        })
-        .catch(function (e) { setStatus("error: " + e.message, false); });
-    });
+  function updateProviderCell(p) {
+    var cell = document.querySelector('[data-config-key="provider"]');
+    if (cell) cell.textContent = p;
   }
-  var resetBtn = document.getElementById("reset-button");
-  var resetSel = document.getElementById("reset-context-select");
-  if (resetBtn && resetSel) {
-    resetBtn.addEventListener("click", function () {
-      var contextKey = resetSel.value;
-      if (!contextKey) { setStatus("no context selected", false); return; }
-      resetBtn.disabled = true;
-      fetch("/dashboard/reset", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ contextKey: contextKey }),
-      })
-        .then(bodyToOk)
-        .then(function (r) {
-          if (r.ok) {
-            var c = r.j.context || {};
-            setStatus("reset " + (c.repo || "?") + ":" + (c.branch || "?"), true);
-          } else {
-            setStatus("error: " + (r.j.reason || r.j.error || "failed"), false);
-          }
+  function wireControls() {
+    var ps = document.getElementById("provider-select");
+    if (ps) {
+      ps.addEventListener("change", function () {
+        var picked = ps.value;
+        fetch("/dashboard/provider", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ provider: picked }),
         })
-        .catch(function (e) { setStatus("error: " + e.message, false); })
-        .finally(function () { resetBtn.disabled = false; });
-    });
+          .then(bodyToOk)
+          .then(function (r) {
+            if (r.ok) {
+              // Update the PROVIDER value cell in the active-config
+              // grid right away so the UI stays consistent without
+              // waiting for the next section refresh.
+              updateProviderCell(r.j.provider || picked);
+              setStatus("provider → " + (r.j.provider || picked) +
+                (r.j.persisted ? "" : " (in-memory only)"), true);
+            } else {
+              setStatus("error: " + (r.j.error || "failed"), false);
+            }
+          })
+          .catch(function (e) { setStatus("error: " + e.message, false); });
+      });
+    }
+    var rb = document.getElementById("reset-button");
+    var rs = document.getElementById("reset-context-select");
+    if (rb && rs) {
+      rb.addEventListener("click", function () {
+        var contextKey = rs.value;
+        if (!contextKey) { setStatus("no context selected", false); return; }
+        rb.disabled = true;
+        fetch("/dashboard/reset", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ contextKey: contextKey }),
+        })
+          .then(bodyToOk)
+          .then(function (r) {
+            if (r.ok) {
+              var c = r.j.context || {};
+              setStatus("reset " + (c.repo || "?") + ":" + (c.branch || "?"), true);
+              refreshSections();
+            } else {
+              setStatus("error: " + (r.j.reason || r.j.error || "failed"), false);
+            }
+          })
+          .catch(function (e) { setStatus("error: " + e.message, false); })
+          .finally(function () {
+            var nb = document.getElementById("reset-button");
+            if (nb) nb.disabled = false;
+          });
+      });
+    }
   }
+
+  wireControls();
+  setInterval(tick, 1000);
+  setInterval(poll, 2000);
 })();
 </script>
 </body>

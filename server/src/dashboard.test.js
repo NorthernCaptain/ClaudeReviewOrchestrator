@@ -263,7 +263,7 @@ describe("renderDashboard", () => {
             config: baseConfig(),
             records: [],
         })
-        expect(html).toMatch(/hook fetch timeout<\/dt><dd>auto/)
+        expect(html).toMatch(/hook fetch timeout<\/dt><dd[^>]*>auto/)
     })
 
     test("successful row with findings renders each as a <li> with severity badge", () => {
@@ -899,5 +899,49 @@ describe("renderControls (v0.1.35)", () => {
         expect(ac).toBeGreaterThan(-1)
         expect(ctrl).toBeGreaterThan(ac)
         expect(ctrl).toBeLessThan(charts)
+    })
+})
+
+describe("live updates (v0.1.37)", () => {
+    test("config cells carry data-config-key so the provider can be poked in place", () => {
+        const html = renderDashboard({
+            version: "0.1.37",
+            config: { provider: "gemini", model: "auto" },
+            records: [],
+        })
+        expect(html).toMatch(/<dd data-config-key="provider">gemini<\/dd>/)
+        expect(html).toMatch(/<dd data-config-key="model">auto<\/dd>/)
+    })
+
+    test("client script wires section refresh on in-flight count drop", () => {
+        const html = renderDashboard({ version: "x", records: [] })
+        // The in-flight render compares list.length to the previous
+        // count and calls refreshSections on a drop.
+        expect(html).toContain("list.length < prev")
+        expect(html).toContain("refreshSections()")
+        // refreshSections fetches the dashboard HTML and swaps the
+        // archive-dependent sections by aria-label.
+        expect(html).toContain('fetch("/", { cache: "no-store" })')
+        for (const section of ["charts", "timeline", "reviews", "failed"]) {
+            expect(html).toContain(`"${section}"`)
+        }
+    })
+
+    test("provider switcher updates the PROVIDER value cell in place", () => {
+        const html = renderDashboard({ version: "x", records: [] })
+        // The success handler pokes [data-config-key="provider"] with
+        // the new value so the active-config grid stays in sync.
+        expect(html).toContain('data-config-key="provider"')
+        expect(html).toContain("updateProviderCell(")
+    })
+
+    test("reset button also triggers a section refresh on success", () => {
+        const html = renderDashboard({ version: "x", records: [] })
+        // The reset success branch must call refreshSections so the
+        // counters / timeline mirror the cleared state.
+        const resetIdx = html.indexOf('/dashboard/reset')
+        expect(resetIdx).toBeGreaterThan(-1)
+        const refreshIdx = html.indexOf("refreshSections()", resetIdx)
+        expect(refreshIdx).toBeGreaterThan(resetIdx)
     })
 })
