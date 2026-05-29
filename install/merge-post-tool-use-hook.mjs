@@ -73,29 +73,65 @@ export const mergePostToolUseHook = ({
         ? hooks.PostToolUse.map((m) => m)
         : []
 
-    // Operate at the hook-entry level inside each matcher block —
-    // never blow away a sibling command the user put alongside ours.
+    // Plan:
+    //   1. Remove our hook from any block whose matcher is NOT
+    //      `matcherPattern` (preserving any sibling hooks in that
+    //      block; dropping empty blocks). Otherwise an old/stale
+    //      matcher like "Write|Edit" would silently leave us off
+    //      MultiEdit — the bug codex flagged.
+    //   2. Locate (or create) a canonical block whose matcher IS
+    //      `matcherPattern`; refresh / append our entry there.
+    //      Sibling hooks already inside that canonical block stay.
     let changed = false
-    let found = false
-    for (let i = 0; i < list.length; i++) {
-        const block = list[i]
-        if (!isObj(block) || !Array.isArray(block.hooks)) continue
-        const hookIdx = block.hooks.findIndex((h) => h?.command === hookPath)
-        if (hookIdx === -1) continue
-        found = true
-        const existingEntry = block.hooks[hookIdx]
-        if (JSON.stringify(existingEntry) !== JSON.stringify(ourEntry)) {
-            const nextHooks = block.hooks.slice()
-            nextHooks[hookIdx] = ourEntry
-            list[i] = { ...block, hooks: nextHooks }
-            changed = true
+    const reindexed = []
+    for (const block of list) {
+        if (!isObj(block) || !Array.isArray(block.hooks)) {
+            reindexed.push(block)
+            continue
         }
-        break
-    }
-    if (!found) {
-        list.push(ourMatcher)
+        const isCanonical = block.matcher === matcherPattern
+        const hasOurs = block.hooks.some((h) => h?.command === hookPath)
+        if (!hasOurs || isCanonical) {
+            reindexed.push(block)
+            continue
+        }
+        // Wrong-matcher block: strip our hook, keep the rest.
+        const kept = block.hooks.filter((h) => h?.command !== hookPath)
+        if (kept.length > 0) {
+            reindexed.push({ ...block, hooks: kept })
+        }
+        // else: block emptied by our removal — drop it.
         changed = true
     }
+
+    let canonicalIdx = reindexed.findIndex(
+        (b) => isObj(b) && b.matcher === matcherPattern
+    )
+    if (canonicalIdx === -1) {
+        reindexed.push(ourMatcher)
+        changed = true
+    } else {
+        const block = reindexed[canonicalIdx]
+        const blockHooks = Array.isArray(block.hooks) ? block.hooks : []
+        const hookIdx = blockHooks.findIndex((h) => h?.command === hookPath)
+        if (hookIdx === -1) {
+            reindexed[canonicalIdx] = {
+                ...block,
+                hooks: [...blockHooks, ourEntry],
+            }
+            changed = true
+        } else if (
+            JSON.stringify(blockHooks[hookIdx]) !== JSON.stringify(ourEntry)
+        ) {
+            const nextHooks = blockHooks.slice()
+            nextHooks[hookIdx] = ourEntry
+            reindexed[canonicalIdx] = { ...block, hooks: nextHooks }
+            changed = true
+        }
+    }
+    // Replace `list` content in place with the new layout.
+    list.length = 0
+    list.push(...reindexed)
 
     if (!changed) {
         return { action: "unchanged", path: settingsPath }

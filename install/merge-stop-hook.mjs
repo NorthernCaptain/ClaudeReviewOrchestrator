@@ -82,33 +82,65 @@ export const mergeStopHook = ({
         }
     }
 
+    const matcherPattern = ""
     const hooks = isObj(root.hooks) ? { ...root.hooks } : {}
     const stopList = Array.isArray(hooks.Stop) ? hooks.Stop.map((m) => m) : []
 
-    // Find OUR command inside each block's hooks[] — operate at the
-    // hook-entry level, not the matcher-block level, so co-located
-    // user hooks in the same matcher block are preserved.
+    // Plan:
+    //   1. Remove our hook from any block whose matcher is NOT the
+    //      canonical "" (preserving siblings; dropping empty blocks).
+    //      A user who tucked our hook under a narrow matcher would
+    //      otherwise stop firing on Stop events that don't match.
+    //   2. Locate (or create) a block whose matcher IS "" and
+    //      refresh / append our entry there. Sibling hooks already
+    //      inside the canonical block stay.
     let changed = false
-    let found = false
-    for (let i = 0; i < stopList.length; i++) {
-        const block = stopList[i]
-        if (!isObj(block) || !Array.isArray(block.hooks)) continue
-        const hookIdx = block.hooks.findIndex((h) => h?.command === hookPath)
-        if (hookIdx === -1) continue
-        found = true
-        const existingEntry = block.hooks[hookIdx]
-        if (JSON.stringify(existingEntry) !== JSON.stringify(ourEntry)) {
-            const nextHooks = block.hooks.slice()
-            nextHooks[hookIdx] = ourEntry
-            stopList[i] = { ...block, hooks: nextHooks }
-            changed = true
+    const reindexed = []
+    for (const block of stopList) {
+        if (!isObj(block) || !Array.isArray(block.hooks)) {
+            reindexed.push(block)
+            continue
         }
-        break
-    }
-    if (!found) {
-        stopList.push(ourMatcher)
+        const isCanonical = block.matcher === matcherPattern
+        const hasOurs = block.hooks.some((h) => h?.command === hookPath)
+        if (!hasOurs || isCanonical) {
+            reindexed.push(block)
+            continue
+        }
+        const kept = block.hooks.filter((h) => h?.command !== hookPath)
+        if (kept.length > 0) {
+            reindexed.push({ ...block, hooks: kept })
+        }
         changed = true
     }
+
+    let canonicalIdx = reindexed.findIndex(
+        (b) => isObj(b) && b.matcher === matcherPattern
+    )
+    if (canonicalIdx === -1) {
+        reindexed.push(ourMatcher)
+        changed = true
+    } else {
+        const block = reindexed[canonicalIdx]
+        const blockHooks = Array.isArray(block.hooks) ? block.hooks : []
+        const hookIdx = blockHooks.findIndex((h) => h?.command === hookPath)
+        if (hookIdx === -1) {
+            reindexed[canonicalIdx] = {
+                ...block,
+                hooks: [...blockHooks, ourEntry],
+            }
+            changed = true
+        } else if (
+            JSON.stringify(blockHooks[hookIdx]) !== JSON.stringify(ourEntry)
+        ) {
+            const nextHooks = blockHooks.slice()
+            nextHooks[hookIdx] = ourEntry
+            reindexed[canonicalIdx] = { ...block, hooks: nextHooks }
+            changed = true
+        }
+    }
+    stopList.length = 0
+    stopList.push(...reindexed)
 
     if (!changed) {
         return { action: "unchanged", path: settingsPath }

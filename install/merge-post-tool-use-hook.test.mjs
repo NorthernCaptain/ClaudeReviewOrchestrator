@@ -101,12 +101,12 @@ describe("mergePostToolUseHook", () => {
         expect(r.action).toBe("unchanged")
     })
 
-    test("refreshes our hook entry's shape but leaves the user's matcher pattern intact", () => {
-        // If a user widened or narrowed the matcher pattern, the
-        // installer treats that as deliberate and only updates OUR
-        // hook entry (type / command / timeout) inside the block.
-        // The codex sibling-preservation contract demands we never
-        // overwrite a whole block we didn't author.
+    test("a stale matcher (only our hook in the block) is migrated to the canonical pattern", () => {
+        // If the block contains ONLY our hook, the matcher pattern is
+        // the installer's contract, not the user's — so a stale
+        // "Write|Edit" block (missing MultiEdit) gets the matcher
+        // refreshed. Without this, the change-notification fast path
+        // silently stops firing on MultiEdit operations.
         const p = path.join(dir, "settings.json")
         writeFileSync(
             p,
@@ -114,12 +114,12 @@ describe("mergePostToolUseHook", () => {
                 hooks: {
                     PostToolUse: [
                         {
-                            matcher: "Write|Edit", // user-customized pattern
+                            matcher: "Write|Edit",
                             hooks: [
                                 {
                                     type: "command",
                                     command: HOOK,
-                                    timeout: 999, // stale
+                                    timeout: 999,
                                 },
                             ],
                         },
@@ -130,7 +130,90 @@ describe("mergePostToolUseHook", () => {
         const r = mergePostToolUseHook({ settingsPath: p, hookPath: HOOK })
         expect(r.action).toBe("updated")
         const s = JSON.parse(readFileSync(p, "utf8"))
-        expect(s.hooks.PostToolUse[0].matcher).toBe("Write|Edit")
+        expect(s.hooks.PostToolUse).toHaveLength(1)
+        expect(s.hooks.PostToolUse[0].matcher).toBe("Write|Edit|MultiEdit")
+        expect(s.hooks.PostToolUse[0].hooks[0].timeout).toBe(3000)
+    })
+
+    test("our hook in a WRONG-matcher block alongside a sibling: hook moves to canonical block, sibling stays", () => {
+        // The wrong-matcher block keeps its sibling under its
+        // original matcher (the user grouped intentionally); our
+        // hook moves to a fresh / existing block with the canonical
+        // matcherPattern.
+        const p = path.join(dir, "settings.json")
+        const sibling = {
+            type: "command",
+            command: "/users/x/their-bash-hook.sh",
+            timeout: 5000,
+        }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        {
+                            matcher: "Bash",
+                            hooks: [
+                                sibling,
+                                {
+                                    type: "command",
+                                    command: HOOK,
+                                    timeout: 1,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergePostToolUseHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        // Two blocks now: the Bash block (siblings only) and our
+        // canonical Write|Edit|MultiEdit block (our hook only).
+        expect(s.hooks.PostToolUse).toHaveLength(2)
+        const bashBlock = s.hooks.PostToolUse.find((b) => b.matcher === "Bash")
+        const ourBlock = s.hooks.PostToolUse.find(
+            (b) => b.matcher === "Write|Edit|MultiEdit"
+        )
+        expect(bashBlock.hooks).toEqual([sibling])
+        expect(ourBlock.hooks).toHaveLength(1)
+        expect(ourBlock.hooks[0].command).toBe(HOOK)
+        expect(ourBlock.hooks[0].timeout).toBe(3000)
+    })
+
+    test("wrong-matcher block + existing canonical block: hook merges into canonical, wrong block emptied/dropped", () => {
+        const p = path.join(dir, "settings.json")
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        {
+                            matcher: "Bash",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: HOOK,
+                                    timeout: 1,
+                                },
+                            ],
+                        },
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [],
+                        },
+                    ],
+                },
+            })
+        )
+        mergePostToolUseHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        // Bash block had only our hook → emptied → dropped.
+        // Canonical block gains our hook.
+        expect(s.hooks.PostToolUse).toHaveLength(1)
+        expect(s.hooks.PostToolUse[0].matcher).toBe("Write|Edit|MultiEdit")
+        expect(s.hooks.PostToolUse[0].hooks).toHaveLength(1)
+        expect(s.hooks.PostToolUse[0].hooks[0].command).toBe(HOOK)
         expect(s.hooks.PostToolUse[0].hooks[0].timeout).toBe(3000)
     })
 
