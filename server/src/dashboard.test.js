@@ -884,6 +884,49 @@ describe("renderControls (v0.1.35)", () => {
         expect(html).not.toContain("<x>:b&b")
     })
 
+    test("pre-selects the context with the most recent lastReviewedAt (v1.0.6)", () => {
+        // Three contexts; "b:main" was reviewed most recently.
+        const html = renderControls("codex", [
+            { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 100 },
+            { key: "/b|main", repo: "b", repoRoot: "/b", branch: "main", lastReviewedAt: 500 },
+            { key: "/c|main", repo: "c", repoRoot: "/c", branch: "main", lastReviewedAt: 200 },
+        ])
+        // Exactly one CONTEXT <option> carries `selected` (filtered by
+        // value-starts-with-/ to exclude the provider-select options
+        // above the reset dropdown).
+        const selected = [
+            ...html.matchAll(
+                /<option value="(\/[^"]+)" selected>([^<]+)<\/option>/g
+            ),
+        ]
+        expect(selected).toHaveLength(1)
+        expect(selected[0][1]).toBe("/b|main")
+        expect(selected[0][2]).toBe("b:main")
+    })
+
+    test("falls back to no preselection when no context has been reviewed yet", () => {
+        const html = renderControls("codex", [
+            { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 0 },
+            { key: "/b|main", repo: "b", repoRoot: "/b", branch: "main" }, // undefined
+        ])
+        // No context-option carries `selected`. (Provider options DO
+        // carry one — filter by value pattern starting with `/`.)
+        const ctxSelected = [
+            ...html.matchAll(/<option value="(\/[^"]+)" selected>/g),
+        ]
+        expect(ctxSelected).toHaveLength(0)
+    })
+
+    test("ties broken by sort order: most recent wins even when alphabetically later", () => {
+        // "/z|main" is alphabetically last but most recent — pre-select it.
+        const html = renderControls("codex", [
+            { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 50 },
+            { key: "/z|main", repo: "z", repoRoot: "/z", branch: "main", lastReviewedAt: 999 },
+        ])
+        expect(html).toMatch(/<option value="\/z\|main" selected>z:main<\/option>/)
+        expect(html).not.toMatch(/<option value="\/a\|main" selected>/)
+    })
+
     test("rendered into the active config section by renderDashboard", () => {
         const html = renderDashboard({
             version: "0.1.35",

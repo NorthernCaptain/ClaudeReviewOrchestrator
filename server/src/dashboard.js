@@ -558,6 +558,20 @@ export const renderControls = (currentProvider, contexts = []) => {
     const sorted = [...(contexts ?? [])].sort((a, b) =>
         String(a.key ?? "").localeCompare(String(b.key ?? ""))
     )
+    // Pre-select the most recently reviewed context — that's almost
+    // always the one the user just finished working on, so a click on
+    // Reset targets the right repo+branch without a manual scroll.
+    // Falls back to no selection when no context has been reviewed yet
+    // (lastReviewedAt is 0 for fresh / reset-cleared contexts).
+    let mostRecentKey = null
+    let mostRecentTs = 0
+    for (const c of sorted) {
+        const ts = Number(c?.lastReviewedAt) || 0
+        if (ts > mostRecentTs) {
+            mostRecentTs = ts
+            mostRecentKey = c.key
+        }
+    }
     const ctxOpts = sorted.length
         ? sorted
               .map((c) => {
@@ -572,7 +586,8 @@ export const renderControls = (currentProvider, contexts = []) => {
                   const label = escapeHtml(
                       `${c.repo ?? (c.repoRoot ?? "").split("/").pop() ?? "?"}:${c.branch ?? "?"}`
                   )
-                  return `<option value="${value}">${label}</option>`
+                  const sel = c.key === mostRecentKey ? " selected" : ""
+                  return `<option value="${value}"${sel}>${label}</option>`
               })
               .join("")
         : `<option value="">(no contexts)</option>`

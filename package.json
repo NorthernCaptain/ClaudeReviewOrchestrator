@@ -1,6 +1,6 @@
 {
     "name": "review-orchestrator",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "private": true,
     "description": "Local code-review orchestrator for Claude Code, using Codex CLI as a meticulous read-only reviewer.",
     "type": "module",
