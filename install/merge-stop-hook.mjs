@@ -86,59 +86,62 @@ export const mergeStopHook = ({
     const hooks = isObj(root.hooks) ? { ...root.hooks } : {}
     const stopList = Array.isArray(hooks.Stop) ? hooks.Stop.map((m) => m) : []
 
-    // Plan:
-    //   1. Remove our hook from any block whose matcher is NOT the
-    //      canonical "" (preserving siblings; dropping empty blocks).
-    //      A user who tucked our hook under a narrow matcher would
-    //      otherwise stop firing on Stop events that don't match.
-    //   2. Locate (or create) a block whose matcher IS "" and
-    //      refresh / append our entry there. Sibling hooks already
-    //      inside the canonical block stay.
+    // Same plan as the PostToolUse merger (see notes there). Summary:
+    //   1. Prefer a canonical (matcher === "") block that already
+    //      contains our hook; fall back to the first canonical block;
+    //      fall back to appending a fresh one. ONE preferred home.
+    //   2. Strip our hook from every other block (canonical or not),
+    //      preserving siblings and dropping emptied blocks. This
+    //      collapses the duplicate-install case where a stop event
+    //      fires twice because two canonical blocks each contain our
+    //      hook.
+    //   3. Refresh / append our entry inside the preferred block.
+    const isCanonical = (b) => isObj(b) && b.matcher === matcherPattern
+    const hasOurs = (b) =>
+        Array.isArray(b?.hooks) && b.hooks.some((h) => h?.command === hookPath)
+    let preferredIdx = stopList.findIndex((b) => isCanonical(b) && hasOurs(b))
+    if (preferredIdx === -1) preferredIdx = stopList.findIndex(isCanonical)
+    const preferredRef = preferredIdx !== -1 ? stopList[preferredIdx] : null
+
     let changed = false
     const reindexed = []
-    for (const block of stopList) {
-        if (!isObj(block) || !Array.isArray(block.hooks)) {
+    stopList.forEach((block, i) => {
+        if (i === preferredIdx) {
             reindexed.push(block)
-            continue
+            return
         }
-        const isCanonical = block.matcher === matcherPattern
-        const hasOurs = block.hooks.some((h) => h?.command === hookPath)
-        if (!hasOurs || isCanonical) {
+        if (!isObj(block) || !Array.isArray(block.hooks) || !hasOurs(block)) {
             reindexed.push(block)
-            continue
+            return
         }
         const kept = block.hooks.filter((h) => h?.command !== hookPath)
         if (kept.length > 0) {
             reindexed.push({ ...block, hooks: kept })
         }
         changed = true
-    }
+    })
 
-    let canonicalIdx = reindexed.findIndex(
-        (b) => isObj(b) && b.matcher === matcherPattern
-    )
-    if (canonicalIdx === -1) {
-        reindexed.push(ourMatcher)
-        changed = true
-    } else {
-        const block = reindexed[canonicalIdx]
+    if (preferredRef) {
+        const where = reindexed.indexOf(preferredRef)
+        const block = reindexed[where]
         const blockHooks = Array.isArray(block.hooks) ? block.hooks : []
         const hookIdx = blockHooks.findIndex((h) => h?.command === hookPath)
         if (hookIdx === -1) {
-            reindexed[canonicalIdx] = {
-                ...block,
-                hooks: [...blockHooks, ourEntry],
-            }
+            reindexed[where] = { ...block, hooks: [...blockHooks, ourEntry] }
             changed = true
         } else if (
             JSON.stringify(blockHooks[hookIdx]) !== JSON.stringify(ourEntry)
         ) {
             const nextHooks = blockHooks.slice()
             nextHooks[hookIdx] = ourEntry
-            reindexed[canonicalIdx] = { ...block, hooks: nextHooks }
+            reindexed[where] = { ...block, hooks: nextHooks }
             changed = true
         }
+    } else {
+        reindexed.push(ourMatcher)
+        changed = true
     }
+
     stopList.length = 0
     stopList.push(...reindexed)
 

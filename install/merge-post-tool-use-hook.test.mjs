@@ -286,3 +286,91 @@ describe("mergePostToolUseHook", () => {
         expect(() => readFileSync(`${p}.bak.ts2`)).toThrow()
     })
 })
+
+describe("mergePostToolUseHook — multiple canonical blocks (v1.0.5)", () => {
+    let dir
+    beforeEach(() => {
+        dir = mkdtempSync(path.join(tmpdir(), "merge-ptu-hook-dup-"))
+    })
+    afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+    test("user's matching-pattern block + installer's matching-pattern block: our hook lands in exactly ONE", () => {
+        // Old install layout: user already had their own
+        // Write|Edit|MultiEdit block; the installer appended ANOTHER
+        // canonical block with our hook. Reinstalling needs to
+        // collapse to one home for our hook.
+        const p = path.join(dir, "settings.json")
+        const userSibling = {
+            type: "command",
+            command: "/users/x/their-tool",
+            timeout: 1000,
+        }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        // User's own canonical block.
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [userSibling],
+                        },
+                        // Installer-owned canonical block with our hook.
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: HOOK,
+                                    timeout: 999,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergePostToolUseHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        const occurrences = s.hooks.PostToolUse.flatMap((b) => b.hooks).filter(
+            (h) => h.command === HOOK
+        )
+        expect(occurrences).toHaveLength(1)
+        expect(occurrences[0].timeout).toBe(3000)
+        // User's sibling block still has its sibling, no leak of our hook.
+        const userBlock = s.hooks.PostToolUse.find((b) =>
+            b.hooks.some((h) => h.command === userSibling.command)
+        )
+        expect(userBlock.hooks).toEqual([userSibling])
+    })
+
+    test("two canonical blocks both with our hook: dedupe to one and drop the now-empty dupe", () => {
+        const p = path.join(dir, "settings.json")
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [
+                                { type: "command", command: HOOK, timeout: 1 },
+                            ],
+                        },
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [
+                                { type: "command", command: HOOK, timeout: 2 },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergePostToolUseHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.PostToolUse).toHaveLength(1)
+        expect(s.hooks.PostToolUse[0].hooks).toHaveLength(1)
+        expect(s.hooks.PostToolUse[0].hooks[0].timeout).toBe(3000)
+    })
+})

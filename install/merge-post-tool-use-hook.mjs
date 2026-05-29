@@ -74,62 +74,63 @@ export const mergePostToolUseHook = ({
         : []
 
     // Plan:
-    //   1. Remove our hook from any block whose matcher is NOT
-    //      `matcherPattern` (preserving any sibling hooks in that
-    //      block; dropping empty blocks). Otherwise an old/stale
-    //      matcher like "Write|Edit" would silently leave us off
-    //      MultiEdit — the bug codex flagged.
-    //   2. Locate (or create) a canonical block whose matcher IS
-    //      `matcherPattern`; refresh / append our entry there.
-    //      Sibling hooks already inside that canonical block stay.
+    //   1. Pick ONE preferred home for our hook — a canonical-matcher
+    //      block that already contains it; failing that, the first
+    //      canonical block; failing that, append a new one.
+    //   2. Strip our hook from every OTHER block (canonical or not).
+    //      Siblings inside those blocks stay; blocks emptied by the
+    //      strip are dropped. This collapses the duplicate-install
+    //      case (an installer-owned block + a user-owned canonical
+    //      block both containing our hook → two Stop hook fires).
+    //   3. Refresh our entry inside the preferred block to the
+    //      current { type, command, timeout } shape; append it if the
+    //      preferred block is canonical but doesn't yet contain it.
+    const isCanonical = (b) => isObj(b) && b.matcher === matcherPattern
+    const hasOurs = (b) =>
+        Array.isArray(b?.hooks) && b.hooks.some((h) => h?.command === hookPath)
+    let preferredIdx = list.findIndex((b) => isCanonical(b) && hasOurs(b))
+    if (preferredIdx === -1) preferredIdx = list.findIndex(isCanonical)
+    const preferredRef = preferredIdx !== -1 ? list[preferredIdx] : null
+
     let changed = false
     const reindexed = []
-    for (const block of list) {
-        if (!isObj(block) || !Array.isArray(block.hooks)) {
+    list.forEach((block, i) => {
+        if (i === preferredIdx) {
             reindexed.push(block)
-            continue
+            return
         }
-        const isCanonical = block.matcher === matcherPattern
-        const hasOurs = block.hooks.some((h) => h?.command === hookPath)
-        if (!hasOurs || isCanonical) {
+        if (!isObj(block) || !Array.isArray(block.hooks) || !hasOurs(block)) {
             reindexed.push(block)
-            continue
+            return
         }
-        // Wrong-matcher block: strip our hook, keep the rest.
         const kept = block.hooks.filter((h) => h?.command !== hookPath)
         if (kept.length > 0) {
             reindexed.push({ ...block, hooks: kept })
         }
-        // else: block emptied by our removal — drop it.
         changed = true
-    }
+    })
 
-    let canonicalIdx = reindexed.findIndex(
-        (b) => isObj(b) && b.matcher === matcherPattern
-    )
-    if (canonicalIdx === -1) {
-        reindexed.push(ourMatcher)
-        changed = true
-    } else {
-        const block = reindexed[canonicalIdx]
+    if (preferredRef) {
+        const where = reindexed.indexOf(preferredRef)
+        const block = reindexed[where]
         const blockHooks = Array.isArray(block.hooks) ? block.hooks : []
         const hookIdx = blockHooks.findIndex((h) => h?.command === hookPath)
         if (hookIdx === -1) {
-            reindexed[canonicalIdx] = {
-                ...block,
-                hooks: [...blockHooks, ourEntry],
-            }
+            reindexed[where] = { ...block, hooks: [...blockHooks, ourEntry] }
             changed = true
         } else if (
             JSON.stringify(blockHooks[hookIdx]) !== JSON.stringify(ourEntry)
         ) {
             const nextHooks = blockHooks.slice()
             nextHooks[hookIdx] = ourEntry
-            reindexed[canonicalIdx] = { ...block, hooks: nextHooks }
+            reindexed[where] = { ...block, hooks: nextHooks }
             changed = true
         }
+    } else {
+        reindexed.push(ourMatcher)
+        changed = true
     }
-    // Replace `list` content in place with the new layout.
+
     list.length = 0
     list.push(...reindexed)
 

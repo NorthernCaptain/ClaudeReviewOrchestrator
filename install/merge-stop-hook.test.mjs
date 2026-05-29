@@ -167,6 +167,88 @@ describe("mergeStopHook", () => {
         expect(s.hooks.Stop[0].hooks[1].timeout).toBe(720000)
     })
 
+    test("multiple canonical blocks: keeps our hook in ONE block, strips dupes from the rest", () => {
+        // The duplicate-install regression: a user-owned empty-matcher
+        // Stop block existed before our installer ran (so the
+        // installer appended a second empty-matcher block with our
+        // hook). Reinstalling on this layout used to leave both,
+        // causing the Stop event to run our hook twice.
+        const p = path.join(dir, "settings.json")
+        const userSibling = {
+            type: "command",
+            command: "/users/x/user-stop.sh",
+            timeout: 1000,
+        }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    Stop: [
+                        // User's own empty-matcher block (no overlap
+                        // with ours).
+                        { matcher: "", hooks: [userSibling] },
+                        // Installer-owned empty-matcher block with
+                        // our hook — should remain THE home.
+                        {
+                            matcher: "",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: HOOK,
+                                    timeout: 60000,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergeStopHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        // Both blocks remain (user's separate group untouched), but
+        // our hook lives in exactly ONE of them now.
+        const occurrences = s.hooks.Stop.flatMap((b) => b.hooks).filter(
+            (h) => h.command === HOOK
+        )
+        expect(occurrences).toHaveLength(1)
+        expect(occurrences[0].timeout).toBe(720000)
+        // The user's sibling block still has only the sibling.
+        const userBlock = s.hooks.Stop.find((b) =>
+            b.hooks.some((h) => h.command === userSibling.command)
+        )
+        expect(userBlock.hooks).toEqual([userSibling])
+    })
+
+    test("two canonical blocks both containing our hook: deduplicate to one, drop the emptied dupe", () => {
+        const p = path.join(dir, "settings.json")
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    Stop: [
+                        {
+                            matcher: "",
+                            hooks: [
+                                { type: "command", command: HOOK, timeout: 1 },
+                            ],
+                        },
+                        {
+                            matcher: "",
+                            hooks: [
+                                { type: "command", command: HOOK, timeout: 2 },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergeStopHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.Stop).toHaveLength(1)
+        expect(s.hooks.Stop[0].hooks).toHaveLength(1)
+        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(720000)
+    })
+
     test("writes a backup only when bytes change", () => {
         const p = path.join(dir, "settings.json")
         writeFileSync(p, JSON.stringify({ hooks: { Stop: [] } }))
