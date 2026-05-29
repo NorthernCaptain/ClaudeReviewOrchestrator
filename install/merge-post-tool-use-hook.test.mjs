@@ -344,6 +344,41 @@ describe("mergePostToolUseHook — multiple canonical blocks (v1.0.5)", () => {
         expect(userBlock.hooks).toEqual([userSibling])
     })
 
+    test("within-block dedupe: one canonical block listing our hook TWICE collapses to one (v1.0.7)", () => {
+        const p = path.join(dir, "settings.json")
+        const sibling = {
+            type: "command",
+            command: "/users/x/their-tool",
+            timeout: 5000,
+        }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    PostToolUse: [
+                        {
+                            matcher: "Write|Edit|MultiEdit",
+                            hooks: [
+                                { type: "command", command: HOOK, timeout: 1 },
+                                sibling,
+                                { type: "command", command: HOOK, timeout: 2 },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergePostToolUseHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.PostToolUse).toHaveLength(1)
+        const ours = s.hooks.PostToolUse[0].hooks.filter(
+            (h) => h.command === HOOK
+        )
+        expect(ours).toHaveLength(1)
+        expect(ours[0].timeout).toBe(3000)
+        expect(s.hooks.PostToolUse[0].hooks).toContainEqual(sibling)
+    })
+
     test("two canonical blocks both with our hook: dedupe to one and drop the now-empty dupe", () => {
         const p = path.join(dir, "settings.json")
         writeFileSync(

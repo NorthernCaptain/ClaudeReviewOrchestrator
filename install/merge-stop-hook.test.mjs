@@ -219,6 +219,43 @@ describe("mergeStopHook", () => {
         expect(userBlock.hooks).toEqual([userSibling])
     })
 
+    test("within-block dedupe: a single canonical block with our hook listed TWICE collapses to one (v1.0.7)", () => {
+        // The same matcher block has our command twice — Claude
+        // Code would fire both. Merge must collapse to a single
+        // refreshed entry, preserving any sibling hooks.
+        const p = path.join(dir, "settings.json")
+        const sibling = {
+            type: "command",
+            command: "/users/x/their-stop.sh",
+            timeout: 5000,
+        }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                hooks: {
+                    Stop: [
+                        {
+                            matcher: "",
+                            hooks: [
+                                { type: "command", command: HOOK, timeout: 1 },
+                                sibling,
+                                { type: "command", command: HOOK, timeout: 2 },
+                            ],
+                        },
+                    ],
+                },
+            })
+        )
+        mergeStopHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        // One block; one occurrence of our hook; sibling preserved.
+        expect(s.hooks.Stop).toHaveLength(1)
+        const ours = s.hooks.Stop[0].hooks.filter((h) => h.command === HOOK)
+        expect(ours).toHaveLength(1)
+        expect(ours[0].timeout).toBe(720000)
+        expect(s.hooks.Stop[0].hooks).toContainEqual(sibling)
+    })
+
     test("two canonical blocks both containing our hook: deduplicate to one, drop the emptied dupe", () => {
         const p = path.join(dir, "settings.json")
         writeFileSync(

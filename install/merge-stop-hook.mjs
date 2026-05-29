@@ -125,15 +125,30 @@ export const mergeStopHook = ({
         const where = reindexed.indexOf(preferredRef)
         const block = reindexed[where]
         const blockHooks = Array.isArray(block.hooks) ? block.hooks : []
-        const hookIdx = blockHooks.findIndex((h) => h?.command === hookPath)
-        if (hookIdx === -1) {
-            reindexed[where] = { ...block, hooks: [...blockHooks, ourEntry] }
-            changed = true
-        } else if (
-            JSON.stringify(blockHooks[hookIdx]) !== JSON.stringify(ourEntry)
-        ) {
-            const nextHooks = blockHooks.slice()
-            nextHooks[hookIdx] = ourEntry
+        // Within-block dedupe: strip EVERY entry whose command is ours,
+        // then add back exactly one refreshed `ourEntry` at the
+        // position of the first occurrence (or appended if there
+        // wasn't one). Siblings keep their original order; second-
+        // and-later dupes of our command are dropped — without this
+        // a canonical block carrying our hook twice would still fire
+        // twice after the merge.
+        const firstIdx = blockHooks.findIndex((h) => h?.command === hookPath)
+        let nextHooks
+        if (firstIdx === -1) {
+            nextHooks = [...blockHooks, ourEntry]
+        } else {
+            nextHooks = []
+            for (let i = 0; i < blockHooks.length; i++) {
+                const h = blockHooks[i]
+                if (h?.command !== hookPath) {
+                    nextHooks.push(h)
+                    continue
+                }
+                if (i === firstIdx) nextHooks.push(ourEntry)
+                // else: drop dupes
+            }
+        }
+        if (JSON.stringify(nextHooks) !== JSON.stringify(blockHooks)) {
             reindexed[where] = { ...block, hooks: nextHooks }
             changed = true
         }
