@@ -12,12 +12,12 @@ import { VERSION } from "./version.js"
 export { VERSION }
 import { authMiddleware } from "./auth.js"
 import { mountReviewRoute, snapshotInFlight } from "./review.js"
-import { mountResetRoute } from "./reset.js"
+import { mountResetRoute, handleReset } from "./reset.js"
 import { mountMcpRoute } from "./mcp.js"
 import { mountStatusRoute } from "./status.js"
 import { mountDashboardRoute } from "./dashboard.js"
 import { mountNotifyChangeRoute } from "./notify-change.js"
-import { mountProviderRoute } from "./provider.js"
+import { mountProviderRoute, handleSetProvider } from "./provider.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { createMetrics } from "./metrics.js"
@@ -102,6 +102,27 @@ export const createApp = ({
         res.json({ ok: true, inFlight: snapshotInFlight(Date.now) })
     })
 
+    // Dashboard control endpoints (v0.1.35). Localhost-only — mounted
+    // BEFORE the auth middleware so the public dashboard page can use
+    // them without embedding the X-Review-Token. The canonical authed
+    // routes (POST /reset, PUT /provider) below still require the
+    // token; these are thin convenience wrappers that share the same
+    // handlers, so the business logic is not duplicated.
+    app.post("/dashboard/reset", (req, res) => {
+        const result = handleReset({ body: req.body, config, store, deps })
+        res.status(result.httpStatus).json(result.body)
+    })
+    app.put("/dashboard/provider", (req, res) => {
+        const result = handleSetProvider({
+            body: req.body,
+            config,
+            configPath,
+            logger: log,
+            deps,
+        })
+        res.status(result.httpStatus).json(result.body)
+    })
+
     // GET / — public dashboard. Mounted BEFORE the auth middleware so
     // it's reachable without the x-review-token. Safe because the
     // server binds 127.0.0.1 by default — the trust boundary is the
@@ -109,6 +130,7 @@ export const createApp = ({
     mountDashboardRoute(app, {
         archive,
         config,
+        store,
         summarize: summarizeStartup,
         version: VERSION,
         startedAt,

@@ -830,3 +830,58 @@ describe("renderDurationPie", () => {
         expect(svg).toMatch(/<circle [^>]*fill="#4ade80"/)
     })
 })
+
+describe("renderControls (v0.1.35)", () => {
+    const { renderControls } = __test__
+
+    test("provider <select> includes all three providers and pre-selects the current", () => {
+        const html = renderControls("gemini", [])
+        expect(html).toContain('id="provider-select"')
+        expect(html).toContain('<option value="codex">codex</option>')
+        expect(html).toContain('<option value="gemini" selected>gemini</option>')
+        expect(html).toContain('<option value="claude">claude</option>')
+    })
+
+    test("context dropdown lists each context as `repo:branch`, value=repoRoot, sorted by key", () => {
+        const html = renderControls("codex", [
+            { key: "/b|main", repo: "b", repoRoot: "/b", branch: "main" },
+            { key: "/a|dev", repo: "a", repoRoot: "/a", branch: "dev" },
+        ])
+        const optMatches = [...html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)]
+            .filter((m) => m[1].startsWith("/"))
+        expect(optMatches.map((m) => m[2])).toEqual(["a:dev", "b:main"])
+        expect(optMatches.map((m) => m[1])).toEqual(["/a", "/b"])
+    })
+
+    test("empty contexts list shows placeholder and disables reset", () => {
+        const html = renderControls("codex", [])
+        expect(html).toContain("(no contexts)")
+        expect(html).toMatch(/<button id="reset-button"[^>]* disabled/)
+        expect(html).toMatch(/<select id="reset-context-select"[^>]* disabled/)
+    })
+
+    test("escapes repo names and branch labels", () => {
+        const html = renderControls("codex", [
+            { key: "k", repo: "<x>", repoRoot: "/x", branch: "b&b" },
+        ])
+        expect(html).toContain("&lt;x&gt;:b&amp;b")
+        expect(html).not.toContain("<x>:b&b")
+    })
+
+    test("rendered into the active config section by renderDashboard", () => {
+        const html = renderDashboard({
+            version: "0.1.35",
+            config: { provider: "codex" },
+            records: [],
+            contexts: [{ key: "/x|main", repo: "x", repoRoot: "/x", branch: "main" }],
+        })
+        // The controls bar sits inside the active config section, BEFORE
+        // the charts section opens.
+        const ac = html.indexOf('aria-label="active config"')
+        const ctrl = html.indexOf('aria-label="dashboard controls"')
+        const charts = html.indexOf('aria-label="charts"')
+        expect(ac).toBeGreaterThan(-1)
+        expect(ctrl).toBeGreaterThan(ac)
+        expect(ctrl).toBeLessThan(charts)
+    })
+})

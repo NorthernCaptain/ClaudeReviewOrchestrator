@@ -543,6 +543,48 @@ export const renderInFlight = (inFlight = []) =>
     `<div id="inflight-body">${renderInFlightRows(inFlight)}</div>` +
     `</div>`
 
+// Inline dashboard controls (v0.1.35). The dashboard is unauthed
+// localhost-only, so these post to /dashboard/* convenience routes
+// that share handlers with the canonical /reset and /provider
+// endpoints. The provider <select> auto-submits on change; the reset
+// button consumes the selected context dropdown.
+const VALID_PROVIDER_OPTIONS = ["codex", "claude", "gemini"]
+
+export const renderControls = (currentProvider, contexts = []) => {
+    const providerOpts = VALID_PROVIDER_OPTIONS.map(
+        (p) =>
+            `<option value="${p}"${p === currentProvider ? " selected" : ""}>${p}</option>`
+    ).join("")
+    const sorted = [...(contexts ?? [])].sort((a, b) =>
+        String(a.key ?? "").localeCompare(String(b.key ?? ""))
+    )
+    const ctxOpts = sorted.length
+        ? sorted
+              .map((c) => {
+                  const value = escapeHtml(c.repoRoot ?? "")
+                  const label = escapeHtml(
+                      `${c.repo ?? (c.repoRoot ?? "").split("/").pop() ?? "?"}:${c.branch ?? "?"}`
+                  )
+                  return `<option value="${value}">${label}</option>`
+              })
+              .join("")
+        : `<option value="">(no contexts)</option>`
+    return (
+        `<div class="controls" aria-label="dashboard controls">` +
+        `<label class="control">` +
+        `<span class="ctl-label">provider</span>` +
+        `<select id="provider-select" class="select">${providerOpts}</select>` +
+        `</label>` +
+        `<div class="control">` +
+        `<span class="ctl-label">reset</span>` +
+        `<select id="reset-context-select" class="select"${sorted.length ? "" : " disabled"}>${ctxOpts}</select>` +
+        `<button id="reset-button" class="btn" type="button"${sorted.length ? "" : " disabled"}>↻ reset</button>` +
+        `</div>` +
+        `<span id="controls-status" class="status" role="status" aria-live="polite"></span>` +
+        `</div>`
+    )
+}
+
 const renderConfigPanel = (config) => {
     if (!config) return ""
     const provider = config.provider ?? "codex"
@@ -797,6 +839,26 @@ section.compact > h2 { margin-bottom: 8px; }
 .charts-row .pie-wrap .label { color: var(--muted); font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
   text-align: center; }
+/* Dashboard controls bar (provider switcher + reset). */
+.controls { display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.controls .control { display: flex; align-items: center; gap: 6px; }
+.controls .ctl-label { color: var(--muted); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+.controls .select { background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); border-radius: 4px; padding: 3px 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+  max-width: 320px; }
+.controls .btn { background: var(--accent); color: white; border: 0;
+  border-radius: 4px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  font-weight: 600; letter-spacing: 0.02em; }
+.controls .btn:hover { opacity: 0.9; }
+.controls .btn:disabled, .controls .select:disabled { opacity: 0.5;
+  cursor: not-allowed; }
+.controls .status { font-size: 12px; color: var(--muted); margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.controls .status.ok { color: #16a34a; }
+.controls .status.err { color: #c2410c; }
 @media (max-width: 720px) {
   .config-row { flex-direction: column; }
   .inflight-slot { border-left: 0; border-top: 2px solid var(--accent);
@@ -881,6 +943,7 @@ export const renderDashboard = ({
     records = [],
     metrics = null,
     inFlight = [],
+    contexts = [],
 } = {}) => {
     // Assign a stable id per record so chart bars can deep-link to the
     // matching row in the reviews table. Index is the position in the
@@ -918,6 +981,7 @@ export const renderDashboard = ({
     ${renderConfigPanel(config)}
     ${renderInFlight(inFlight)}
   </div>
+  ${renderControls(config?.provider, contexts)}
 </section>
 
 <section aria-label="charts">
@@ -1031,6 +1095,72 @@ export const renderDashboard = ({
   setInterval(tick, 1000);
   setInterval(poll, 2000);
 })();
+
+// Dashboard controls (v0.1.35): provider switcher + reset counter
+// button. Both POST to /dashboard/* localhost-only convenience routes.
+(function () {
+  var statusEl = document.getElementById("controls-status");
+  var statusTimer = null;
+  function setStatus(msg, ok) {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.className = "status " + (ok ? "ok" : "err");
+    if (statusTimer) clearTimeout(statusTimer);
+    statusTimer = setTimeout(function () {
+      statusEl.textContent = "";
+      statusEl.className = "status";
+    }, 4000);
+  }
+  function bodyToOk(r) {
+    return r.json().then(function (j) { return { ok: r.ok, j: j }; });
+  }
+  var provSel = document.getElementById("provider-select");
+  if (provSel) {
+    provSel.addEventListener("change", function () {
+      var picked = provSel.value;
+      fetch("/dashboard/provider", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ provider: picked }),
+      })
+        .then(bodyToOk)
+        .then(function (r) {
+          if (r.ok) {
+            setStatus("provider → " + (r.j.provider || picked) +
+              (r.j.persisted ? "" : " (in-memory only)"), true);
+          } else {
+            setStatus("error: " + (r.j.error || "failed"), false);
+          }
+        })
+        .catch(function (e) { setStatus("error: " + e.message, false); });
+    });
+  }
+  var resetBtn = document.getElementById("reset-button");
+  var resetSel = document.getElementById("reset-context-select");
+  if (resetBtn && resetSel) {
+    resetBtn.addEventListener("click", function () {
+      var cwd = resetSel.value;
+      if (!cwd) { setStatus("no context selected", false); return; }
+      resetBtn.disabled = true;
+      fetch("/dashboard/reset", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cwd: cwd }),
+      })
+        .then(bodyToOk)
+        .then(function (r) {
+          if (r.ok) {
+            var c = r.j.context || {};
+            setStatus("reset " + (c.repo || "?") + ":" + (c.branch || "?"), true);
+          } else {
+            setStatus("error: " + (r.j.reason || r.j.error || "failed"), false);
+          }
+        })
+        .catch(function (e) { setStatus("error: " + e.message, false); })
+        .finally(function () { resetBtn.disabled = false; });
+    });
+  }
+})();
 </script>
 </body>
 </html>`
@@ -1041,6 +1171,7 @@ export const mountDashboardRoute = (
     {
         archive,
         config,
+        store = null,
         summarize,
         version,
         startedAt,
@@ -1057,6 +1188,11 @@ export const mountDashboardRoute = (
             typeof startedAt === "number"
                 ? Math.max(0, Math.round((Date.now() - startedAt) / 1000))
                 : null
+        // Context list feeds the Reset dropdown — we read repoRoot
+        // off each so the dashboard can POST { cwd: repoRoot } to
+        // /dashboard/reset and the same handleReset that the authed
+        // /reset route uses resolves it back to (repoRoot, branch).
+        const contexts = store?.list ? store.list() : []
         const html = renderDashboard({
             version,
             config: summary,
@@ -1066,6 +1202,7 @@ export const mountDashboardRoute = (
             metrics: metrics?.snapshot ? metrics.snapshot() : metrics,
             inFlight:
                 typeof inFlight === "function" ? inFlight() : (inFlight ?? []),
+            contexts,
         })
         res.setHeader("Content-Type", "text/html; charset=utf-8")
         res.setHeader("Cache-Control", "no-store")
@@ -1084,6 +1221,7 @@ export const __test__ = {
     renderDurationPie,
     sumDurationByStatus,
     renderInFlight,
+    renderControls,
     renderConfigPanel,
     renderFinding,
     renderSuccessRow,

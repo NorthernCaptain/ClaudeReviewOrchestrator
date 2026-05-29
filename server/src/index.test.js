@@ -180,6 +180,82 @@ describe("createApp wiring", () => {
         }
     })
 
+    test("PUT /dashboard/provider switches in-memory without a token (v0.1.35)", async () => {
+        // Inject a fake fs so handleSetProvider's persistence step
+        // doesn't touch the real ~/.config/review-orchestrator/config.json
+        // when the test exercises the endpoint.
+        let writtenJson = null
+        const fakeFs = {
+            readFileSync: () => JSON.stringify({ reviewer: { provider: "codex" } }),
+            writeFileSync: (_p, data) => {
+                writtenJson = data
+            },
+        }
+        const cfg = minimalConfig({ reviewer: { provider: "codex" } })
+        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+        try {
+            expect(cfg.reviewer?.provider).toBe("codex")
+            const r = await fetch(`${url}/dashboard/provider`, {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ provider: "gemini" }),
+            })
+            expect(r.status).toBe(200)
+            const body = await r.json()
+            expect(body.ok).toBe(true)
+            expect(body.provider).toBe("gemini")
+            expect(cfg.reviewer.provider).toBe("gemini")
+            // Persistence wrote through the fake fs, not the real file.
+            expect(writtenJson).toMatch(/"provider": "gemini"/)
+        } finally {
+            await close()
+        }
+    })
+
+    test("PUT /dashboard/provider rejects an unknown provider with 400", async () => {
+        const { url, close } = await start(minimalConfig(), {
+            ...happyDeps,
+            fs: { readFileSync: () => "{}", writeFileSync: () => {} },
+        })
+        try {
+            const r = await fetch(`${url}/dashboard/provider`, {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ provider: "bogus" }),
+            })
+            expect(r.status).toBe(400)
+            const body = await r.json()
+            expect(body.ok).toBe(false)
+        } finally {
+            await close()
+        }
+    })
+
+    test("POST /dashboard/reset clears the context without a token (v0.1.35)", async () => {
+        const { url, store, close } = await start(minimalConfig(), happyDeps)
+        try {
+            store.save("/repo|main", {
+                repoRoot: "/repo",
+                branch: "main",
+                codexRounds: 4,
+                blockCount: 3,
+                lastReviewedAt: 1,
+            })
+            const r = await fetch(`${url}/dashboard/reset`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ cwd: "/repo" }),
+            })
+            expect(r.status).toBe(200)
+            const body = await r.json()
+            expect(body.ok).toBe(true)
+            expect(body.state.codexRounds).toBe(0)
+            expect(body.state.blockCount).toBe(0)
+        } finally {
+            await close()
+        }
+    })
+
     test("/review rejects with 401 when token is missing", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
