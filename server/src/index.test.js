@@ -186,7 +186,8 @@ describe("createApp wiring", () => {
         // when the test exercises the endpoint.
         let writtenJson = null
         const fakeFs = {
-            readFileSync: () => JSON.stringify({ reviewer: { provider: "codex" } }),
+            readFileSync: () =>
+                JSON.stringify({ reviewer: { provider: "codex" } }),
             writeFileSync: (_p, data) => {
                 writtenJson = data
             },
@@ -231,12 +232,24 @@ describe("createApp wiring", () => {
         }
     })
 
-    test("POST /dashboard/reset clears the context without a token (v0.1.35)", async () => {
+    test("POST /dashboard/reset clears the EXACT stored context by contextKey (v0.1.36)", async () => {
+        // Two contexts share the same repoRoot but differ by branch.
+        // Submitting only `repoRoot` (the old v0.1.35 shape) couldn't
+        // disambiguate them — handleReset would resolve whichever
+        // branch the working tree was on. The contextKey form targets
+        // exactly one stored context regardless of disk state.
         const { url, store, close } = await start(minimalConfig(), happyDeps)
         try {
             store.save("/repo|main", {
                 repoRoot: "/repo",
                 branch: "main",
+                codexRounds: 99,
+                blockCount: 99,
+                lastReviewedAt: 1,
+            })
+            store.save("/repo|feature", {
+                repoRoot: "/repo",
+                branch: "feature",
                 codexRounds: 4,
                 blockCount: 3,
                 lastReviewedAt: 1,
@@ -244,13 +257,106 @@ describe("createApp wiring", () => {
             const r = await fetch(`${url}/dashboard/reset`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ cwd: "/repo" }),
+                body: JSON.stringify({ contextKey: "/repo|feature" }),
             })
             expect(r.status).toBe(200)
             const body = await r.json()
             expect(body.ok).toBe(true)
+            expect(body.context.branch).toBe("feature")
             expect(body.state.codexRounds).toBe(0)
             expect(body.state.blockCount).toBe(0)
+            // The OTHER branch's context must be untouched.
+            const main = store.get({
+                key: "/repo|main",
+                repoRoot: "/repo",
+                branch: "main",
+            })
+            expect(main.codexRounds).toBe(99)
+            expect(main.blockCount).toBe(99)
+        } finally {
+            await close()
+        }
+    })
+
+    test("POST /dashboard/reset rejects missing contextKey with 400", async () => {
+        const { url, close } = await start(minimalConfig(), happyDeps)
+        try {
+            const r = await fetch(`${url}/dashboard/reset`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({}),
+            })
+            expect(r.status).toBe(400)
+        } finally {
+            await close()
+        }
+    })
+
+    test("/favicon.svg and /favicon.ico both serve the yin-yang SVG (v0.1.36)", async () => {
+        const { url, close } = await start(minimalConfig(), happyDeps)
+        try {
+            for (const path of ["/favicon.svg", "/favicon.ico"]) {
+                const r = await fetch(`${url}${path}`)
+                expect(r.status).toBe(200)
+                expect(r.headers.get("content-type")).toMatch(/image\/svg\+xml/)
+                const body = await r.text()
+                expect(body).toContain("<svg")
+                // Yin-yang shape signature: outer circle + S-curve path
+                // + two small dots.
+                expect(body).toContain('viewBox="0 0 64 64"')
+                expect(body).toContain("M 32 2 A 30 30")
+            }
+        } finally {
+            await close()
+        }
+    })
+
+    test("loopbackOnly: allows 127.0.0.1, ::1, ::ffff:127.0.0.1; rejects others 403", async () => {
+        const { loopbackOnly } = await import("./index.js")
+        const mkReq = (ip) => ({ ip, socket: { remoteAddress: ip } })
+        const mkRes = () => {
+            const res = { statusCode: 0, body: null }
+            res.status = (c) => {
+                res.statusCode = c
+                return res
+            }
+            res.json = (b) => {
+                res.body = b
+                return res
+            }
+            return res
+        }
+        for (const ip of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
+            const res = mkRes()
+            let nexted = false
+            loopbackOnly(mkReq(ip), res, () => {
+                nexted = true
+            })
+            expect(nexted).toBe(true)
+            expect(res.statusCode).toBe(0)
+        }
+        for (const ip of ["10.0.0.1", "192.168.1.5", "::ffff:10.0.0.1", ""]) {
+            const res = mkRes()
+            let nexted = false
+            loopbackOnly(mkReq(ip), res, () => {
+                nexted = true
+            })
+            expect(nexted).toBe(false)
+            expect(res.statusCode).toBe(403)
+            expect(res.body.ok).toBe(false)
+            expect(res.body.error).toMatch(/loopback only/i)
+        }
+    })
+
+    test("POST /dashboard/reset rejects an unknown contextKey with 404", async () => {
+        const { url, close } = await start(minimalConfig(), happyDeps)
+        try {
+            const r = await fetch(`${url}/dashboard/reset`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ contextKey: "/nope|x" }),
+            })
+            expect(r.status).toBe(404)
         } finally {
             await close()
         }
@@ -649,7 +755,11 @@ describe("VERSION + summarizeStartup", () => {
             port: 7777,
             reviewer: {
                 provider: "claude",
-                claude: { model: "claude-opus-4-7", effort: "medium", timeoutSeconds: 600 },
+                claude: {
+                    model: "claude-opus-4-7",
+                    effort: "medium",
+                    timeoutSeconds: 600,
+                },
             },
             limits: { codexTimeoutSeconds: 240 },
         }

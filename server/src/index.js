@@ -12,7 +12,7 @@ import { VERSION } from "./version.js"
 export { VERSION }
 import { authMiddleware } from "./auth.js"
 import { mountReviewRoute, snapshotInFlight } from "./review.js"
-import { mountResetRoute, handleReset } from "./reset.js"
+import { mountResetRoute } from "./reset.js"
 import { mountMcpRoute } from "./mcp.js"
 import { mountStatusRoute } from "./status.js"
 import { mountDashboardRoute } from "./dashboard.js"
@@ -29,6 +29,36 @@ import { createHttpAccessLog, createHttpErrorHandler } from "./http-log.js"
 // non-sensitive subset of config the operator needs to verify the
 // daemon picked up the right knobs after a config change. Pure
 // function — exported for unit testing.
+// Inline yin-yang favicon (v0.1.36). Colors match the dashboard's dark
+// slate palette so the tab icon reads as the same UI. Served from
+// /favicon.svg and /favicon.ico (browsers auto-request the latter when
+// no <link rel="icon"> is found — we serve the same SVG body either
+// way to avoid a 404 on the tab).
+export const FAVICON_SVG =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">` +
+    `<circle cx="32" cy="32" r="30" fill="#f1f5f9"/>` +
+    `<path d="M 32 2 A 30 30 0 0 1 32 62 A 15 15 0 0 0 32 32 A 15 15 0 0 1 32 2 Z" fill="#0f172a"/>` +
+    `<circle cx="32" cy="47" r="4" fill="#f1f5f9"/>` +
+    `<circle cx="32" cy="17" r="4" fill="#0f172a"/>` +
+    `</svg>`
+
+// Express middleware that rejects any peer that isn't on the loopback
+// interface (127.0.0.1, ::1, or the v4-in-v6 form). Belt for the
+// dashboard mutation routes (POST /dashboard/reset, PUT /dashboard/
+// provider) so the operator widening `bind` from 127.0.0.1 to 0.0.0.0
+// doesn't accidentally expose them to the network. Returns 403 with a
+// clear `error` field; never proxies the request through.
+export const loopbackOnly = (req, res, next) => {
+    const ip = req.ip || req.socket?.remoteAddress || ""
+    const ok = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1"
+    if (!ok) {
+        return res
+            .status(403)
+            .json({ ok: false, error: "loopback only", remote: ip })
+    }
+    next()
+}
+
 export const summarizeStartup = (config, version = VERSION) => {
     const provider = config?.reviewer?.provider ?? "codex"
     const providerCfg =
@@ -93,6 +123,18 @@ export const createApp = ({
         res.json({ ok: true })
     })
 
+    // Yin-yang favicon. Same body served for /favicon.svg AND
+    // /favicon.ico (the latter is what browsers auto-fetch when no
+    // <link rel="icon"> is present; serving the SVG keeps the tab from
+    // logging a 404 noise on every page load).
+    const sendFavicon = (_req, res) => {
+        res.setHeader("Content-Type", "image/svg+xml")
+        res.setHeader("Cache-Control", "public, max-age=86400")
+        res.status(200).send(FAVICON_SVG)
+    }
+    app.get("/favicon.svg", sendFavicon)
+    app.get("/favicon.ico", sendFavicon)
+
     // GET /inflight — live snapshot of running reviews. Public (mounted
     // before auth) because the dashboard page polls it without a token,
     // same trust boundary as GET /. Exposes only repo/branch/elapsed,
@@ -102,17 +144,53 @@ export const createApp = ({
         res.json({ ok: true, inFlight: snapshotInFlight(Date.now) })
     })
 
-    // Dashboard control endpoints (v0.1.35). Localhost-only — mounted
-    // BEFORE the auth middleware so the public dashboard page can use
-    // them without embedding the X-Review-Token. The canonical authed
-    // routes (POST /reset, PUT /provider) below still require the
-    // token; these are thin convenience wrappers that share the same
-    // handlers, so the business logic is not duplicated.
-    app.post("/dashboard/reset", (req, res) => {
-        const result = handleReset({ body: req.body, config, store, deps })
-        res.status(result.httpStatus).json(result.body)
+    // Dashboard control endpoints (v0.1.35). Mounted BEFORE auth so the
+    // public dashboard page can use them without embedding the
+    // X-Review-Token, but explicitly guarded to loopback peers
+    // (v0.1.36) — these mutate live config / clear review state, so we
+    // can't rely on `bind: 127.0.0.1` alone as the trust boundary. If
+    // the operator ever widens the bind, these stay locked down. The
+    // canonical authed routes (POST /reset, PUT /provider) remain
+    // available for cross-host callers with a valid token.
+    // Dashboard reset: takes `{ contextKey }` (preferred) — the
+    // store key already encodes (repoRoot, branch), so unlike `cwd`
+    // it can't be ambiguous when a repo has multiple branches in the
+    // store. Validates against store.list() before touching state.
+    app.post("/dashboard/reset", loopbackOnly, (req, res) => {
+        const contextKey = req.body?.contextKey
+        if (typeof contextKey !== "string" || contextKey.length === 0) {
+            return res
+                .status(400)
+                .json({ ok: false, error: "contextKey is required" })
+        }
+        const known = (store?.list?.() ?? []).find((c) => c.key === contextKey)
+        if (!known) {
+            return res.status(404).json({
+                ok: false,
+                error: `unknown context: ${contextKey}`,
+            })
+        }
+        const fresh = store.reset({
+            key: known.key,
+            repoRoot: known.repoRoot,
+            branch: known.branch,
+        })
+        res.json({
+            ok: true,
+            context: {
+                repo: known.repo ?? known.repoRoot?.split("/").pop() ?? null,
+                repoRoot: known.repoRoot,
+                branch: known.branch,
+                key: known.key,
+            },
+            state: {
+                codexRounds: fresh.codexRounds,
+                blockCount: fresh.blockCount,
+                lastResultStatus: fresh.lastResultStatus,
+            },
+        })
     })
-    app.put("/dashboard/provider", (req, res) => {
+    app.put("/dashboard/provider", loopbackOnly, (req, res) => {
         const result = handleSetProvider({
             body: req.body,
             config,

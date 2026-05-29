@@ -561,7 +561,14 @@ export const renderControls = (currentProvider, contexts = []) => {
     const ctxOpts = sorted.length
         ? sorted
               .map((c) => {
-                  const value = escapeHtml(c.repoRoot ?? "")
+                  // Option value is the store key (repoRoot|branch) so
+                  // the server can target the EXACT stored context.
+                  // Submitting just repoRoot would collide when a repo
+                  // has multiple branches in the store and the server
+                  // would re-resolve to whatever branch is currently
+                  // checked out — possibly resetting a different one
+                  // than the user picked.
+                  const value = escapeHtml(c.key ?? "")
                   const label = escapeHtml(
                       `${c.repo ?? (c.repoRoot ?? "").split("/").pop() ?? "?"}:${c.branch ?? "?"}`
                   )
@@ -966,6 +973,7 @@ export const renderDashboard = ({
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>review-orchestrator</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>${CSS}</style>
 </head>
 <body>
@@ -1139,13 +1147,13 @@ export const renderDashboard = ({
   var resetSel = document.getElementById("reset-context-select");
   if (resetBtn && resetSel) {
     resetBtn.addEventListener("click", function () {
-      var cwd = resetSel.value;
-      if (!cwd) { setStatus("no context selected", false); return; }
+      var contextKey = resetSel.value;
+      if (!contextKey) { setStatus("no context selected", false); return; }
       resetBtn.disabled = true;
       fetch("/dashboard/reset", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ cwd: cwd }),
+        body: JSON.stringify({ contextKey: contextKey }),
       })
         .then(bodyToOk)
         .then(function (r) {

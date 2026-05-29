@@ -842,15 +842,31 @@ describe("renderControls (v0.1.35)", () => {
         expect(html).toContain('<option value="claude">claude</option>')
     })
 
-    test("context dropdown lists each context as `repo:branch`, value=repoRoot, sorted by key", () => {
+    test("context dropdown lists each as `repo:branch`, value=contextKey, sorted by key (v0.1.36)", () => {
+        // Option value is the store key (not repoRoot) so multiple
+        // branches of one repo don't collide and the server can
+        // target the EXACT stored context.
         const html = renderControls("codex", [
             { key: "/b|main", repo: "b", repoRoot: "/b", branch: "main" },
             { key: "/a|dev", repo: "a", repoRoot: "/a", branch: "dev" },
         ])
-        const optMatches = [...html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)]
-            .filter((m) => m[1].startsWith("/"))
+        const optMatches = [
+            ...html.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g),
+        ].filter((m) => m[1].startsWith("/"))
         expect(optMatches.map((m) => m[2])).toEqual(["a:dev", "b:main"])
-        expect(optMatches.map((m) => m[1])).toEqual(["/a", "/b"])
+        expect(optMatches.map((m) => m[1])).toEqual(["/a|dev", "/b|main"])
+    })
+
+    test("two branches of the same repo each get a distinct option (v0.1.36 disambiguation)", () => {
+        const html = renderControls("codex", [
+            { key: "/r|main", repo: "r", repoRoot: "/r", branch: "main" },
+            { key: "/r|feat", repo: "r", repoRoot: "/r", branch: "feat" },
+        ])
+        const opts = [
+            ...html.matchAll(/<option value="(\/r\|[^"]+)">([^<]+)<\/option>/g),
+        ]
+        expect(opts.map((m) => m[1])).toEqual(["/r|feat", "/r|main"])
+        expect(opts.map((m) => m[2])).toEqual(["r:feat", "r:main"])
     })
 
     test("empty contexts list shows placeholder and disables reset", () => {
