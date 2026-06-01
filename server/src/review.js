@@ -163,6 +163,32 @@ const computeBlocking = (findings, blockingSeverities) => {
     return findings.filter((f) => set.has(f.severity))
 }
 
+// Stable match key for user exclusions (v1.1). We deliberately do NOT
+// include line number — the same issue can shift lines as the user
+// edits the code, and an exclusion should survive that.
+export const exclusionMatchKey = (file, message) => `${file}\n${message}`
+
+// Drop findings whose (file, message) match any user exclusion. Used
+// both when saving priorFindings (so NO_PROGRESS doesn't fire on
+// excluded items) and when exposing the cached list to clients.
+const filterByExclusions = (findings, exclusions) => {
+    if (!Array.isArray(exclusions) || exclusions.length === 0) return findings
+    const set = new Set(
+        exclusions
+            .filter(
+                (e) =>
+                    e &&
+                    typeof e.file === "string" &&
+                    typeof e.message === "string"
+            )
+            .map((e) => exclusionMatchKey(e.file, e.message))
+    )
+    if (set.size === 0) return findings
+    return findings.filter(
+        (f) => !set.has(exclusionMatchKey(f?.file, f?.message))
+    )
+}
+
 // Derive the public status from kept findings and the blocking subset.
 // Codex never returns GOOD_TO_GO_WITH_NOTES itself — that's a server-side
 // notion based on severity classification.
@@ -454,6 +480,49 @@ export const handleReview = async ({
     const inflight = deps.inflight ?? defaultInflight
     const contextChains = deps.contextChains ?? defaultContextChains
     const inflightMeta = deps.inflightMeta ?? defaultInflightMeta
+
+    // Anti-clobber save (v1.1.2): a long review captures state at its
+    // start; if the user mutates the persisted context mid-run via
+    // POST /dashboard/exclusions, the final review-result save would
+    // spread the stale snapshot back and silently lose that mutation.
+    // Every store.save inside the review pipeline goes through this
+    // wrapper instead — it re-reads the LATEST exclusions out of the
+    // store (peek doesn't trigger idle reset) and forces them into
+    // the write, also re-filtering any priorFindings being saved so
+    // a freshly-excluded entry doesn't sneak back into the cache.
+    // Set once the pipeline loads `state` — saveContext compares
+    // against it to detect a mid-run exclusion mutation and preserve
+    // its cache invalidation (see comment in saveContext below).
+    let snapshotExclusions = []
+    const saveContext = (key, writes) => {
+        const fresh = store.peek ? store.peek(key) : null
+        const freshExclusions = Array.isArray(fresh?.exclusions)
+            ? fresh.exclusions
+            : (writes.exclusions ?? [])
+        const out = { ...writes, exclusions: freshExclusions }
+        // Cache-invalidation preservation (v1.1.6). If exclusions
+        // changed DURING the review, the prompt the reviewer saw
+        // referenced the OLD list, so the just-computed baseline is
+        // tainted — caching it would let the NEXT Stop fast-path
+        // NO_CHANGES on a verdict the reviewer wouldn't reach with
+        // the current list. handleExclusionMutation already set
+        // dirtySinceLastReview=true + lastBaseline=null on mutation;
+        // re-apply those here so the review's terminal save doesn't
+        // clobber that invalidation back to a clean baseline.
+        const startKey = JSON.stringify(snapshotExclusions)
+        const freshKey = JSON.stringify(freshExclusions)
+        if (startKey !== freshKey) {
+            out.dirtySinceLastReview = true
+            out.lastBaseline = null
+        }
+        if (Array.isArray(out.priorFindings) && freshExclusions.length > 0) {
+            out.priorFindings = filterByExclusions(
+                out.priorFindings,
+                freshExclusions
+            )
+        }
+        return store.save(key, out)
+    }
     const effectiveProvider =
         providerOverride ?? config.reviewer?.provider ?? "codex"
     const inflightKey = `${context.key}|force=${force}|provider=${effectiveProvider}`
@@ -513,6 +582,10 @@ export const handleReview = async ({
 
         const trigger = body?.trigger ?? "manual"
         const state = store.get(context)
+        // Snapshot exclusions for saveContext's mid-run-drift check.
+        snapshotExclusions = Array.isArray(state.exclusions)
+            ? state.exclusions
+            : []
         log.info(
             {
                 codexRounds: state.codexRounds,
@@ -655,7 +728,7 @@ export const handleReview = async ({
         ) {
             const notifyUser = computeNotifyUser(state, trigger)
             if (notifyUser) {
-                store.save(context.key, {
+                saveContext(context.key, {
                     ...state,
                     escalateNotified: true,
                 })
@@ -797,7 +870,7 @@ export const handleReview = async ({
                 } else {
                     let nextState = state
                     if (isStopHook(trigger)) {
-                        nextState = store.save(context.key, {
+                        nextState = saveContext(context.key, {
                             ...state,
                             blockCount: state.blockCount + 1,
                             lastReviewedAt: now(),
@@ -834,7 +907,7 @@ export const handleReview = async ({
                 const notifyUser = computeNotifyUser(state, trigger)
                 let nextState = state
                 if (isStopHook(trigger) || notifyUser) {
-                    nextState = store.save(context.key, {
+                    nextState = saveContext(context.key, {
                         ...state,
                         blockCount: isStopHook(trigger)
                             ? state.blockCount + 1
@@ -876,7 +949,7 @@ export const handleReview = async ({
         if (!force && state.codexRounds >= config.limits.maxCodexRounds) {
             const notifyUser = computeNotifyUser(state, trigger)
             if (notifyUser) {
-                store.save(context.key, {
+                saveContext(context.key, {
                     ...state,
                     escalateNotified: true,
                 })
@@ -923,6 +996,7 @@ export const handleReview = async ({
             payloadText: payload.promptText,
             priorFindings: state.priorFindings,
             extraInstructions,
+            exclusions: state.exclusions ?? [],
         })
 
         // Pick the reviewer adapter (codex or claude). The picker maps
@@ -1097,7 +1171,7 @@ export const handleReview = async ({
                       escalateNotified:
                           notifyUser || state.escalateNotified === true,
                   }
-            const nextState = store.save(context.key, saveFields)
+            const nextState = saveContext(context.key, saveFields)
             if (transientAuth) {
                 log.warn(
                     {
@@ -1155,11 +1229,23 @@ export const handleReview = async ({
         //      config.blockingSeverities (the project-config-merged value when
         //      Phase 5 lands).
         const payloadPaths = collectPayloadPaths(payload)
-        const { kept, dropped } = partitionFindings(
+        const { kept: keptAll, dropped } = partitionFindings(
             codexResult.findings,
             payloadPaths,
             context.repoRoot
         )
+        // Server-side guarantee for user exclusions (v1.1.3): the
+        // `state.exclusions` snapshot was captured before the reviewer
+        // ran; a long review gives the user time to add/remove
+        // exclusions from the dashboard mid-flight. Re-read the LIVE
+        // list from the store now so kept/blockingFindings/status,
+        // the archive entry, and the HTTP response all reflect what
+        // the user has decided NOW — not what they thought 3 minutes
+        // ago. The `saveContext` wrapper applies the same fresh list
+        // to the persisted nextState below.
+        const liveExclusions =
+            store.peek?.(context.key)?.exclusions ?? state.exclusions ?? []
+        const kept = filterByExclusions(keptAll, liveExclusions)
         const blockingFindings = computeBlocking(
             kept,
             config.blockingSeverities
@@ -1178,6 +1264,16 @@ export const handleReview = async ({
             lastResultStatus: status,
             // priorFindings tracks ONLY blockers across rounds — Codex's next
             // job is to verify each one is resolved, not to chase nits.
+            // blockingFindings was already derived from `kept`, which
+            // was filtered with `liveExclusions` (read fresh from the
+            // store via peek). Filtering AGAIN here with the stale
+            // `state.exclusions` snapshot would harm the
+            // "remove mid-run" path — it'd drop blockers the live
+            // filter correctly let back through, leaving the saved
+            // cache empty while the response still reports ISSUES.
+            // saveContext also defensively re-filters priorFindings
+            // against peek()ed exclusions, so the no-op assignment
+            // here is safe and correct.
             priorFindings: status === "ISSUES" ? blockingFindings : [],
             // blockCount is consumed only by Stop-hook ISSUES results.
             blockCount:
@@ -1215,7 +1311,7 @@ export const handleReview = async ({
             nextState.priorFindings = []
         }
 
-        const saved = store.save(context.key, nextState)
+        const saved = saveContext(context.key, nextState)
 
         log.info(
             {

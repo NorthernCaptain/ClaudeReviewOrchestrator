@@ -348,6 +348,64 @@ describe("createApp wiring", () => {
         }
     })
 
+    test("POST /dashboard/exclusions adds + removes per context (v1.1)", async () => {
+        const { url, store, close } = await start(minimalConfig(), happyDeps)
+        try {
+            store.save("/r|main", {
+                repoRoot: "/r",
+                branch: "main",
+                lastReviewedAt: 1,
+            })
+            const add = await fetch(`${url}/dashboard/exclusions`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    contextKey: "/r|main",
+                    file: "a.js",
+                    message: "noise",
+                    action: "add",
+                }),
+            })
+            expect(add.status).toBe(200)
+            const addBody = await add.json()
+            expect(addBody.exclusions).toHaveLength(1)
+            const remove = await fetch(`${url}/dashboard/exclusions`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    contextKey: "/r|main",
+                    file: "a.js",
+                    message: "noise",
+                    action: "remove",
+                }),
+            })
+            expect(remove.status).toBe(200)
+            const rmBody = await remove.json()
+            expect(rmBody.exclusions).toHaveLength(0)
+        } finally {
+            await close()
+        }
+    })
+
+    test("POST /dashboard/exclusions rejects an unknown context with 404", async () => {
+        const { url, close } = await start(minimalConfig(), happyDeps)
+        try {
+            const r = await fetch(`${url}/dashboard/exclusions`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    contextKey: "/nope|x",
+                    file: "a",
+                    message: "m",
+                    action: "add",
+                }),
+            })
+            expect(r.status).toBe(404)
+        } finally {
+            await close()
+        }
+    })
+
     test("POST /dashboard/reset rejects an unknown contextKey with 404", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {

@@ -178,6 +178,62 @@ describe("wrapPrompt", () => {
         expect(out.slice(start, end)).toMatch(/Trusted directive/)
         expect(out.slice(start, end)).toMatch(/Check the auth flow\./)
     })
+
+    test("EXCLUSIONS block is emitted when exclusions are supplied (v1.1)", () => {
+        const out = wrapPrompt({
+            payloadText: "x",
+            exclusions: [
+                {
+                    file: "a.js",
+                    message: "unused var",
+                    excludedAt: 12345,
+                },
+                { file: "b.js", message: "long line" },
+            ],
+        })
+        expect(out).toContain("<<<EXCLUSIONS>>>")
+        expect(out).toContain("<<<END_EXCLUSIONS>>>")
+        const start = out.indexOf("<<<EXCLUSIONS>>>")
+        const end = out.indexOf("<<<END_EXCLUSIONS>>>")
+        const block = out.slice(start, end)
+        // Directive present, file + message present, excludedAt stripped.
+        expect(block).toMatch(/Trusted directive/)
+        expect(block).toContain('"file": "a.js"')
+        expect(block).toContain('"message": "unused var"')
+        expect(block).not.toContain("excludedAt")
+    })
+
+    test("EXCLUSIONS block is omitted when exclusions is empty / missing", () => {
+        // The preamble mentions <<<EXCLUSIONS>>> as a marker name in
+        // its trust-model description — that's documentation, not a
+        // real section. The END marker only appears when an actual
+        // block is emitted.
+        expect(wrapPrompt({ payloadText: "x" })).not.toContain(
+            "<<<END_EXCLUSIONS>>>"
+        )
+        expect(wrapPrompt({ payloadText: "x", exclusions: [] })).not.toContain(
+            "<<<END_EXCLUSIONS>>>"
+        )
+    })
+
+    test("EXCLUSIONS block survives entries missing required fields by filtering them out", () => {
+        const out = wrapPrompt({
+            payloadText: "x",
+            exclusions: [
+                { file: "ok.js", message: "real" },
+                { file: 5, message: "bad-file" }, // dropped
+                { file: "missing-msg.js" }, // dropped
+                null, // dropped
+            ],
+        })
+        expect(out).toContain('"file": "ok.js"')
+        expect(out).not.toContain("bad-file")
+        expect(out).not.toContain("missing-msg.js")
+    })
+
+    test("preamble names EXCLUSIONS in the trust model", () => {
+        expect(SYSTEM_PREAMBLE).toMatch(/EXCLUSIONS/)
+    })
 })
 
 describe("buildCodexArgs", () => {

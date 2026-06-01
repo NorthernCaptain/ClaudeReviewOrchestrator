@@ -24,6 +24,12 @@ const blankContext = ({ key, repoRoot, branch }) => ({
     blockCount: 0,
     lastBaseline: null,
     priorFindings: [],
+    // User-curated exclusion list (v1.1). Each entry is
+    // { file, message, excludedAt }. Findings whose (file, message)
+    // pair matches an entry are silently dropped from saved
+    // priorFindings (so NO_PROGRESS doesn't fire on them) and listed
+    // as a trusted directive in the next reviewer prompt.
+    exclusions: [],
     lastReviewedAt: 0,
     lastResultStatus: null,
     lastEscalateReason: null,
@@ -71,6 +77,9 @@ const idleResetContext = ({ key, repoRoot, branch }, existing) => ({
     codexRounds: 0,
     blockCount: 0,
     priorFindings: existing?.priorFindings ?? [],
+    // User exclusions persist across idle reset (they reflect ongoing
+    // policy, not transient loop state).
+    exclusions: existing?.exclusions ?? [],
     lastReviewedAt: 0,
     lastBaseline: existing?.lastBaseline ?? null,
     lastResultStatus: existing?.lastResultStatus ?? null,
@@ -153,14 +162,27 @@ export const createStateStore = ({
     }
 
     const reset = ({ key, repoRoot, branch }) => {
-        contexts[key] = blankContext({ key, repoRoot, branch })
+        // Preserve user-set exclusions across an explicit /reset —
+        // they encode ongoing policy ('don't flag X here'), not loop
+        // state that the user wanted cleared.
+        const existing = contexts[key]
+        const fresh = blankContext({ key, repoRoot, branch })
+        fresh.exclusions = existing?.exclusions ?? []
+        contexts[key] = fresh
         persistAtomically(filePath, contexts)
         return cloneState(contexts[key])
     }
 
     const list = () => Object.values(contexts).map(cloneState)
 
-    return { get, save, reset, list }
+    // Read the current persisted state for a context WITHOUT triggering
+    // idle reset, save, or cloning. Used by review.js right before
+    // saving review results so a concurrent dashboard mutation
+    // (e.g. POST /dashboard/exclusions during a long review) isn't
+    // clobbered by the stale snapshot the review captured at its start.
+    const peek = (key) => contexts[key] ?? null
+
+    return { get, save, reset, list, peek }
 }
 
 export const __test__ = { blankContext, cloneState }

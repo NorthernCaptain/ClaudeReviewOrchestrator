@@ -18,6 +18,7 @@ import { mountStatusRoute } from "./status.js"
 import { mountDashboardRoute } from "./dashboard.js"
 import { mountNotifyChangeRoute } from "./notify-change.js"
 import { mountProviderRoute, handleSetProvider } from "./provider.js"
+import { handleExclusionMutation } from "./exclusions.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { createMetrics } from "./metrics.js"
@@ -198,6 +199,13 @@ export const createApp = ({
             logger: log,
             deps,
         })
+        res.status(result.httpStatus).json(result.body)
+    })
+
+    // Per-context exclusion mutations (v1.1). Loopback-only; same trust
+    // boundary as the other dashboard mutation routes.
+    app.post("/dashboard/exclusions", loopbackOnly, (req, res) => {
+        const result = handleExclusionMutation({ body: req.body, store })
         res.status(result.httpStatus).json(result.body)
     })
 

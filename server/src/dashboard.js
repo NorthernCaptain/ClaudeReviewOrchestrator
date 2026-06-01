@@ -617,6 +617,100 @@ export const renderControls = (currentProvider, contexts = []) => {
     )
 }
 
+// Dedicated exclusions panel (v1.1). Shows every excluded finding for
+// the dashboard's "current" context — by default the same context the
+// Reset selector pre-selects (most recent lastReviewedAt). The client
+// script swaps the panel body when the user changes the Reset
+// selector. Each row carries an Include button.
+export const renderExclusionsPanel = (contexts = []) => {
+    const sorted = [...(contexts ?? [])].sort((a, b) =>
+        String(a.key ?? "").localeCompare(String(b.key ?? ""))
+    )
+    // Same default-context rule the Reset selector uses.
+    let defaultKey = null
+    let mostRecent = 0
+    for (const c of sorted) {
+        const ts = Number(c?.lastReviewedAt) || 0
+        if (ts > mostRecent) {
+            mostRecent = ts
+            defaultKey = c.key
+        }
+    }
+    const exclusionsByKey = new Map()
+    for (const c of sorted) {
+        if (c?.key) exclusionsByKey.set(c.key, c.exclusions ?? [])
+    }
+    const body = renderExclusionsBody(
+        defaultKey ? (exclusionsByKey.get(defaultKey) ?? []) : [],
+        defaultKey
+    )
+    // Serialize the per-context exclusions as a JSON island the client
+    // reads when the Reset selector changes — saves a roundtrip and
+    // keeps the panel in lockstep with whatever the server most
+    // recently saw.
+    const dataIsland = JSON.stringify(
+        Object.fromEntries(exclusionsByKey),
+        null,
+        0
+    )
+    return (
+        `<div class="exclusions" aria-label="exclusions">` +
+        `<div class="exc-title">excluded findings · <span id="exclusions-context">${escapeHtml(
+            defaultKey ?? "(none)"
+        )}</span></div>` +
+        `<div id="exclusions-body">${body}</div>` +
+        `<script type="application/json" id="exclusions-data">${escapeForScriptText(
+            dataIsland
+        )}</script>` +
+        `</div>`
+    )
+}
+
+// JSON sitting inside a <script> tag is RAW text — HTML entity escaping
+// (escapeHtml) would leave `&quot;` instead of `"` and JSON.parse would
+// fail. The only thing we need to neutralize is a `</script>` (or HTML
+// comment opener) that would prematurely close the tag. Escaping `<`
+// to `<` and `>` to `>` covers both cases; JSON quotes and
+// every other character are preserved verbatim. Also escape the JSON-
+// breaking U+2028 / U+2029 separators that some JS engines stumble on.
+const escapeForScriptText = (s) =>
+    String(s)
+        .replace(/</g, "\\u003c")
+        .replace(/>/g, "\\u003e")
+        .replace(/\u2028/g, "\\u2028")
+        .replace(/\u2029/g, "\\u2029")
+
+// Render the inner list for a single context's exclusions. Each row
+// shows file:message and an Include button that posts the remove
+// action. When the contextKey is null (e.g. no contexts yet) we show
+// a placeholder.
+const renderExclusionsBody = (exclusions, contextKey) => {
+    if (!contextKey) {
+        return `<div class="empty">no context selected</div>`
+    }
+    const list = Array.isArray(exclusions) ? exclusions : []
+    if (list.length === 0) {
+        return `<div class="empty">no exclusions for this context</div>`
+    }
+    return list
+        .map((e) => {
+            const file = escapeHtml(e?.file ?? "")
+            const msg = escapeHtml(e?.message ?? "")
+            return (
+                `<div class="exc-row">` +
+                `<button class="excl-btn on" type="button" ` +
+                `data-context-key="${escapeHtml(contextKey)}" ` +
+                `data-file="${file}" ` +
+                `data-message="${msg}" ` +
+                `data-action="remove">Include</button>` +
+                `<code class="exc-file">${file}</code>` +
+                `<span class="exc-msg">${msg}</span>` +
+                `</div>`
+            )
+        })
+        .join("")
+}
+
 const renderConfigPanel = (config) => {
     if (!config) return ""
     const provider = config.provider ?? "codex"
@@ -664,7 +758,14 @@ const renderConfigPanel = (config) => {
     )
 }
 
-const renderFinding = (f) => {
+// Stable match key (file + message) used both client- and server-side
+// to test whether a finding is currently excluded for its context.
+// Line is deliberately NOT included so a code shift doesn't break the
+// match.
+const findingMatchKey = (file, message) => `${file ?? ""}\n${message ?? ""}`
+
+const renderFinding = (f, opts = {}) => {
+    const { contextKey = null, excludedKeys = null } = opts
     const sev = String(f.severity ?? "?").toLowerCase()
     const badge = SEVERITY_BADGE[sev] ?? { bg: "#e5e7eb", fg: "#374151" }
     const file = escapeHtml(f.file ?? "(unknown)")
@@ -676,8 +777,27 @@ const renderFinding = (f) => {
               String(f.suggestion).slice(0, 800)
           )}${String(f.suggestion).length > 800 ? "…" : ""}</div>`
         : ""
+    // Exclude/Include toggle (v1.1). Only rendered when we have a
+    // resolved context key for this row — ambiguous (repo, branch)
+    // pairs leave the button off so a click can't target the wrong
+    // store entry.
+    let toggle = ""
+    if (contextKey) {
+        const matchKey = findingMatchKey(f.file, f.message)
+        const isExcluded = excludedKeys && excludedKeys.has(matchKey)
+        const label = isExcluded ? "Include" : "Exclude"
+        toggle =
+            `<button class="excl-btn${isExcluded ? " on" : ""}" ` +
+            `type="button" ` +
+            `data-context-key="${escapeHtml(contextKey)}" ` +
+            `data-file="${escapeHtml(f.file ?? "")}" ` +
+            `data-message="${escapeHtml(f.message ?? "")}" ` +
+            `data-action="${isExcluded ? "remove" : "add"}"` +
+            `>${label}</button>`
+    }
     return (
         `<li>` +
+        toggle +
         `<span class="sev" style="background:${badge.bg};color:${badge.fg}">${escapeHtml(sev)}</span> ` +
         `<code class="loc">${file}:${line}</code> ` +
         `<span class="cat">${cat}</span>` +
@@ -729,7 +849,13 @@ const renderReviewRow = (r) => {
     } else if (r.findingsCount === 0) {
         body = `<div class="empty">no findings — clean review</div>`
     } else {
-        body = `<ul class="findings">${r.findings.map(renderFinding).join("")}</ul>`
+        const opts = {
+            contextKey: r._contextKey ?? null,
+            excludedKeys: r._excludedKeys ?? null,
+        }
+        body = `<ul class="findings">${r.findings
+            .map((f) => renderFinding(f, opts))
+            .join("")}</ul>`
     }
     const meta =
         `<div class="meta">` +
@@ -907,6 +1033,31 @@ section.compact > h2 { margin-bottom: 8px; }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .controls .status.ok { color: #16a34a; }
 .controls .status.err { color: #c2410c; }
+/* Exclude / Include toggle on each finding (v1.1). */
+.excl-btn { float: right; background: var(--bg); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 3px;
+  padding: 2px 8px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em; cursor: pointer;
+  margin-left: 8px; }
+.excl-btn:hover { color: var(--fg); border-color: var(--accent); }
+.excl-btn.on { background: #fef9c3; color: #a16207; border-color: #a16207; }
+.excl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+/* Dedicated exclusions panel below the controls bar. */
+.exclusions { margin-top: 12px; padding-top: 12px;
+  border-top: 1px solid var(--border); }
+.exclusions .exc-title { color: var(--muted); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+  margin-bottom: 8px; }
+.exclusions #exclusions-context { font-family: ui-monospace,
+  SFMono-Regular, Menlo, monospace; }
+#exclusions-body { display: flex; flex-direction: column; gap: 6px; }
+.exc-row { display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; }
+.exc-row .exc-file { font-family: ui-monospace, SFMono-Regular, Menlo,
+  monospace; font-size: 11px; color: var(--muted); }
+.exc-row .exc-msg { flex: 1 1 auto; }
+.exclusions .empty { color: var(--muted); font-size: 12px;
+  font-style: italic; }
 @media (max-width: 720px) {
   .config-row { flex-direction: column; }
   .inflight-slot { border-left: 0; border-top: 2px solid var(--accent);
@@ -1020,13 +1171,32 @@ export const renderDashboard = ({
             contextKeyByRepoBranch.set(lookup, c.key ?? null)
         }
     }
-    const recordsWithIds = records.map((r, i) => ({
-        ...r,
-        _id: `review-${i}`,
-        _contextKey:
+    // Per-context exclusion match-key sets (v1.1). Used by the row
+    // finding renderer to label each Exclude/Include toggle correctly.
+    const excludedKeysByContext = new Map()
+    for (const c of contexts ?? []) {
+        if (!c?.key) continue
+        const set = new Set()
+        for (const e of c.exclusions ?? []) {
+            if (typeof e?.file === "string" && typeof e?.message === "string") {
+                set.add(`${e.file}\n${e.message}`)
+            }
+        }
+        excludedKeysByContext.set(c.key, set)
+    }
+    const recordsWithIds = records.map((r, i) => {
+        const ctxKey =
             contextKeyByRepoBranch.get(`${basenameOf(r)}:${r.branch ?? ""}`) ??
-            null,
-    }))
+            null
+        return {
+            ...r,
+            _id: `review-${i}`,
+            _contextKey: ctxKey,
+            _excludedKeys: ctxKey
+                ? (excludedKeysByContext.get(ctxKey) ?? new Set())
+                : null,
+        }
+    })
     // Reviews section now shows EVERY attempt (success + failure) so a
     // chart click always lands on a row. The Failed section below
     // remains as a focused quick-view of just the ESCALATEs.
@@ -1057,6 +1227,7 @@ export const renderDashboard = ({
     ${renderInFlight(inFlight)}
   </div>
   ${renderControls(config?.provider, contexts)}
+  ${renderExclusionsPanel(contexts)}
 </section>
 
 <section aria-label="charts">
@@ -1271,6 +1442,12 @@ export const renderDashboard = ({
           curCtrl.replaceWith(freshCtrl);
           wireControls();
         }
+        var freshExcl = doc.querySelector(".exclusions");
+        var curExcl = document.querySelector(".exclusions");
+        if (freshExcl && curExcl) curExcl.replaceWith(freshExcl);
+        var freshData = doc.getElementById("exclusions-data");
+        var curData = document.getElementById("exclusions-data");
+        if (freshData && curData) curData.replaceWith(freshData);
       })
       .catch(function () {})
       .finally(function () { refreshing = false; });
@@ -1351,6 +1528,123 @@ export const renderDashboard = ({
       });
     }
   }
+
+  // Exclusion toggle (v1.1). One delegated listener for every
+  // .excl-btn anywhere on the page — survives section refreshes.
+  function readExclusionsData() {
+    var el = document.getElementById("exclusions-data");
+    if (!el) return {};
+    try { return JSON.parse(el.textContent || "{}"); }
+    catch (e) { return {}; }
+  }
+  function writeExclusionsData(obj) {
+    var el = document.getElementById("exclusions-data");
+    if (el) el.textContent = JSON.stringify(obj);
+  }
+  function renderExclusionRow(contextKey, e) {
+    return (
+      '<div class="exc-row">' +
+      '<button class="excl-btn on" type="button" ' +
+      'data-context-key="' + esc(contextKey) + '" ' +
+      'data-file="' + esc(e.file) + '" ' +
+      'data-message="' + esc(e.message) + '" ' +
+      'data-action="remove">Include</button>' +
+      '<code class="exc-file">' + esc(e.file) + '</code>' +
+      '<span class="exc-msg">' + esc(e.message) + '</span>' +
+      '</div>'
+    );
+  }
+  function renderPanelFor(contextKey) {
+    var ctxEl = document.getElementById("exclusions-context");
+    var body = document.getElementById("exclusions-body");
+    if (!body) return;
+    if (ctxEl) ctxEl.textContent = contextKey || "(none)";
+    if (!contextKey) {
+      body.innerHTML = '<div class="empty">no context selected</div>';
+      return;
+    }
+    var data = readExclusionsData();
+    var list = data[contextKey] || [];
+    body.innerHTML = list.length
+      ? list.map(function (e) { return renderExclusionRow(contextKey, e); }).join("")
+      : '<div class="empty">no exclusions for this context</div>';
+  }
+  function applyExclusionsUpdate(contextKey, file, message, action) {
+    var data = readExclusionsData();
+    var list = (data[contextKey] || []).slice();
+    var idx = -1;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].file === file && list[i].message === message) { idx = i; break; }
+    }
+    if (action === "add" && idx === -1) {
+      list.push({ file: file, message: message, excludedAt: Date.now() });
+    } else if (action === "remove" && idx !== -1) {
+      list.splice(idx, 1);
+    }
+    data[contextKey] = list;
+    writeExclusionsData(data);
+    // Refresh both the dedicated panel (if it's showing this ctx) AND
+    // every inline button currently in the DOM that targets the same
+    // (contextKey, file, message) — the row may live in Reviews and/or
+    // Failed sections.
+    var current = document.getElementById("exclusions-context");
+    if (current && current.textContent === contextKey) renderPanelFor(contextKey);
+    var nowExcluded = action === "add";
+    document.querySelectorAll('.excl-btn[data-context-key="' + cssEsc(contextKey) +
+      '"][data-file="' + cssEsc(file) + '"][data-message="' + cssEsc(message) + '"]'
+    ).forEach(function (b) {
+      // Skip the dedicated-panel buttons (they get rebuilt above) by
+      // checking the parent. They always carry the on class anyway.
+      if (b.closest("#exclusions-body")) return;
+      b.textContent = nowExcluded ? "Include" : "Exclude";
+      b.dataset.action = nowExcluded ? "remove" : "add";
+      if (nowExcluded) b.classList.add("on"); else b.classList.remove("on");
+    });
+  }
+  function cssEsc(s) {
+    return String(s).replace(/(["\\])/g, "\\$1");
+  }
+  document.addEventListener("click", function (e) {
+    var btn = e.target && e.target.closest && e.target.closest(".excl-btn");
+    if (!btn) return;
+    var contextKey = btn.dataset.contextKey;
+    var file = btn.dataset.file;
+    var message = btn.dataset.message;
+    var action = btn.dataset.action;
+    if (!contextKey || !file || !message || (action !== "add" && action !== "remove")) {
+      return;
+    }
+    btn.disabled = true;
+    fetch("/dashboard/exclusions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ contextKey: contextKey, file: file, message: message, action: action }),
+    })
+      .then(bodyToOk)
+      .then(function (r) {
+        if (r.ok) {
+          // Re-seed the data island from the server's authoritative list
+          // for this context (handles dedupe / race with another tab).
+          var data = readExclusionsData();
+          data[contextKey] = r.j.exclusions || [];
+          writeExclusionsData(data);
+          applyExclusionsUpdate(contextKey, file, message, action);
+          setStatus(action === "add" ? "excluded" : "included", true);
+        } else {
+          setStatus("error: " + (r.j.error || "failed"), false);
+        }
+      })
+      .catch(function (err) { setStatus("error: " + err.message, false); })
+      .finally(function () { btn.disabled = false; });
+  });
+
+  // When the Reset selector changes, swap the exclusions panel to the
+  // new context (data is already embedded in the JSON island).
+  document.addEventListener("change", function (e) {
+    if (e.target && e.target.id === "reset-context-select") {
+      renderPanelFor(e.target.value || null);
+    }
+  });
 
   wireControls();
   setInterval(tick, 1000);

@@ -291,3 +291,57 @@ describe("createStateStore — disk robustness", () => {
         expect(ctxs.map((c) => c.key).sort()).toEqual(["/a|main", "/b|main"])
     })
 })
+
+describe("exclusions (v1.1)", () => {
+    let dir, filePath
+    beforeEach(() => {
+        dir = mkdtempSync(path.join(tmpdir(), "state-excl-"))
+        filePath = path.join(dir, "state.json")
+    })
+    afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+    test("blank context has an empty exclusions array", () => {
+        const store = createStateStore({ filePath })
+        const s = store.get({ key: "/r|main", repoRoot: "/r", branch: "main" })
+        expect(s.exclusions).toEqual([])
+    })
+
+    test("idle reset preserves exclusions (same rule as priorFindings)", () => {
+        let t = 1000
+        const store = createStateStore({
+            filePath,
+            now: () => t,
+            idleResetMs: 500,
+        })
+        const ctx = { key: "/r|main", repoRoot: "/r", branch: "main" }
+        store.save(ctx.key, {
+            repoRoot: "/r",
+            branch: "main",
+            lastReviewedAt: 1000,
+            exclusions: [{ file: "a.js", message: "noise", excludedAt: 1 }],
+        })
+        t = 2000 // > idleResetMs
+        const s = store.get(ctx)
+        expect(s.exclusions).toEqual([
+            { file: "a.js", message: "noise", excludedAt: 1 },
+        ])
+    })
+
+    test("store.reset preserves exclusions but clears counters", () => {
+        const store = createStateStore({ filePath })
+        const ctx = { key: "/r|main", repoRoot: "/r", branch: "main" }
+        store.save(ctx.key, {
+            repoRoot: "/r",
+            branch: "main",
+            codexRounds: 4,
+            blockCount: 3,
+            exclusions: [{ file: "a.js", message: "noise", excludedAt: 7 }],
+        })
+        const fresh = store.reset(ctx)
+        expect(fresh.codexRounds).toBe(0)
+        expect(fresh.blockCount).toBe(0)
+        expect(fresh.exclusions).toEqual([
+            { file: "a.js", message: "noise", excludedAt: 7 },
+        ])
+    })
+})

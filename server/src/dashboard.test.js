@@ -1202,3 +1202,221 @@ describe("dashboard hardening (v1.0.9)", () => {
         )
     })
 })
+
+describe("exclusions UI (v1.1)", () => {
+    const buildHtml = (over = {}) =>
+        renderDashboard({
+            version: "x",
+            contexts: [
+                {
+                    key: "/r|main",
+                    repoRoot: "/r",
+                    branch: "main",
+                    lastReviewedAt: 100,
+                    exclusions: [
+                        { file: "a.js", message: "old issue", excludedAt: 7 },
+                    ],
+                },
+            ],
+            records: [
+                {
+                    ts: "2026-06-01T00:00:00Z",
+                    context: "r:main",
+                    repo: "r",
+                    branch: "main",
+                    status: "ISSUES",
+                    durationMs: 1000,
+                    findingsCount: 2,
+                    blockingCount: 2,
+                    droppedCount: 0,
+                    provider: "codex",
+                    model: "x",
+                    round: 1,
+                    blockCount: 0,
+                    trigger: "stop_hook",
+                    findings: [
+                        {
+                            file: "a.js",
+                            line: 1,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "old issue",
+                        },
+                        {
+                            file: "b.js",
+                            line: 2,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "new issue",
+                        },
+                    ],
+                    failureDetail: null,
+                },
+            ],
+            ...over,
+        })
+
+    test("renders Exclude on un-excluded findings and Include on already-excluded ones", () => {
+        const html = buildHtml()
+        // Inline button for the excluded finding: action=remove, label=Include.
+        expect(html).toMatch(
+            /<button class="excl-btn[^"]*" type="button"[^>]*data-file="a\.js"[^>]*data-action="remove"[^>]*>Include<\/button>/
+        )
+        // Inline button for the un-excluded finding: action=add, label=Exclude.
+        expect(html).toMatch(
+            /<button class="excl-btn[^"]*" type="button"[^>]*data-file="b\.js"[^>]*data-action="add"[^>]*>Exclude<\/button>/
+        )
+    })
+
+    test("renders the dedicated panel with the default context's exclusions", () => {
+        const html = buildHtml()
+        expect(html).toContain('aria-label="exclusions"')
+        expect(html).toContain('id="exclusions-context">/r|main<')
+        // The panel row exists for the excluded entry.
+        expect(html).toMatch(
+            /class="exc-row"[^]*data-file="a\.js"[^]*data-action="remove"/
+        )
+        // JSON data island carries the per-context exclusions for the
+        // client to swap panels without a roundtrip.
+        expect(html).toContain('id="exclusions-data"')
+    })
+
+    test("ambiguous (repo, branch) row gets NO inline buttons (can't disambiguate)", () => {
+        const html = renderDashboard({
+            version: "x",
+            contexts: [
+                {
+                    key: "/a/r|main",
+                    repoRoot: "/a/r",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                },
+                {
+                    key: "/b/r|main",
+                    repoRoot: "/b/r",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                },
+            ],
+            records: [
+                {
+                    ts: "x",
+                    context: "r:main",
+                    repo: "r",
+                    branch: "main",
+                    status: "ISSUES",
+                    durationMs: 1,
+                    findingsCount: 1,
+                    blockingCount: 1,
+                    droppedCount: 0,
+                    provider: "codex",
+                    model: "x",
+                    round: 1,
+                    blockCount: 0,
+                    trigger: "stop_hook",
+                    findings: [
+                        {
+                            file: "a.js",
+                            line: 1,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "x",
+                        },
+                    ],
+                    failureDetail: null,
+                },
+            ],
+        })
+        // The finding list exists but carries no inline excl-btn.
+        expect(html).toContain('<ul class="findings">')
+        const buttons = [
+            ...html.matchAll(/<button class="excl-btn[^>]+data-file="a\.js"/g),
+        ]
+        // Zero matches means the inline button is gone. (Dedicated
+        // panel might still render an empty body.)
+        expect(buttons).toHaveLength(0)
+    })
+
+    test("dashboard wires the exclusion click handler and the Reset-selector change handler", () => {
+        const html = buildHtml()
+        expect(html).toContain(
+            'e.target.closest && e.target.closest(".excl-btn")'
+        )
+        expect(html).toContain('e.target.id === "reset-context-select"')
+        expect(html).toContain('"/dashboard/exclusions"')
+    })
+})
+
+describe("exclusions data island is parseable JSON (v1.1.1)", () => {
+    const extractScript = (html) => {
+        const m = html.match(
+            /<script type="application\/json" id="exclusions-data">([\s\S]*?)<\/script>/
+        )
+        return m ? m[1] : null
+    }
+
+    test("script body is raw JSON — JSON.parse succeeds with the real contexts", () => {
+        // HTML entity escaping (the old bug) would produce &quot;
+        // inside the script and JSON.parse would throw. The new
+        // script-safe escape uses < for < etc., leaving JSON
+        // quotes intact.
+        const html = renderDashboard({
+            version: "x",
+            contexts: [
+                {
+                    key: "/r|main",
+                    repoRoot: "/r",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                    exclusions: [
+                        { file: "a.js", message: "noise", excludedAt: 7 },
+                    ],
+                },
+            ],
+            records: [],
+        })
+        const raw = extractScript(html)
+        expect(raw).toBeTruthy()
+        // textContent of a <script> tag is raw text — no HTML entity
+        // decoding. The OLD output `&quot;...&quot;` would crash here.
+        const parsed = JSON.parse(raw)
+        expect(parsed["/r|main"]).toEqual([
+            { file: "a.js", message: "noise", excludedAt: 7 },
+        ])
+    })
+
+    test("dangerous </script> sequences in the JSON payload don't break out of the tag", () => {
+        // A hand-crafted exclusion message containing </script> would
+        // close the tag if we emitted raw < — verify the escape
+        // converts < to < so the closer is harmless data.
+        const html = renderDashboard({
+            version: "x",
+            contexts: [
+                {
+                    key: "/r|main",
+                    repoRoot: "/r",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                    exclusions: [
+                        {
+                            file: "evil.js",
+                            message: "</script><script>alert(1)</script>",
+                            excludedAt: 1,
+                        },
+                    ],
+                },
+            ],
+            records: [],
+        })
+        const raw = extractScript(html)
+        expect(raw).toBeTruthy()
+        // No literal </script> inside the script body.
+        expect(raw).not.toMatch(/<\/script/i)
+        // But the original characters survive once JSON.parse decodes
+        // the < escapes back to <.
+        const parsed = JSON.parse(raw)
+        expect(parsed["/r|main"][0].message).toBe(
+            "</script><script>alert(1)</script>"
+        )
+    })
+})

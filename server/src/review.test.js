@@ -4070,7 +4070,13 @@ describe("handleReview — MAX_BLOCKS recovery exemption for empty-cache (v0.1.3
                 headSha: "abc",
                 progressHash: "p",
                 reviewConfigHash: computeReviewConfigHash(minimalConfig()),
-                files: { modified: [{ path: "a.js" }], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
                 totalBytes: 0,
                 truncated: false,
             },
@@ -4111,7 +4117,13 @@ describe("handleReview — MAX_BLOCKS recovery exemption for empty-cache (v0.1.3
                 headSha: "abc",
                 progressHash: "p",
                 reviewConfigHash: computeReviewConfigHash(minimalConfig()),
-                files: { modified: [{ path: "a.js" }], untracked: [], deleted: [], renamed: [], priorFindingContext: [] },
+                files: {
+                    modified: [{ path: "a.js" }],
+                    untracked: [],
+                    deleted: [],
+                    renamed: [],
+                    priorFindingContext: [],
+                },
                 totalBytes: 0,
                 truncated: false,
             },
@@ -4144,5 +4156,811 @@ describe("handleReview — MAX_BLOCKS recovery exemption for empty-cache (v0.1.3
         })
         expect(r.body.code).toBe("MAX_BLOCKS")
         expect(runSpy).not.toHaveBeenCalled()
+    })
+})
+
+describe("handleReview — exclusions wiring (v1.1)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("state.exclusions is threaded into wrapPrompt", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            exclusions: [{ file: "a.js", message: "noise", excludedAt: 1 }],
+        })
+        let received = null
+        const runAndParse = jest.fn(async ({ prompt }) => {
+            received = prompt
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        expect(received).toContain("<<<EXCLUSIONS>>>")
+        expect(received).toContain('"file": "a.js"')
+        expect(received).toContain('"message": "noise"')
+    })
+
+    test("ISSUES result drops excluded findings from saved priorFindings", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            exclusions: [{ file: "a.js", message: "noise", excludedAt: 1 }],
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }, { path: "b.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        {
+                            file: "a.js",
+                            line: 1,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "noise",
+                        },
+                        {
+                            file: "b.js",
+                            line: 2,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "real",
+                        },
+                    ],
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
+                }),
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        // Excluded finding stripped; real one survives.
+        expect(after.priorFindings).toHaveLength(1)
+        expect(after.priorFindings[0].file).toBe("b.js")
+    })
+})
+
+describe("handleReview — excluded findings dropped from RESPONSE too (v1.1.1)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("reviewer re-emits an excluded blocker: server drops it; status stays GOOD_TO_GO", async () => {
+        // Server-side guarantee: even if the reviewer ignores the
+        // EXCLUSIONS prompt directive and re-emits a suppressed
+        // (file, message), the orchestrator drops it before computing
+        // blocking + status. The user-facing response stays clean.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            exclusions: [{ file: "a.js", message: "noise", excludedAt: 1 }],
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    // Reviewer ignores the directive and re-emits the
+                    // excluded finding (and ONLY that finding).
+                    status: "ISSUES",
+                    findings: [
+                        {
+                            file: "a.js",
+                            line: 1,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "noise",
+                        },
+                    ],
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
+                }),
+            }),
+        })
+        // No blockers reach the response; status flips to GOOD_TO_GO.
+        expect(r.body.blockingFindings).toEqual([])
+        expect(r.body.findings).toEqual([])
+        expect(r.body.status).toBe("GOOD_TO_GO")
+    })
+
+    test("reviewer emits an excluded blocker AND a different real blocker: response carries only the real one", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            exclusions: [{ file: "a.js", message: "noise", excludedAt: 1 }],
+        })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }, { path: "b.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [
+                        {
+                            file: "a.js",
+                            line: 1,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "noise",
+                        },
+                        {
+                            file: "b.js",
+                            line: 2,
+                            severity: "blocker",
+                            category: "bug",
+                            message: "real",
+                        },
+                    ],
+                    raw: {
+                        exitCode: 0,
+                        durationMs: 1,
+                        rawStdout: "{}",
+                        rawStderr: "",
+                    },
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("ISSUES")
+        expect(r.body.findings).toHaveLength(1)
+        expect(r.body.findings[0].file).toBe("b.js")
+        expect(r.body.blockingFindings).toHaveLength(1)
+    })
+})
+
+describe("handleReview — concurrent exclusion mutation isn't clobbered (v1.1.2)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("an exclusion added DURING the review survives the final save", async () => {
+        // Mid-flight mutation: handleReview captures state at the
+        // start (empty exclusions). The runAndParse stub then mutates
+        // the store directly — simulating a /dashboard/exclusions POST
+        // landing while the reviewer is still running. When the review
+        // pipeline completes and writes nextState back, the helper
+        // re-reads peek() and forces the latest exclusions into the
+        // write so the user's mutation isn't lost.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        const runAndParse = async () => {
+            // Concurrent dashboard add — exactly what handleExclusionMutation does:
+            store.save("/repo|main", {
+                ...store.get({
+                    key: "/repo|main",
+                    repoRoot: "/repo",
+                    branch: "main",
+                }),
+                exclusions: [
+                    { file: "z.js", message: "added mid-run", excludedAt: 42 },
+                ],
+            })
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }
+        }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        // The mid-run add survived the final save.
+        expect(after.exclusions).toEqual([
+            { file: "z.js", message: "added mid-run", excludedAt: 42 },
+        ])
+    })
+
+    test("an exclusion REMOVED during the review stays removed (no zombie resurrection)", async () => {
+        // Seed with one exclusion. Mid-review the user removes it.
+        // The review save must NOT bring it back.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            exclusions: [
+                { file: "old.js", message: "obsolete", excludedAt: 1 },
+            ],
+        })
+        const runAndParse = async () => {
+            store.save("/repo|main", {
+                ...store.get({
+                    key: "/repo|main",
+                    repoRoot: "/repo",
+                    branch: "main",
+                }),
+                exclusions: [], // user removed it via /dashboard/exclusions
+            })
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }
+        }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        // The mid-run removal survived; review didn't write the
+        // stale exclusion back.
+        expect(after.exclusions).toEqual([])
+    })
+
+    test("priorFindings being saved is re-filtered against the latest exclusions", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        const runAndParse = async () => {
+            // User adds an exclusion for "a.js / noise" mid-run.
+            store.save("/repo|main", {
+                ...store.get({
+                    key: "/repo|main",
+                    repoRoot: "/repo",
+                    branch: "main",
+                }),
+                exclusions: [{ file: "a.js", message: "noise", excludedAt: 7 }],
+            })
+            // Reviewer returns both the excluded one and a real one.
+            return {
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "noise",
+                    },
+                    {
+                        file: "b.js",
+                        line: 2,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "real",
+                    },
+                ],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }
+        }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }, { path: "b.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        // The newly-added exclusion survived AND priorFindings was
+        // re-filtered against it — only the real finding remains.
+        expect(after.exclusions).toEqual([
+            { file: "a.js", message: "noise", excludedAt: 7 },
+        ])
+        expect(after.priorFindings).toHaveLength(1)
+        expect(after.priorFindings[0].file).toBe("b.js")
+    })
+})
+
+describe("handleReview — mid-run exclusion drift invalidates cache (v1.1.6)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("mid-run ADD forces dirtySinceLastReview=true and lastBaseline=null", async () => {
+        // Seed a fresh context (no exclusions). The runAndParse stub
+        // simulates a /dashboard/exclusions add landing while the
+        // reviewer is running — the verdict the reviewer reaches was
+        // computed against the OLD (empty) exclusion list, so the
+        // baseline must NOT be cached.
+        store.save("/repo|main", { repoRoot: "/repo", branch: "main" })
+        const runAndParse = async () => {
+            store.save("/repo|main", {
+                ...store.get({
+                    key: "/repo|main",
+                    repoRoot: "/repo",
+                    branch: "main",
+                }),
+                exclusions: [
+                    { file: "z.js", message: "added mid-run", excludedAt: 42 },
+                ],
+            })
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }
+        }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.lastBaseline).toBeNull()
+        expect(after.dirtySinceLastReview).toBe(true)
+    })
+
+    test("mid-run REMOVE forces dirtySinceLastReview=true and lastBaseline=null", async () => {
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            exclusions: [
+                { file: "old.js", message: "obsolete", excludedAt: 1 },
+            ],
+        })
+        const runAndParse = async () => {
+            store.save("/repo|main", {
+                ...store.get({
+                    key: "/repo|main",
+                    repoRoot: "/repo",
+                    branch: "main",
+                }),
+                exclusions: [],
+            })
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }
+        }
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.lastBaseline).toBeNull()
+        expect(after.dirtySinceLastReview).toBe(true)
+    })
+
+    test("no exclusion drift leaves cache fields written normally", async () => {
+        // No mutation during the run — the terminal save should NOT
+        // force lastBaseline=null. A normal GOOD_TO_GO writes a fresh
+        // baseline and clears dirtySinceLastReview.
+        store.save("/repo|main", { repoRoot: "/repo", branch: "main" })
+        const runAndParse = async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: {
+                exitCode: 0,
+                durationMs: 1,
+                rawStdout: "{}",
+                rawStderr: "",
+            },
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.lastBaseline).not.toBeNull()
+        expect(after.dirtySinceLastReview).toBe(false)
+    })
+})
+
+describe("handleReview — response uses LIVE exclusions, not stale snapshot (v1.1.3)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("exclusion added DURING the review is honored in the HTTP response too", async () => {
+        // The review pipeline captures state at its start. If we
+        // computed kept/blocking/status from that stale snapshot, the
+        // dashboard's mid-run /dashboard/exclusions add would have
+        // landed in the persisted state (thanks to saveContext) but
+        // the user-facing response and the archive entry would still
+        // surface the suppressed finding. Codex flagged this. The fix
+        // re-reads exclusions via store.peek BEFORE filtering kept.
+        store.save("/repo|main", { repoRoot: "/repo", branch: "main" })
+        const runAndParse = async () => {
+            // Mid-run: simulate a /dashboard/exclusions POST adding an
+            // exclusion for the (a.js, "mid-run noise") pair the
+            // reviewer is about to emit.
+            store.save("/repo|main", {
+                ...store.get({
+                    key: "/repo|main",
+                    repoRoot: "/repo",
+                    branch: "main",
+                }),
+                exclusions: [
+                    {
+                        file: "a.js",
+                        message: "mid-run noise",
+                        excludedAt: 42,
+                    },
+                ],
+            })
+            return {
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "mid-run noise",
+                    },
+                ],
+                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+            }
+        }
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        // The freshly-excluded finding is filtered out of the response.
+        expect(r.body.findings).toEqual([])
+        expect(r.body.blockingFindings).toEqual([])
+        expect(r.body.status).toBe("GOOD_TO_GO")
+    })
+
+    test("exclusion REMOVED during the review lets a previously-suppressed finding surface", async () => {
+        // Inverse race: state.exclusions captured = [{noise}]. Mid-run
+        // the user CLEARS the exclusions. The reviewer emits the
+        // (now-un-excluded) finding. The response must surface it.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            exclusions: [
+                { file: "a.js", message: "was-excluded", excludedAt: 1 },
+            ],
+        })
+        const runAndParse = async () => {
+            store.save("/repo|main", {
+                ...store.get({
+                    key: "/repo|main",
+                    repoRoot: "/repo",
+                    branch: "main",
+                }),
+                exclusions: [], // user un-excluded mid-run
+            })
+            return {
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "was-excluded",
+                    },
+                ],
+                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+            }
+        }
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        // The previously-excluded finding now surfaces because the user
+        // cleared their exclusion mid-run.
+        expect(r.body.status).toBe("ISSUES")
+        expect(r.body.findings).toHaveLength(1)
+        expect(r.body.findings[0].file).toBe("a.js")
+        expect(r.body.blockingFindings).toHaveLength(1)
+    })
+})
+
+describe("handleReview — remove-mid-run preserves priorFindings cache (v1.1.4)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    test("response reports ISSUES AND priorFindings carries the unblocked blocker", async () => {
+        // Codex caught: response was correct (live filter) but the
+        // priorFindings cache was being re-filtered with the STALE
+        // state.exclusions snapshot, leaving the cache empty while
+        // lastResultStatus="ISSUES". On the next Stop event,
+        // NO_PROGRESS would fire with an empty findings list — the
+        // exact stuck-loop shape v0.1.30 was built to prevent.
+        store.save("/repo|main", {
+            repoRoot: "/repo",
+            branch: "main",
+            // SNAPSHOT-time: the exclusion exists.
+            exclusions: [
+                { file: "a.js", message: "was-excluded", excludedAt: 1 },
+            ],
+        })
+        const runAndParse = async () => {
+            // Mid-run: the user clears the exclusion via the dashboard.
+            store.save("/repo|main", {
+                ...store.get({
+                    key: "/repo|main",
+                    repoRoot: "/repo",
+                    branch: "main",
+                }),
+                exclusions: [],
+            })
+            return {
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "was-excluded",
+                    },
+                ],
+                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+            }
+        }
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        files: {
+                            modified: [{ path: "a.js" }],
+                            untracked: [],
+                            deleted: [],
+                            renamed: [],
+                            priorFindingContext: [],
+                        },
+                    }),
+                runAndParse,
+            }),
+        })
+        // Response uses live exclusions → ISSUES + 1 blocker (v1.1.3
+        // already covered this).
+        expect(r.body.status).toBe("ISSUES")
+        expect(r.body.blockingFindings).toHaveLength(1)
+        // Persisted cache also carries the blocker — without v1.1.4
+        // the stale filter would have wiped it.
+        const after = store.get({
+            key: "/repo|main",
+            repoRoot: "/repo",
+            branch: "main",
+        })
+        expect(after.lastResultStatus).toBe("ISSUES")
+        expect(after.priorFindings).toHaveLength(1)
+        expect(after.priorFindings[0].file).toBe("a.js")
+        // Defense-in-depth: the next Stop event won't trigger an
+        // empty-cache NO_PROGRESS_WITH_OPEN_ISSUES loop because the
+        // cache has the blocker the response showed.
     })
 })
