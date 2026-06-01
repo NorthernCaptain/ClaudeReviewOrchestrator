@@ -988,3 +988,33 @@ describe("live updates (v0.1.37)", () => {
         expect(refreshIdx).toBeGreaterThan(resetIdx)
     })
 })
+
+describe("URL hash + reset-selector sync on details toggle (v1.0.8)", () => {
+    test("inline script listens for toggle events at the document level", () => {
+        const html = renderDashboard({ version: "x", records: [] })
+        // Capture-phase listener so it picks up details inside
+        // refreshed sections without re-wiring.
+        expect(html).toContain('document.addEventListener("toggle"')
+        // The capture-phase `true` argument has to be there for
+        // non-bubbling toggle events.
+        expect(html).toMatch(/document\.addEventListener\("toggle"[\s\S]+?true\)/)
+    })
+
+    test("expanding a row updates the URL hash; collapsing the targeted row clears it", () => {
+        const html = renderDashboard({ version: "x", records: [] })
+        // setHash via history.replaceState — both branches present.
+        expect(html).toContain("history.replaceState")
+        expect(html).toContain('"#" + hash')
+        // Collapse branch clears the hash via location.pathname.
+        expect(html).toContain("location.pathname + location.search")
+    })
+
+    test("expanding a row points the reset selector at the matching context", () => {
+        const html = renderDashboard({ version: "x", records: [] })
+        // syncResetToContext walks the reset options matching by
+        // textContent (the "repo:branch" label rendered in <summary>).
+        expect(html).toContain("syncResetToContext")
+        expect(html).toContain("reset-context-select")
+        expect(html).toContain("summary .repo")
+    })
+})

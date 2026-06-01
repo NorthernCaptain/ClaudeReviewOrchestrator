@@ -1053,8 +1053,10 @@ export const renderDashboard = ({
 </main>
 <script>
 // Open the target <details> when a chart bar is clicked and the URL
-// hash changes. Native :target cannot set the open attribute,
-// so a small JS snippet does it.
+// hash changes, AND keep the URL + reset selector in sync as the user
+// expands / collapses rows by hand (v1.0.8). Reloading the page after
+// a manual collapse used to bring back the old #review-N hash and
+// auto-open the wrong row.
 (function () {
   function openTarget() {
     if (!location.hash) return
@@ -1067,6 +1069,45 @@ export const renderDashboard = ({
   }
   window.addEventListener("hashchange", openTarget)
   window.addEventListener("load", openTarget)
+
+  // history.replaceState avoids polluting the back stack on every
+  // expand/collapse. It does NOT fire hashchange, so it can't loop
+  // through openTarget above.
+  function setHash(hash) {
+    if (!history || typeof history.replaceState !== "function") return
+    if (hash) history.replaceState(null, "", "#" + hash)
+    else history.replaceState(null, "", location.pathname + location.search)
+  }
+
+  // When a row expands, find the matching context option (by its
+  // visible "repo:branch" label) and select it so a quick Reset
+  // click targets the right repo+branch.
+  function syncResetToContext(label) {
+    if (!label) return
+    var sel = document.getElementById("reset-context-select")
+    if (!sel) return
+    for (var i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].textContent === label) {
+        sel.value = sel.options[i].value
+        return
+      }
+    }
+  }
+
+  // The toggle event does NOT bubble, but capture-phase listeners
+  // still see it. Attaching at document level survives section
+  // refreshes that replace the inner details elements.
+  document.addEventListener("toggle", function (e) {
+    var d = e.target
+    if (!d || d.tagName !== "DETAILS") return
+    if (d.open) {
+      if (d.id) setHash(d.id)
+      var repoEl = d.querySelector("summary .repo")
+      if (repoEl) syncResetToContext(repoEl.textContent.trim())
+    } else if (d.id && location.hash === "#" + d.id) {
+      setHash("")
+    }
+  }, true)
 })();
 
 // Live dashboard updates (v0.1.37):
