@@ -838,7 +838,9 @@ describe("renderControls (v0.1.35)", () => {
         const html = renderControls("gemini", [])
         expect(html).toContain('id="provider-select"')
         expect(html).toContain('<option value="codex">codex</option>')
-        expect(html).toContain('<option value="gemini" selected>gemini</option>')
+        expect(html).toContain(
+            '<option value="gemini" selected>gemini</option>'
+        )
         expect(html).toContain('<option value="claude">claude</option>')
     })
 
@@ -887,9 +889,27 @@ describe("renderControls (v0.1.35)", () => {
     test("pre-selects the context with the most recent lastReviewedAt (v1.0.6)", () => {
         // Three contexts; "b:main" was reviewed most recently.
         const html = renderControls("codex", [
-            { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 100 },
-            { key: "/b|main", repo: "b", repoRoot: "/b", branch: "main", lastReviewedAt: 500 },
-            { key: "/c|main", repo: "c", repoRoot: "/c", branch: "main", lastReviewedAt: 200 },
+            {
+                key: "/a|main",
+                repo: "a",
+                repoRoot: "/a",
+                branch: "main",
+                lastReviewedAt: 100,
+            },
+            {
+                key: "/b|main",
+                repo: "b",
+                repoRoot: "/b",
+                branch: "main",
+                lastReviewedAt: 500,
+            },
+            {
+                key: "/c|main",
+                repo: "c",
+                repoRoot: "/c",
+                branch: "main",
+                lastReviewedAt: 200,
+            },
         ])
         // Exactly one CONTEXT <option> carries `selected` (filtered by
         // value-starts-with-/ to exclude the provider-select options
@@ -906,7 +926,13 @@ describe("renderControls (v0.1.35)", () => {
 
     test("falls back to no preselection when no context has been reviewed yet", () => {
         const html = renderControls("codex", [
-            { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 0 },
+            {
+                key: "/a|main",
+                repo: "a",
+                repoRoot: "/a",
+                branch: "main",
+                lastReviewedAt: 0,
+            },
             { key: "/b|main", repo: "b", repoRoot: "/b", branch: "main" }, // undefined
         ])
         // No context-option carries `selected`. (Provider options DO
@@ -920,10 +946,24 @@ describe("renderControls (v0.1.35)", () => {
     test("ties broken by sort order: most recent wins even when alphabetically later", () => {
         // "/z|main" is alphabetically last but most recent — pre-select it.
         const html = renderControls("codex", [
-            { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 50 },
-            { key: "/z|main", repo: "z", repoRoot: "/z", branch: "main", lastReviewedAt: 999 },
+            {
+                key: "/a|main",
+                repo: "a",
+                repoRoot: "/a",
+                branch: "main",
+                lastReviewedAt: 50,
+            },
+            {
+                key: "/z|main",
+                repo: "z",
+                repoRoot: "/z",
+                branch: "main",
+                lastReviewedAt: 999,
+            },
         ])
-        expect(html).toMatch(/<option value="\/z\|main" selected>z:main<\/option>/)
+        expect(html).toMatch(
+            /<option value="\/z\|main" selected>z:main<\/option>/
+        )
         expect(html).not.toMatch(/<option value="\/a\|main" selected>/)
     })
 
@@ -932,7 +972,9 @@ describe("renderControls (v0.1.35)", () => {
             version: "0.1.35",
             config: { provider: "codex" },
             records: [],
-            contexts: [{ key: "/x|main", repo: "x", repoRoot: "/x", branch: "main" }],
+            contexts: [
+                { key: "/x|main", repo: "x", repoRoot: "/x", branch: "main" },
+            ],
         })
         // The controls bar sits inside the active config section, BEFORE
         // the charts section opens.
@@ -982,7 +1024,7 @@ describe("live updates (v0.1.37)", () => {
         const html = renderDashboard({ version: "x", records: [] })
         // The reset success branch must call refreshSections so the
         // counters / timeline mirror the cleared state.
-        const resetIdx = html.indexOf('/dashboard/reset')
+        const resetIdx = html.indexOf("/dashboard/reset")
         expect(resetIdx).toBeGreaterThan(-1)
         const refreshIdx = html.indexOf("refreshSections()", resetIdx)
         expect(refreshIdx).toBeGreaterThan(resetIdx)
@@ -997,7 +1039,9 @@ describe("URL hash + reset-selector sync on details toggle (v1.0.8)", () => {
         expect(html).toContain('document.addEventListener("toggle"')
         // The capture-phase `true` argument has to be there for
         // non-bubbling toggle events.
-        expect(html).toMatch(/document\.addEventListener\("toggle"[\s\S]+?true\)/)
+        expect(html).toMatch(
+            /document\.addEventListener\("toggle"[\s\S]+?true\)/
+        )
     })
 
     test("expanding a row updates the URL hash; collapsing the targeted row clears it", () => {
@@ -1030,7 +1074,13 @@ describe("dashboard hardening (v1.0.9)", () => {
             version: "x",
             records: [],
             contexts: [
-                { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 0 },
+                {
+                    key: "/a|main",
+                    repo: "a",
+                    repoRoot: "/a",
+                    branch: "main",
+                    lastReviewedAt: 0,
+                },
                 { key: "/b|dev", repo: "b", repoRoot: "/b", branch: "dev" },
             ],
         })
@@ -1052,36 +1102,53 @@ describe("dashboard hardening (v1.0.9)", () => {
             version: "x",
             records: [],
             contexts: [
-                { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 100 },
+                {
+                    key: "/a|main",
+                    repo: "a",
+                    repoRoot: "/a",
+                    branch: "main",
+                    lastReviewedAt: 100,
+                },
             ],
         })
         expect(html).not.toContain("(choose a context)")
     })
 
     test("review rows carry data-context-key when the (repo, branch) resolves to ONE context", () => {
+        // Use the REALISTIC store.list() shape: contexts have no
+        // `repo` field — just repoRoot + branch. The renderer must
+        // derive the basename for matching. (Before v1.0.10 it
+        // didn't, and no row ever got a key in production.)
         const html = renderDashboard({
             version: "x",
             contexts: [
-                { key: "/Users/leo/work/review|main", repo: "review", repoRoot: "/Users/leo/work/review", branch: "main", lastReviewedAt: 1 },
+                {
+                    key: "/Users/leo/work/review|main",
+                    repoRoot: "/Users/leo/work/review",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                },
             ],
-            records: [{
-                ts: "2026-06-01T00:00:00Z",
-                context: "review:main",
-                repo: "review",
-                branch: "main",
-                status: "GOOD_TO_GO",
-                durationMs: 1000,
-                findingsCount: 0,
-                blockingCount: 0,
-                droppedCount: 0,
-                provider: "codex",
-                model: "x",
-                round: 1,
-                blockCount: 0,
-                trigger: "stop_hook",
-                findings: [],
-                failureDetail: null,
-            }],
+            records: [
+                {
+                    ts: "2026-06-01T00:00:00Z",
+                    context: "review:main",
+                    repo: "review",
+                    branch: "main",
+                    status: "GOOD_TO_GO",
+                    durationMs: 1000,
+                    findingsCount: 0,
+                    blockingCount: 0,
+                    droppedCount: 0,
+                    provider: "codex",
+                    model: "x",
+                    round: 1,
+                    blockCount: 0,
+                    trigger: "stop_hook",
+                    findings: [],
+                    failureDetail: null,
+                },
+            ],
         })
         expect(html).toContain('data-context-key="/Users/leo/work/review|main"')
     })
@@ -1095,27 +1162,39 @@ describe("dashboard hardening (v1.0.9)", () => {
         const html = renderDashboard({
             version: "x",
             contexts: [
-                { key: "/a/review|main", repo: "review", repoRoot: "/a/review", branch: "main", lastReviewedAt: 1 },
-                { key: "/b/review|main", repo: "review", repoRoot: "/b/review", branch: "main", lastReviewedAt: 1 },
+                {
+                    key: "/a/review|main",
+                    repoRoot: "/a/review",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                },
+                {
+                    key: "/b/review|main",
+                    repoRoot: "/b/review",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                },
             ],
-            records: [{
-                ts: "2026-06-01T00:00:00Z",
-                context: "review:main",
-                repo: "review",
-                branch: "main",
-                status: "GOOD_TO_GO",
-                durationMs: 1000,
-                findingsCount: 0,
-                blockingCount: 0,
-                droppedCount: 0,
-                provider: "codex",
-                model: "x",
-                round: 1,
-                blockCount: 0,
-                trigger: "stop_hook",
-                findings: [],
-                failureDetail: null,
-            }],
+            records: [
+                {
+                    ts: "2026-06-01T00:00:00Z",
+                    context: "review:main",
+                    repo: "review",
+                    branch: "main",
+                    status: "GOOD_TO_GO",
+                    durationMs: 1000,
+                    findingsCount: 0,
+                    blockingCount: 0,
+                    droppedCount: 0,
+                    provider: "codex",
+                    model: "x",
+                    round: 1,
+                    blockCount: 0,
+                    trigger: "stop_hook",
+                    findings: [],
+                    failureDetail: null,
+                },
+            ],
         })
         // No data-context-key attribute on the row → client gracefully skips sync.
         expect(html).not.toMatch(

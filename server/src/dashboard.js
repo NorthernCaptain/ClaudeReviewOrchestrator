@@ -998,15 +998,22 @@ export const renderDashboard = ({
     // newest-first list — chart reverses for display, but the id is
     // stable.
     //
-    // _contextKey (v1.0.9): walk the `contexts` list and try to resolve
-    // each record's (repo, branch) to a unique store key. When two
-    // contexts share the same (repo, branch) — e.g., two different
-    // repos with the same basename — the lookup is ambiguous and we
-    // emit no key, so the client toggle handler simply leaves the
-    // Reset selector alone instead of guessing wrong.
+    // _contextKey (v1.0.10): walk the `contexts` list and try to
+    // resolve each record's (repo, branch) to a unique store key.
+    // store.list() returns the persisted shape — repoRoot + branch
+    // only, no `repo` — so we derive the basename from repoRoot the
+    // same way renderControls computes the dropdown label. (Before:
+    // c.repo was always undefined, every lookup key collapsed to
+    // ":<branch>", and no row ever got a data-context-key.)
+    // When two contexts share the same (basename, branch) — e.g.,
+    // two different repos with the same basename — the lookup is
+    // ambiguous and we emit no key, so the client toggle handler
+    // leaves the Reset selector alone instead of guessing wrong.
+    const basenameOf = (c) =>
+        c?.repo ?? (c?.repoRoot ?? "").split("/").pop() ?? ""
     const contextKeyByRepoBranch = new Map()
     for (const c of contexts ?? []) {
-        const lookup = `${c.repo ?? ""}:${c.branch ?? ""}`
+        const lookup = `${basenameOf(c)}:${c.branch ?? ""}`
         if (contextKeyByRepoBranch.has(lookup)) {
             contextKeyByRepoBranch.set(lookup, null) // ambiguous
         } else {
@@ -1017,7 +1024,7 @@ export const renderDashboard = ({
         ...r,
         _id: `review-${i}`,
         _contextKey:
-            contextKeyByRepoBranch.get(`${r.repo ?? ""}:${r.branch ?? ""}`) ??
+            contextKeyByRepoBranch.get(`${basenameOf(r)}:${r.branch ?? ""}`) ??
             null,
     }))
     // Reviews section now shows EVERY attempt (success + failure) so a
