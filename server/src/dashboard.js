@@ -572,8 +572,18 @@ export const renderControls = (currentProvider, contexts = []) => {
             mostRecentKey = c.key
         }
     }
+    // When the store has contexts but none has ever been reviewed, a
+    // bare <select> still defaults to the first option — clicking
+    // Reset would then clear an arbitrary first-by-key context. Prepend
+    // an empty-value placeholder so the visible default is "(choose a
+    // context)" and the client's `if (!contextKey)` guard fires
+    // correctly on a stray click.
+    const showPlaceholder = sorted.length > 0 && mostRecentKey === null
     const ctxOpts = sorted.length
-        ? sorted
+        ? (showPlaceholder
+              ? `<option value="" selected>(choose a context)</option>`
+              : "") +
+          sorted
               .map((c) => {
                   // Option value is the store key (repoRoot|branch) so
                   // the server can target the EXACT stored context.
@@ -696,6 +706,15 @@ const renderEscalateBody = (r) => {
 const renderReviewRow = (r) => {
     const color = STATUS_COLORS[r.status] ?? STATUS_FALLBACK
     const idAttr = r._id ? ` id="${escapeHtml(r._id)}"` : ""
+    // data-context-key (v1.0.9) carries the unambiguous store key so
+    // the client toggle handler can sync the Reset selector to the
+    // exact (repoRoot, branch) — never the visible "repo:branch"
+    // label, which is non-unique when two repos share a basename.
+    // Attached only when renderDashboard could resolve a single
+    // context for this row's (repo, branch).
+    const ctxAttr = r._contextKey
+        ? ` data-context-key="${escapeHtml(r._contextKey)}"`
+        : ""
     const summary =
         `<summary>` +
         `<span class="ts">${escapeHtml(fmtTs(r.ts))}</span>` +
@@ -722,7 +741,7 @@ const renderReviewRow = (r) => {
             ? `<span class="warn">${r.droppedCount} dropped</span>`
             : "") +
         `</div>`
-    return `<details${idAttr}>${summary}${meta}${body}</details>`
+    return `<details${idAttr}${ctxAttr}>${summary}${meta}${body}</details>`
 }
 
 // Keep the old name as an alias so the public API the tests use
@@ -731,6 +750,9 @@ const renderSuccessRow = renderReviewRow
 
 const renderFailureRow = (r) => {
     const d = r.failureDetail ?? {}
+    const ctxAttr = r._contextKey
+        ? ` data-context-key="${escapeHtml(r._contextKey)}"`
+        : ""
     // Coerce reason: archive blobs come from disk and a hand-edited
     // file could leave `reason` non-string. Coerce once at the top
     // so every downstream slice / length / template-literal use is
@@ -770,7 +792,7 @@ const renderFailureRow = (r) => {
         `<span>${escapeHtml(r.provider ?? "?")} · ${escapeHtml(r.model ?? "?")}</span>` +
         `</div>`
     return (
-        `<details class="fail">${summary}${meta}` +
+        `<details class="fail"${ctxAttr}>${summary}${meta}` +
         kv("reason", r.reason) +
         argvHtml +
         (stderr
@@ -975,9 +997,28 @@ export const renderDashboard = ({
     // matching row in the reviews table. Index is the position in the
     // newest-first list — chart reverses for display, but the id is
     // stable.
+    //
+    // _contextKey (v1.0.9): walk the `contexts` list and try to resolve
+    // each record's (repo, branch) to a unique store key. When two
+    // contexts share the same (repo, branch) — e.g., two different
+    // repos with the same basename — the lookup is ambiguous and we
+    // emit no key, so the client toggle handler simply leaves the
+    // Reset selector alone instead of guessing wrong.
+    const contextKeyByRepoBranch = new Map()
+    for (const c of contexts ?? []) {
+        const lookup = `${c.repo ?? ""}:${c.branch ?? ""}`
+        if (contextKeyByRepoBranch.has(lookup)) {
+            contextKeyByRepoBranch.set(lookup, null) // ambiguous
+        } else {
+            contextKeyByRepoBranch.set(lookup, c.key ?? null)
+        }
+    }
     const recordsWithIds = records.map((r, i) => ({
         ...r,
         _id: `review-${i}`,
+        _contextKey:
+            contextKeyByRepoBranch.get(`${r.repo ?? ""}:${r.branch ?? ""}`) ??
+            null,
     }))
     // Reviews section now shows EVERY attempt (success + failure) so a
     // chart click always lands on a row. The Failed section below
@@ -1079,15 +1120,18 @@ export const renderDashboard = ({
     else history.replaceState(null, "", location.pathname + location.search)
   }
 
-  // When a row expands, find the matching context option (by its
-  // visible "repo:branch" label) and select it so a quick Reset
-  // click targets the right repo+branch.
-  function syncResetToContext(label) {
-    if (!label) return
+  // When a row expands, point the Reset selector at the row's
+  // unambiguous store key (carried in data-context-key, set by the
+  // server when (repo, branch) resolved to a single context). The
+  // earlier label-match approach (v1.0.8) could pick the wrong
+  // context when two repos share a basename — the option value is
+  // the only unique handle.
+  function syncResetToKey(key) {
+    if (!key) return
     var sel = document.getElementById("reset-context-select")
     if (!sel) return
     for (var i = 0; i < sel.options.length; i++) {
-      if (sel.options[i].textContent === label) {
+      if (sel.options[i].value === key) {
         sel.value = sel.options[i].value
         return
       }
@@ -1102,8 +1146,8 @@ export const renderDashboard = ({
     if (!d || d.tagName !== "DETAILS") return
     if (d.open) {
       if (d.id) setHash(d.id)
-      var repoEl = d.querySelector("summary .repo")
-      if (repoEl) syncResetToContext(repoEl.textContent.trim())
+      var key = d.getAttribute("data-context-key")
+      if (key) syncResetToKey(key)
     } else if (d.id && location.hash === "#" + d.id) {
       setHash("")
     }

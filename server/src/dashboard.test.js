@@ -1009,12 +1009,117 @@ describe("URL hash + reset-selector sync on details toggle (v1.0.8)", () => {
         expect(html).toContain("location.pathname + location.search")
     })
 
-    test("expanding a row points the reset selector at the matching context", () => {
+    test("expanding a row points the reset selector at the row's context key (v1.0.9)", () => {
         const html = renderDashboard({ version: "x", records: [] })
-        // syncResetToContext walks the reset options matching by
-        // textContent (the "repo:branch" label rendered in <summary>).
-        expect(html).toContain("syncResetToContext")
+        // syncResetToKey walks #reset-context-select matching by
+        // option VALUE (the store key), driven by data-context-key
+        // on the row — never the visible label, which can collide
+        // when two repos share a basename.
+        expect(html).toContain("syncResetToKey")
         expect(html).toContain("reset-context-select")
-        expect(html).toContain("summary .repo")
+        expect(html).toContain('getAttribute("data-context-key")')
+        // The brittle label-match path is gone.
+        expect(html).not.toContain("syncResetToContext")
+    })
+})
+
+describe("dashboard hardening (v1.0.9)", () => {
+    test("placeholder option fires the 'no context selected' guard when nothing was reviewed yet", () => {
+        // The store has contexts but none has lastReviewedAt.
+        const html = renderDashboard({
+            version: "x",
+            records: [],
+            contexts: [
+                { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 0 },
+                { key: "/b|dev", repo: "b", repoRoot: "/b", branch: "dev" },
+            ],
+        })
+        // A real, default-selected, empty-value option sits above the
+        // actual context options so clicking Reset routes through the
+        // client guard instead of clearing an arbitrary first context.
+        expect(html).toContain(
+            '<option value="" selected>(choose a context)</option>'
+        )
+        // The two real options exist but none carries `selected`.
+        const ctxSelected = [
+            ...html.matchAll(/<option value="\/[^"]+" selected>/g),
+        ]
+        expect(ctxSelected).toHaveLength(0)
+    })
+
+    test("placeholder is NOT shown when the most-recent rule picks a winner", () => {
+        const html = renderDashboard({
+            version: "x",
+            records: [],
+            contexts: [
+                { key: "/a|main", repo: "a", repoRoot: "/a", branch: "main", lastReviewedAt: 100 },
+            ],
+        })
+        expect(html).not.toContain("(choose a context)")
+    })
+
+    test("review rows carry data-context-key when the (repo, branch) resolves to ONE context", () => {
+        const html = renderDashboard({
+            version: "x",
+            contexts: [
+                { key: "/Users/leo/work/review|main", repo: "review", repoRoot: "/Users/leo/work/review", branch: "main", lastReviewedAt: 1 },
+            ],
+            records: [{
+                ts: "2026-06-01T00:00:00Z",
+                context: "review:main",
+                repo: "review",
+                branch: "main",
+                status: "GOOD_TO_GO",
+                durationMs: 1000,
+                findingsCount: 0,
+                blockingCount: 0,
+                droppedCount: 0,
+                provider: "codex",
+                model: "x",
+                round: 1,
+                blockCount: 0,
+                trigger: "stop_hook",
+                findings: [],
+                failureDetail: null,
+            }],
+        })
+        expect(html).toContain('data-context-key="/Users/leo/work/review|main"')
+    })
+
+    test("review rows OMIT data-context-key when (repo, branch) is ambiguous (two repos with same basename)", () => {
+        // Two distinct repos both named "review" at different paths,
+        // both on branch "main" — the label "review:main" maps to
+        // two store keys, so we can't pick safely. The renderer omits
+        // data-context-key entirely; the client toggle handler then
+        // leaves the Reset selector alone.
+        const html = renderDashboard({
+            version: "x",
+            contexts: [
+                { key: "/a/review|main", repo: "review", repoRoot: "/a/review", branch: "main", lastReviewedAt: 1 },
+                { key: "/b/review|main", repo: "review", repoRoot: "/b/review", branch: "main", lastReviewedAt: 1 },
+            ],
+            records: [{
+                ts: "2026-06-01T00:00:00Z",
+                context: "review:main",
+                repo: "review",
+                branch: "main",
+                status: "GOOD_TO_GO",
+                durationMs: 1000,
+                findingsCount: 0,
+                blockingCount: 0,
+                droppedCount: 0,
+                provider: "codex",
+                model: "x",
+                round: 1,
+                blockCount: 0,
+                trigger: "stop_hook",
+                findings: [],
+                failureDetail: null,
+            }],
+        })
+        // No data-context-key attribute on the row → client gracefully skips sync.
+        expect(html).not.toMatch(
+            /<details[^>]*data-context-key="\/[ab]\/review\|main"/
+        )
     })
 })
