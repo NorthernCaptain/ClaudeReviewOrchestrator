@@ -341,7 +341,12 @@ describe("handleExclusionMutation — review cache invalidation (v1.1.5)", () =>
             exclusions: [{ file: "a", message: "m", excludedAt: 1 }],
         })
         handleExclusionMutation({
-            body: { contextKey: "/r|main", action: "add", file: "a", message: "m" },
+            body: {
+                contextKey: "/r|main",
+                action: "add",
+                file: "a",
+                message: "m",
+            },
             store,
         })
         const after = store.get({

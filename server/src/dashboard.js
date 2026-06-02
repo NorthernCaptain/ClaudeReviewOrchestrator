@@ -746,12 +746,23 @@ const renderConfigPanel = (config) => {
     // single field in place (e.g. the provider switcher updates the
     // PROVIDER value cell without a full refetch).
     const slug = (k) => k.replace(/[^a-z0-9]+/gi, "-").toLowerCase()
+    const renderValue = (k, v) => {
+        // max rounds: inline stepper buttons (v1.1.8).
+        if (k === "max rounds" && typeof v === "number") {
+            return (
+                `<span class="cfg-val" data-max-rounds-value>${escapeHtml(String(v))}</span>` +
+                ` <button type="button" class="cfg-step" id="max-rounds-dec" aria-label="decrease max rounds">−</button>` +
+                ` <button type="button" class="cfg-step" id="max-rounds-inc" aria-label="increase max rounds">+</button>`
+            )
+        }
+        return escapeHtml(String(v))
+    }
     return (
         `<dl class="config">` +
         cells
             .map(
                 ([k, v]) =>
-                    `<div><dt>${escapeHtml(k)}</dt><dd data-config-key="${slug(k)}">${escapeHtml(String(v))}</dd></div>`
+                    `<div><dt>${escapeHtml(k)}</dt><dd data-config-key="${slug(k)}">${renderValue(k, v)}</dd></div>`
             )
             .join("") +
         `</dl>`
@@ -970,6 +981,11 @@ section h2 { font-size: 14px; margin: 0 0 12px; text-transform: uppercase;
   letter-spacing: 0.05em; }
 .config dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px; }
+.config dd .cfg-step { font-family: inherit; font-size: 12px; line-height: 1;
+  padding: 1px 6px; border: 1px solid var(--border); background: var(--card);
+  color: var(--ink); border-radius: 3px; cursor: pointer; }
+.config dd .cfg-step:hover { background: var(--bg); }
+.config dd .cfg-step:disabled { opacity: 0.5; cursor: not-allowed; }
 svg.chart { width: 100%; height: auto; display: block; }
 svg.chart .ref { stroke: var(--border); stroke-width: 1; stroke-dasharray: 2 3; }
 svg.chart .ref-label { fill: var(--muted); font-size: 10px;
@@ -1529,6 +1545,55 @@ export const renderDashboard = ({
     }
   }
 
+  // Max-rounds stepper (v1.1.8). Delegated so it survives the
+  // refreshSections swap of the config grid.
+  function maxRoundsValueCell() {
+    return document.querySelector("[data-max-rounds-value]");
+  }
+  function readMaxRounds() {
+    var cell = maxRoundsValueCell();
+    if (!cell) return null;
+    var n = Number(cell.textContent);
+    return Number.isFinite(n) ? n : null;
+  }
+  document.addEventListener("click", function (e) {
+    var btn = e.target && e.target.closest && e.target.closest(".cfg-step");
+    if (!btn) return;
+    var delta = btn.id === "max-rounds-inc" ? 1 :
+                btn.id === "max-rounds-dec" ? -1 : 0;
+    if (!delta) return;
+    var cur = readMaxRounds();
+    if (cur == null) return;
+    var next = cur + delta;
+    var dec = document.getElementById("max-rounds-dec");
+    var inc = document.getElementById("max-rounds-inc");
+    if (dec) dec.disabled = true;
+    if (inc) inc.disabled = true;
+    fetch("/dashboard/max-rounds", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value: next }),
+    })
+      .then(bodyToOk)
+      .then(function (r) {
+        if (r.ok) {
+          var cell = maxRoundsValueCell();
+          if (cell) cell.textContent = String(r.j.value);
+          setStatus("max rounds → " + r.j.value +
+            (r.j.persisted ? "" : " (in-memory only)"), true);
+        } else {
+          setStatus("error: " + (r.j.error || "failed"), false);
+        }
+      })
+      .catch(function (err) { setStatus("error: " + err.message, false); })
+      .finally(function () {
+        var d = document.getElementById("max-rounds-dec");
+        var i = document.getElementById("max-rounds-inc");
+        if (d) d.disabled = false;
+        if (i) i.disabled = false;
+      });
+  });
+
   // Exclusion toggle (v1.1). One delegated listener for every
   // .excl-btn anywhere on the page — survives section refreshes.
   function readExclusionsData() {
@@ -1602,7 +1667,12 @@ export const renderDashboard = ({
     });
   }
   function cssEsc(s) {
-    return String(s).replace(/(["\\])/g, "\\$1");
+    // NOTE: this is inside the renderDashboard template literal, so
+    // every backslash here is one escape level *removed* by the time
+    // the browser sees it. The runtime regex must end up as
+    // /(["\\])/g and the replacement as "\\$1" — that needs 4 source
+    // backslashes per slot here.
+    return String(s).replace(/(["\\\\])/g, "\\\\$1");
   }
   document.addEventListener("click", function (e) {
     var btn = e.target && e.target.closest && e.target.closest(".excl-btn");

@@ -722,9 +722,7 @@ describe("isWorkingTreeClean", () => {
             "--porcelain",
             "-z",
         ])
-        const dirtyGit = jest.fn(
-            () => " M file.txt\0?? scratch.txt\0"
-        )
+        const dirtyGit = jest.fn(() => " M file.txt\0?? scratch.txt\0")
         expect(isWorkingTreeClean("/anywhere", dirtyGit)).toBe(false)
     })
 })
@@ -746,11 +744,9 @@ describe("currentHeadSha", () => {
 
     test("returns the current HEAD SHA after a commit", () => {
         const sha = currentHeadSha(dir)
-        const expected = execFileSync(
-            "git",
-            ["-C", dir, "rev-parse", "HEAD"],
-            { encoding: "utf8" }
-        ).trim()
+        const expected = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], {
+            encoding: "utf8",
+        }).trim()
         expect(sha).toBe(expected)
         expect(sha).toMatch(/^[0-9a-f]{40}$/)
     })

@@ -19,6 +19,7 @@ import { mountDashboardRoute } from "./dashboard.js"
 import { mountNotifyChangeRoute } from "./notify-change.js"
 import { mountProviderRoute, handleSetProvider } from "./provider.js"
 import { handleExclusionMutation } from "./exclusions.js"
+import { handleSetMaxRounds } from "./maxRounds.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { createMetrics } from "./metrics.js"
@@ -206,6 +207,20 @@ export const createApp = ({
     // boundary as the other dashboard mutation routes.
     app.post("/dashboard/exclusions", loopbackOnly, (req, res) => {
         const result = handleExclusionMutation({ body: req.body, store })
+        res.status(result.httpStatus).json(result.body)
+    })
+
+    // Adjust the codex-rounds cap from the dashboard (v1.1.8). Live +
+    // best-effort persisted, same loopback trust boundary as the rest
+    // of the dashboard mutation surface.
+    app.put("/dashboard/max-rounds", loopbackOnly, (req, res) => {
+        const result = handleSetMaxRounds({
+            body: req.body,
+            config,
+            configPath,
+            logger: log,
+            deps,
+        })
         res.status(result.httpStatus).json(result.body)
     })
 

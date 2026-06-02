@@ -48,7 +48,9 @@ describe("pickReviewer", () => {
     })
 
     test("returns claude adapter when provider=claude", () => {
-        const r = pickReviewer(minimalConfig({ reviewer: { provider: "claude" } }))
+        const r = pickReviewer(
+            minimalConfig({ reviewer: { provider: "claude" } })
+        )
         expect(r.name).toBe("claude")
         expect(r.runAndParse).toBe(claudeRunAndParse)
     })
@@ -62,9 +64,9 @@ describe("pickReviewer", () => {
     })
 
     test("throws on unknown provider with a clear message", () => {
-        expect(() =>
-            pickReviewer({ reviewer: { provider: "bogus" } })
-        ).toThrow(/unknown reviewer\.provider: bogus/)
+        expect(() => pickReviewer({ reviewer: { provider: "bogus" } })).toThrow(
+            /unknown reviewer\.provider: bogus/
+        )
     })
 
     test("override argument wins over config.reviewer.provider", () => {

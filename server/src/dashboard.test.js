@@ -257,6 +257,18 @@ describe("renderDashboard", () => {
         }
     })
 
+    test("max rounds cell carries +/- stepper buttons (v1.1.8)", () => {
+        const html = renderDashboard({
+            version: "1.1.8",
+            config: baseConfig(),
+            records: [],
+        })
+        expect(html).toMatch(/data-config-key="max-rounds"/)
+        expect(html).toMatch(/id="max-rounds-dec"/)
+        expect(html).toMatch(/id="max-rounds-inc"/)
+        expect(html).toMatch(/data-max-rounds-value[^>]*>5</)
+    })
+
     test("hook fetch timeout shows 'auto' when config value is null", () => {
         const html = renderDashboard({
             version: "0.1.3",
@@ -402,6 +414,31 @@ describe("renderDashboard", () => {
         expect(html).toContain("scrollIntoView")
         // No external script source — keep the dashboard a single file.
         expect(html).not.toMatch(/<script[^>]+src=/)
+    })
+
+    test("the inline JS block is syntactically valid", () => {
+        // Regression for v1.1.7: backslashes inside the renderDashboard
+        // template literal get collapsed when the template evaluates,
+        // so anything that needs a literal `\` in the served JS (e.g.
+        // a regex like /(["\\])/g) must be double-escaped in source.
+        // A typo there hard-fails the second IIFE and the in-flight
+        // polling never starts. Parse-check the served JS so this
+        // regression can't recur.
+        const html = renderDashboard({
+            version: "1.1.7",
+            config: baseConfig(),
+            records: [],
+        })
+        // Pull every <script> block that isn't application/json.
+        const re =
+            /<script(?![^>]*type="application\/json")[^>]*>([\s\S]*?)<\/script>/g
+        const blocks = []
+        let m
+        while ((m = re.exec(html)) !== null) blocks.push(m[1])
+        expect(blocks.length).toBeGreaterThan(0)
+        for (const body of blocks) {
+            expect(() => new Function(body)).not.toThrow()
+        }
     })
 })
 

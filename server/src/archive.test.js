@@ -865,7 +865,10 @@ describe("createArchive.readRecent", () => {
         const archive = tickArchive()
         writeOne(archive, 0, "a", "main", "GOOD_TO_GO")
         const ctxDir = path.join(tmp, "a:main")
-        writeFileSync(path.join(ctxDir, "2026-12-31T23-59-59-001Z.json"), "null")
+        writeFileSync(
+            path.join(ctxDir, "2026-12-31T23-59-59-001Z.json"),
+            "null"
+        )
         writeFileSync(path.join(ctxDir, "2026-12-31T23-59-59-002Z.json"), "42")
         writeFileSync(
             path.join(ctxDir, "2026-12-31T23-59-59-003Z.json"),

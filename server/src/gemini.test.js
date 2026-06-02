@@ -299,9 +299,7 @@ describe("runAndParse", () => {
             prompt: "ignored",
             config: baseConfig(),
             spawn: fakeSpawn((child) => {
-                child.stdout.write(
-                    wrap({ status: "GOOD_TO_GO", findings: [] })
-                )
+                child.stdout.write(wrap({ status: "GOOD_TO_GO", findings: [] }))
                 child.stdout.end()
                 child.stderr.end()
                 child.emit("close", 0, null)
@@ -334,9 +332,7 @@ describe("runAndParse", () => {
             prompt: "ignored",
             config: baseConfig(),
             spawn: fakeSpawn((child) => {
-                child.stdout.write(
-                    wrap({ status: "GOOD_TO_GO", findings: [] })
-                )
+                child.stdout.write(wrap({ status: "GOOD_TO_GO", findings: [] }))
                 child.stdout.end()
                 child.stderr.end()
                 child.emit("close", 1, null) // soft-fail exit

@@ -161,7 +161,8 @@ describe("parseClaudeOutput", () => {
         JSON.stringify({
             type: "result",
             subtype: "success",
-            result: typeof result === "string" ? result : JSON.stringify(result),
+            result:
+                typeof result === "string" ? result : JSON.stringify(result),
             is_error: false,
             ...extra,
         })

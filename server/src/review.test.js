@@ -4793,7 +4793,12 @@ describe("handleReview — response uses LIVE exclusions, not stale snapshot (v1
                         message: "mid-run noise",
                     },
                 ],
-                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
             }
         }
         const r = await handleReview({
@@ -4851,7 +4856,12 @@ describe("handleReview — response uses LIVE exclusions, not stale snapshot (v1
                         message: "was-excluded",
                     },
                 ],
-                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
             }
         }
         const r = await handleReview({
@@ -4924,7 +4934,12 @@ describe("handleReview — remove-mid-run preserves priorFindings cache (v1.1.4)
                         message: "was-excluded",
                     },
                 ],
-                raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
             }
         }
         const r = await handleReview({

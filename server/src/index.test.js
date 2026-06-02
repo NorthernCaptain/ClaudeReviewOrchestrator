@@ -232,6 +232,54 @@ describe("createApp wiring", () => {
         }
     })
 
+    test("PUT /dashboard/max-rounds switches in-memory and persists (v1.1.8)", async () => {
+        let writtenJson = null
+        const fakeFs = {
+            readFileSync: () =>
+                JSON.stringify({ limits: { maxCodexRounds: 5 } }),
+            writeFileSync: (_p, data) => {
+                writtenJson = data
+            },
+        }
+        const cfg = minimalConfig({ limits: { maxCodexRounds: 5 } })
+        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+        try {
+            const r = await fetch(`${url}/dashboard/max-rounds`, {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ value: 8 }),
+            })
+            expect(r.status).toBe(200)
+            const body = await r.json()
+            expect(body.ok).toBe(true)
+            expect(body.value).toBe(8)
+            expect(body.previous).toBe(5)
+            expect(cfg.limits.maxCodexRounds).toBe(8)
+            expect(writtenJson).toMatch(/"maxCodexRounds": 8/)
+        } finally {
+            await close()
+        }
+    })
+
+    test("PUT /dashboard/max-rounds rejects out-of-range with 400", async () => {
+        const { url, close } = await start(minimalConfig(), {
+            ...happyDeps,
+            fs: { readFileSync: () => "{}", writeFileSync: () => {} },
+        })
+        try {
+            const r = await fetch(`${url}/dashboard/max-rounds`, {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ value: 0 }),
+            })
+            expect(r.status).toBe(400)
+            const body = await r.json()
+            expect(body.ok).toBe(false)
+        } finally {
+            await close()
+        }
+    })
+
     test("POST /dashboard/reset clears the EXACT stored context by contextKey (v0.1.36)", async () => {
         // Two contexts share the same repoRoot but differ by branch.
         // Submitting only `repoRoot` (the old v0.1.35 shape) couldn't
