@@ -622,47 +622,37 @@ export const renderControls = (currentProvider, contexts = []) => {
 // Reset selector pre-selects (most recent lastReviewedAt). The client
 // script swaps the panel body when the user changes the Reset
 // selector. Each row carries an Include button.
+// Renders ALL exclusions across every context as a single flat list
+// grouped by context (v1.1.11). Earlier this followed the Reset
+// selector and showed only one context's list, which silently hid
+// exclusions in every other context.
 export const renderExclusionsPanel = (contexts = []) => {
     const sorted = [...(contexts ?? [])].sort((a, b) =>
         String(a.key ?? "").localeCompare(String(b.key ?? ""))
     )
-    // Same default-context rule the Reset selector uses.
-    let defaultKey = null
-    let mostRecent = 0
-    for (const c of sorted) {
-        const ts = Number(c?.lastReviewedAt) || 0
-        if (ts > mostRecent) {
-            mostRecent = ts
-            defaultKey = c.key
-        }
-    }
     const exclusionsByKey = new Map()
+    let totalCount = 0
     for (const c of sorted) {
-        if (c?.key) exclusionsByKey.set(c.key, c.exclusions ?? [])
+        if (!c?.key) continue
+        const list = Array.isArray(c.exclusions) ? c.exclusions : []
+        exclusionsByKey.set(c.key, list)
+        totalCount += list.length
     }
-    const body = renderExclusionsBody(
-        defaultKey ? (exclusionsByKey.get(defaultKey) ?? []) : [],
-        defaultKey
-    )
-    // Serialize the per-context exclusions as a JSON island the client
-    // reads when the Reset selector changes — saves a roundtrip and
-    // keeps the panel in lockstep with whatever the server most
-    // recently saw.
+    const body = renderExclusionsBody(exclusionsByKey)
     const dataIsland = JSON.stringify(
         Object.fromEntries(exclusionsByKey),
         null,
         0
     )
+    const countClass = totalCount > 0 ? "exc-count warn" : "exc-count"
     return (
-        `<div class="exclusions" aria-label="exclusions">` +
-        `<div class="exc-title">excluded findings · <span id="exclusions-context">${escapeHtml(
-            defaultKey ?? "(none)"
-        )}</span></div>` +
+        `<details class="exclusions" aria-label="exclusions">` +
+        `<summary class="exc-title">excluded findings · <span id="exclusions-count" class="${countClass}">${totalCount}</span></summary>` +
         `<div id="exclusions-body">${body}</div>` +
         `<script type="application/json" id="exclusions-data">${escapeForScriptText(
             dataIsland
         )}</script>` +
-        `</div>`
+        `</details>`
     )
 }
 
@@ -680,33 +670,42 @@ const escapeForScriptText = (s) =>
         .replace(/\u2028/g, "\\u2028")
         .replace(/\u2029/g, "\\u2029")
 
-// Render the inner list for a single context's exclusions. Each row
-// shows file:message and an Include button that posts the remove
-// action. When the contextKey is null (e.g. no contexts yet) we show
-// a placeholder.
-const renderExclusionsBody = (exclusions, contextKey) => {
-    if (!contextKey) {
-        return `<div class="empty">no context selected</div>`
+// Renders the inner body across every context that has at least one
+// exclusion. Empty contexts are skipped so the panel doesn't fill up
+// with "no exclusions" placeholders. `exclusionsByKey` is a Map (or
+// plain object via Object.entries) of contextKey -> entry[].
+const renderExclusionsBody = (exclusionsByKey) => {
+    const entries =
+        exclusionsByKey instanceof Map
+            ? [...exclusionsByKey.entries()]
+            : Object.entries(exclusionsByKey ?? {})
+    const groups = entries
+        .map(([ctx, list]) => [ctx, Array.isArray(list) ? list : []])
+        .filter(([, list]) => list.length > 0)
+    if (groups.length === 0) {
+        return `<div class="empty">no exclusions yet</div>`
     }
-    const list = Array.isArray(exclusions) ? exclusions : []
-    if (list.length === 0) {
-        return `<div class="empty">no exclusions for this context</div>`
-    }
-    return list
-        .map((e) => {
-            const file = escapeHtml(e?.file ?? "")
-            const msg = escapeHtml(e?.message ?? "")
-            return (
-                `<div class="exc-row">` +
-                `<button class="excl-btn on" type="button" ` +
-                `data-context-key="${escapeHtml(contextKey)}" ` +
-                `data-file="${file}" ` +
-                `data-message="${msg}" ` +
-                `data-action="remove">Include</button>` +
-                `<code class="exc-file">${file}</code>` +
-                `<span class="exc-msg">${msg}</span>` +
-                `</div>`
-            )
+    return groups
+        .map(([ctx, list]) => {
+            const header = `<div class="exc-group-header">${escapeHtml(ctx)}</div>`
+            const rows = list
+                .map((e) => {
+                    const file = escapeHtml(e?.file ?? "")
+                    const msg = escapeHtml(e?.message ?? "")
+                    return (
+                        `<div class="exc-row">` +
+                        `<button class="excl-btn on" type="button" ` +
+                        `data-context-key="${escapeHtml(ctx)}" ` +
+                        `data-file="${file}" ` +
+                        `data-message="${msg}" ` +
+                        `data-action="remove">Include</button>` +
+                        `<code class="exc-file">${file}</code>` +
+                        `<span class="exc-msg">${msg}</span>` +
+                        `</div>`
+                    )
+                })
+                .join("")
+            return `<div class="exc-group">${header}${rows}</div>`
         })
         .join("")
 }
@@ -1061,12 +1060,22 @@ section.compact > h2 { margin-bottom: 8px; }
 /* Dedicated exclusions panel below the controls bar. */
 .exclusions { margin-top: 12px; padding-top: 12px;
   border-top: 1px solid var(--border); }
-.exclusions .exc-title { color: var(--muted); font-size: 11px;
+.exclusions > summary.exc-title { color: var(--muted); font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
-  margin-bottom: 8px; }
-.exclusions #exclusions-context { font-family: ui-monospace,
-  SFMono-Regular, Menlo, monospace; }
-#exclusions-body { display: flex; flex-direction: column; gap: 6px; }
+  cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; }
+.exclusions > summary.exc-title::-webkit-details-marker { display: none; }
+.exclusions > summary.exc-title::before { content: "▸"; color: var(--muted);
+  transition: transform 0.15s; display: inline-block; }
+.exclusions[open] > summary.exc-title::before { transform: rotate(90deg); }
+.exclusions[open] #exclusions-body { margin-top: 8px; }
+.exclusions .exc-count { font-family: ui-monospace, SFMono-Regular, Menlo,
+  monospace; }
+.exclusions .exc-count.warn { color: #ca8a04; font-weight: 700; }
+#exclusions-body { display: flex; flex-direction: column; gap: 12px; }
+.exc-group { display: flex; flex-direction: column; gap: 4px; }
+.exc-group-header { font-family: ui-monospace, SFMono-Regular, Menlo,
+  monospace; font-size: 11px; color: var(--muted);
+  border-bottom: 1px dashed var(--border); padding-bottom: 2px; }
 .exc-row { display: flex; align-items: baseline; gap: 8px;
   font-size: 12px; }
 .exc-row .exc-file { font-family: ui-monospace, SFMono-Regular, Menlo,
@@ -1460,7 +1469,12 @@ export const renderDashboard = ({
         }
         var freshExcl = doc.querySelector(".exclusions");
         var curExcl = document.querySelector(".exclusions");
-        if (freshExcl && curExcl) curExcl.replaceWith(freshExcl);
+        if (freshExcl && curExcl) {
+          // Preserve the user's expanded/collapsed state across the swap.
+          if (curExcl.hasAttribute("open")) freshExcl.setAttribute("open", "");
+          else freshExcl.removeAttribute("open");
+          curExcl.replaceWith(freshExcl);
+        }
         var freshData = doc.getElementById("exclusions-data");
         var curData = document.getElementById("exclusions-data");
         if (freshData && curData) curData.replaceWith(freshData);
@@ -1619,20 +1633,31 @@ export const renderDashboard = ({
       '</div>'
     );
   }
-  function renderPanelFor(contextKey) {
-    var ctxEl = document.getElementById("exclusions-context");
+  function renderAllExclusions() {
     var body = document.getElementById("exclusions-body");
+    var countEl = document.getElementById("exclusions-count");
     if (!body) return;
-    if (ctxEl) ctxEl.textContent = contextKey || "(none)";
-    if (!contextKey) {
-      body.innerHTML = '<div class="empty">no context selected</div>';
-      return;
-    }
     var data = readExclusionsData();
-    var list = data[contextKey] || [];
-    body.innerHTML = list.length
-      ? list.map(function (e) { return renderExclusionRow(contextKey, e); }).join("")
-      : '<div class="empty">no exclusions for this context</div>';
+    var keys = Object.keys(data).sort();
+    var html = "";
+    var total = 0;
+    for (var k = 0; k < keys.length; k++) {
+      var ctx = keys[k];
+      var list = data[ctx] || [];
+      if (!list.length) continue;
+      total += list.length;
+      var rows = list.map(function (e) { return renderExclusionRow(ctx, e); }).join("");
+      html += '<div class="exc-group">' +
+              '<div class="exc-group-header">' + esc(ctx) + '</div>' +
+              rows +
+              '</div>';
+    }
+    body.innerHTML = html || '<div class="empty">no exclusions yet</div>';
+    if (countEl) {
+      countEl.textContent = String(total);
+      if (total > 0) countEl.classList.add("warn");
+      else countEl.classList.remove("warn");
+    }
   }
   function applyExclusionsUpdate(contextKey, file, message, action) {
     var data = readExclusionsData();
@@ -1648,12 +1673,9 @@ export const renderDashboard = ({
     }
     data[contextKey] = list;
     writeExclusionsData(data);
-    // Refresh both the dedicated panel (if it's showing this ctx) AND
-    // every inline button currently in the DOM that targets the same
-    // (contextKey, file, message) — the row may live in Reviews and/or
-    // Failed sections.
-    var current = document.getElementById("exclusions-context");
-    if (current && current.textContent === contextKey) renderPanelFor(contextKey);
+    // Re-render the full panel and update every inline button on the
+    // page that targets the same (contextKey, file, message).
+    renderAllExclusions();
     var nowExcluded = action === "add";
     document.querySelectorAll('.excl-btn[data-context-key="' + cssEsc(contextKey) +
       '"][data-file="' + cssEsc(file) + '"][data-message="' + cssEsc(message) + '"]'
@@ -1706,14 +1728,6 @@ export const renderDashboard = ({
       })
       .catch(function (err) { setStatus("error: " + err.message, false); })
       .finally(function () { btn.disabled = false; });
-  });
-
-  // When the Reset selector changes, swap the exclusions panel to the
-  // new context (data is already embedded in the JSON island).
-  document.addEventListener("change", function (e) {
-    if (e.target && e.target.id === "reset-context-select") {
-      renderPanelFor(e.target.value || null);
-    }
   });
 
   wireControls();

@@ -104,6 +104,22 @@ const REVIEWER_DIRECTIVE =
     "test, other), `message` (string), and optional `suggestion` " +
     "(string)."
 
+// Surface gemini-cli's loop-detection signal so the caller can emit a
+// pointed ESCALATE reason instead of the generic INVALID_JSON. The CLI
+// emits envelope.warnings as `["Loop detected, stopping execution"]`
+// when the model repeats itself; the envelope still parses, but
+// `response` is typically truncated mid-string and our inner JSON
+// parse then fails. Returns the first matching warning string or
+// null. Match is case-insensitive substring on "loop detected" so a
+// minor CLI wording change doesn't lose the signal.
+const findLoopWarning = (warnings) => {
+    if (!Array.isArray(warnings)) return null
+    for (const w of warnings) {
+        if (typeof w === "string" && /loop detected/i.test(w)) return w
+    }
+    return null
+}
+
 // Walks the string tracking brace depth; ignores braces inside string
 // literals (with backslash escapes honored). Returns the substring from
 // the first opening { through the matching closing }, which the caller
@@ -339,13 +355,23 @@ export const parseGeminiOutput = (
         }
     }
 
+    // Loop-detection signal (gemini-cli surfaces this via
+    // envelope.warnings when the model gets stuck repeating itself; the
+    // envelope is well-formed but `response` is typically truncated
+    // mid-string, so the inner JSON parse below will fail. Hold the
+    // signal so we can emit a clearer code than the generic
+    // INVALID_JSON in that case.
+    const loopWarning = findLoopWarning(envelope?.warnings)
+
     const inner = envelope?.response
     if (typeof inner !== "string" || inner.trim() === "") {
         return {
             ok: false,
             error: {
-                code: "EMPTY_RESULT",
-                message: "gemini envelope had no response string",
+                code: loopWarning ? "GEMINI_LOOP_TRUNCATED" : "EMPTY_RESULT",
+                message: loopWarning
+                    ? `gemini hit its loop detector and produced no response: "${loopWarning}"`
+                    : "gemini envelope had no response string",
             },
         }
     }
@@ -359,6 +385,23 @@ export const parseGeminiOutput = (
     try {
         parsed = JSON.parse(inner)
     } catch {
+        // If the loop detector fired, refuse to salvage. A looped
+        // response often contains one or more COMPLETE objects before
+        // the cutoff (e.g. `{...}{...` then truncation), so
+        // extractFirstJsonObject would happily hand back the first
+        // object and we'd return GOOD_TO_GO/ISSUES against a verdict
+        // the model never finished. Bail out with the loop code
+        // BEFORE the salvage attempt so the operator sees the real
+        // reason.
+        if (loopWarning) {
+            return {
+                ok: false,
+                error: {
+                    code: "GEMINI_LOOP_TRUNCATED",
+                    message: `gemini hit its loop detector and truncated mid-output: "${loopWarning}"`,
+                },
+            }
+        }
         const candidate = extractFirstJsonObject(inner)
         if (candidate !== null) {
             try {

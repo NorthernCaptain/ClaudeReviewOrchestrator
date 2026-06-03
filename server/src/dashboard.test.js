@@ -1305,17 +1305,86 @@ describe("exclusions UI (v1.1)", () => {
         )
     })
 
-    test("renders the dedicated panel with the default context's exclusions", () => {
+    test("renders the panel listing every context's exclusions (v1.1.11)", () => {
         const html = buildHtml()
         expect(html).toContain('aria-label="exclusions"')
-        expect(html).toContain('id="exclusions-context">/r|main<')
-        // The panel row exists for the excluded entry.
+        // v1.1.12: panel is a <details> collapsed by default.
+        expect(html).toMatch(/<details class="exclusions"/)
+        expect(html).not.toMatch(/<details class="exclusions"[^>]*\bopen\b/)
+        // Header shows a total count, yellow class applied when > 0.
+        expect(html).toMatch(/id="exclusions-count" class="exc-count warn">1</)
+        // Group header carries the context key.
+        expect(html).toMatch(
+            /class="exc-group-header">\/r\|main<\/div>/
+        )
+        // Row exists for the excluded entry.
         expect(html).toMatch(
             /class="exc-row"[^]*data-file="a\.js"[^]*data-action="remove"/
         )
-        // JSON data island carries the per-context exclusions for the
-        // client to swap panels without a roundtrip.
         expect(html).toContain('id="exclusions-data"')
+    })
+
+    test("zero exclusions: count cell omits the warn class (v1.1.12)", () => {
+        const html = renderDashboard({
+            version: "x",
+            contexts: [
+                {
+                    key: "/a|main",
+                    repoRoot: "/a",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                    exclusions: [],
+                },
+            ],
+            records: [],
+        })
+        expect(html).toMatch(/id="exclusions-count" class="exc-count">0</)
+    })
+
+    test("panel groups exclusions per context and skips empty contexts (v1.1.11)", () => {
+        const html = renderDashboard({
+            version: "x",
+            contexts: [
+                {
+                    key: "/a|main",
+                    repoRoot: "/a",
+                    branch: "main",
+                    lastReviewedAt: 1,
+                    exclusions: [
+                        { file: "x.js", message: "ax", excludedAt: 1 },
+                    ],
+                },
+                {
+                    key: "/b|main",
+                    repoRoot: "/b",
+                    branch: "main",
+                    lastReviewedAt: 2,
+                    exclusions: [], // empty: should be omitted from panel body
+                },
+                {
+                    key: "/c|main",
+                    repoRoot: "/c",
+                    branch: "main",
+                    lastReviewedAt: 3,
+                    exclusions: [
+                        { file: "y.js", message: "cy", excludedAt: 1 },
+                        { file: "z.js", message: "cz", excludedAt: 1 },
+                    ],
+                },
+            ],
+            records: [],
+        })
+        // Total count across all contexts.
+        expect(html).toMatch(/id="exclusions-count" class="exc-count warn">3</)
+        // Both non-empty groups are rendered.
+        expect(html).toMatch(/exc-group-header">\/a\|main</)
+        expect(html).toMatch(/exc-group-header">\/c\|main</)
+        // The empty context is skipped.
+        expect(html).not.toMatch(/exc-group-header">\/b\|main</)
+        // All three exclusion rows are present.
+        expect(html).toMatch(/data-file="x\.js"/)
+        expect(html).toMatch(/data-file="y\.js"/)
+        expect(html).toMatch(/data-file="z\.js"/)
     })
 
     test("ambiguous (repo, branch) row gets NO inline buttons (can't disambiguate)", () => {
@@ -1374,12 +1443,11 @@ describe("exclusions UI (v1.1)", () => {
         expect(buttons).toHaveLength(0)
     })
 
-    test("dashboard wires the exclusion click handler and the Reset-selector change handler", () => {
+    test("dashboard wires the exclusion click handler (v1.1.11: no per-selector binding)", () => {
         const html = buildHtml()
         expect(html).toContain(
             'e.target.closest && e.target.closest(".excl-btn")'
         )
-        expect(html).toContain('e.target.id === "reset-context-select"')
         expect(html).toContain('"/dashboard/exclusions"')
     })
 })

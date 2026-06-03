@@ -159,6 +159,70 @@ describe("parseGeminiOutput", () => {
         expect(out.error.code).toBe("INVALID_JSON")
     })
 
+    test("returns GEMINI_LOOP_TRUNCATED when warnings has 'Loop detected' and inner JSON is truncated (v1.1.9)", () => {
+        // Reproduces the real failure: outer envelope parses, but
+        // `response` is cut off mid-string AND warnings says the loop
+        // detector fired. We must surface the loop reason instead of
+        // the generic INVALID_JSON so the operator can tell at a
+        // glance why ESCALATE happened.
+        const envelope = wrap(
+            '{"status":"ISSUES","findings":[{"file":"a.js","line":1,"severity":"blocker"',
+            { warnings: ["Loop detected, stopping execution"] }
+        )
+        const out = parseGeminiOutput(envelope, validator)
+        expect(out.ok).toBe(false)
+        expect(out.error.code).toBe("GEMINI_LOOP_TRUNCATED")
+        expect(out.error.message).toMatch(/loop detector/i)
+        expect(out.error.message).toContain("Loop detected, stopping execution")
+    })
+
+    test("GEMINI_LOOP_TRUNCATED also fires when response is missing entirely + loop warning present", () => {
+        const envelope = JSON.stringify({
+            session_id: "x",
+            response: "",
+            stats: {},
+            warnings: ["Loop detected, stopping execution"],
+        })
+        const out = parseGeminiOutput(envelope, validator)
+        expect(out.ok).toBe(false)
+        expect(out.error.code).toBe("GEMINI_LOOP_TRUNCATED")
+    })
+
+    test("matches the loop warning case-insensitively", () => {
+        const envelope = wrap("not json at all", {
+            warnings: ["LOOP DETECTED in agent execution"],
+        })
+        const out = parseGeminiOutput(envelope, validator)
+        expect(out.error.code).toBe("GEMINI_LOOP_TRUNCATED")
+    })
+
+    test("GEMINI_LOOP_TRUNCATED beats the salvage path when a complete object precedes the truncation", () => {
+        // Codex round 1 catch: a looped response can be `{...}{...`
+        // where the FIRST object is a complete, parseable verdict.
+        // extractFirstJsonObject would happily return it and we would
+        // emit GOOD_TO_GO/ISSUES against a verdict the model never
+        // finished. The loop warning must short-circuit salvage so the
+        // ESCALATE surfaces the real failure mode.
+        const looped =
+            '{"status":"ISSUES","findings":[{"file":"a.js","line":1,' +
+            '"severity":"blocker","category":"bug","message":"x","suggestion":"y"}]}' +
+            '{"status":"ISSUES","findings":[{"file":"a.js","line":1,'
+        const envelope = wrap(looped, {
+            warnings: ["Loop detected, stopping execution"],
+        })
+        const out = parseGeminiOutput(envelope, validator)
+        expect(out.ok).toBe(false)
+        expect(out.error.code).toBe("GEMINI_LOOP_TRUNCATED")
+    })
+
+    test("falls back to INVALID_JSON when warnings don't mention a loop", () => {
+        const envelope = wrap("not json", {
+            warnings: ["Ripgrep is not available."],
+        })
+        const out = parseGeminiOutput(envelope, validator)
+        expect(out.error.code).toBe("INVALID_JSON")
+    })
+
     test("returns SCHEMA_INVALID when inner JSON doesn't satisfy schema", () => {
         const out = parseGeminiOutput(
             wrap({ status: "WAT", findings: 7 }),
