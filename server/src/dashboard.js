@@ -43,6 +43,10 @@ const SEVERITY_BADGE = {
     nit: { bg: "#e0e7ff", fg: "#4338ca" },
 }
 
+// Canonical severity ordering (most → least severe). The blocking-
+// severities dropdown offers cumulative prefixes of this list.
+const SEVERITY_ORDER = ["blocker", "major", "minor", "nit"]
+
 const ESCAPE_RE = /[&<>"'`]/g
 const ESCAPE_MAP = {
     "&": "&amp;",
@@ -493,6 +497,124 @@ export const renderDurationPie = (records = []) => {
     )
 }
 
+// Good-to-go attempts pie (v1.1.14): of the reviews that reached
+// GOOD_TO_GO, how many got there on the 1st / 2nd / 3rd / 4th-or-later
+// round. `round` is the reviewer round stamped on each archived
+// review. The long tail is folded into "4+" so one slow convergence
+// doesn't shatter the chart. GOOD_TO_GO_WITH_NOTES is a separate
+// terminal state and is intentionally excluded — this slice answers
+// "how often did we land a clean pass, and how fast".
+const ATTEMPT_BUCKETS = ["1", "2", "3", "4+"]
+const ATTEMPT_LABELS = {
+    1: "1st attempt",
+    2: "2nd attempt",
+    3: "3rd attempt",
+    "4+": "4+ attempts",
+}
+const ATTEMPT_COLORS = {
+    1: "#4ade80",
+    2: "#a3e635",
+    3: "#facc15",
+    "4+": "#fb923c",
+}
+
+// Bucket GOOD_TO_GO records by the round they landed on. Exported so
+// the dashboard caption can reuse the total without re-walking.
+export const sumGoodToGoByAttempt = (records = []) => {
+    const totals = { 1: 0, 2: 0, 3: 0, "4+": 0 }
+    for (const r of records ?? []) {
+        if (!r || r.status !== "GOOD_TO_GO") continue
+        const round = Number(r.round)
+        if (!Number.isFinite(round) || round < 1) continue
+        const key = round >= 4 ? "4+" : String(round)
+        totals[key] += 1
+    }
+    const total = ATTEMPT_BUCKETS.reduce((s, k) => s + totals[k], 0)
+    return { totals, total }
+}
+
+export const renderAttemptsPie = (records = []) => {
+    const { totals, total } = sumGoodToGoByAttempt(records)
+
+    // Matches the other two pies' viewBox so all three render at the
+    // same size and the callouts don't clip at the SVG edge.
+    const W = 360
+    const H = 190
+    const cx = W / 2
+    const cy = H / 2
+    const r = 56
+
+    if (total === 0) {
+        return (
+            `<svg viewBox="0 0 ${W} ${H}" class="pie" aria-label="empty attempts pie">` +
+            `<circle cx="${cx}" cy="${cy}" r="${r}" class="pie-empty"/>` +
+            `<text x="${cx}" y="${cy + 4}" text-anchor="middle" class="empty">no good-to-go yet</text>` +
+            `</svg>`
+        )
+    }
+
+    const buckets = ATTEMPT_BUCKETS.filter((k) => totals[k] > 0).map((k) => [
+        k,
+        totals[k],
+    ])
+
+    let slices
+    const sliceMidAngles = []
+    if (buckets.length === 1) {
+        const [bucket, count] = buckets[0]
+        slices =
+            `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${ATTEMPT_COLORS[bucket]}">` +
+            `<title>${escapeHtml(ATTEMPT_LABELS[bucket])} · ${count} · 100%</title>` +
+            `</circle>`
+        sliceMidAngles.push({ bucket, count, midDeg: 0 })
+    } else {
+        let startDeg = 0
+        slices = buckets
+            .map(([bucket, count]) => {
+                const sweep = (count / total) * 360
+                const endDeg = startDeg + sweep
+                const midDeg = startDeg + sweep / 2
+                sliceMidAngles.push({ bucket, count, midDeg })
+                const pct = ((count / total) * 100).toFixed(1)
+                const title = escapeHtml(
+                    `${ATTEMPT_LABELS[bucket]} · ${count} · ${pct}%`
+                )
+                const d = arcPath(cx, cy, r, startDeg, endDeg)
+                startDeg = endDeg
+                return (
+                    `<path d="${d}" fill="${ATTEMPT_COLORS[bucket]}">` +
+                    `<title>${title}</title></path>`
+                )
+            })
+            .join("")
+    }
+
+    const callouts = sliceMidAngles
+        .map(({ bucket, count, midDeg }) => {
+            const pct = ((count / total) * 100).toFixed(1)
+            const inner = polarToCartesian(cx, cy, r, midDeg)
+            const outer = polarToCartesian(cx, cy, r + 10, midDeg)
+            const onRight = outer.x >= cx
+            const labelX = onRight ? outer.x + 4 : outer.x - 4
+            const anchor = onRight ? "start" : "end"
+            return (
+                `<g class="callout">` +
+                `<line x1="${inner.x.toFixed(2)}" y1="${inner.y.toFixed(2)}" x2="${outer.x.toFixed(2)}" y2="${outer.y.toFixed(2)}" stroke="${ATTEMPT_COLORS[bucket]}" stroke-width="1"/>` +
+                `<text x="${labelX.toFixed(2)}" y="${(outer.y - 2).toFixed(2)}" text-anchor="${anchor}" class="callout-label">${escapeHtml(ATTEMPT_LABELS[bucket])}</text>` +
+                `<text x="${labelX.toFixed(2)}" y="${(outer.y + 10).toFixed(2)}" text-anchor="${anchor}" class="callout-count">${count} · ${pct}%</text>` +
+                `</g>`
+            )
+        })
+        .join("")
+
+    return (
+        `<svg viewBox="0 0 ${W} ${H}" class="pie" preserveAspectRatio="xMidYMid meet" data-gtg-total="${total}">` +
+        slices +
+        callouts +
+        `</svg>`
+    )
+}
+
 // Compact elapsed formatter for running reviews: "12s", "3m 05s",
 // "1h 02m". Mirrored in the client poll script below — keep them in sync.
 const fmtElapsed = (ms) => {
@@ -735,8 +857,8 @@ const renderConfigPanel = (config) => {
         [
             "blocking severities",
             Array.isArray(config.blockingSeverities)
-                ? config.blockingSeverities.join(", ")
-                : "—",
+                ? config.blockingSeverities
+                : null,
         ],
         ["allowed roots", config.allowedRootsCount ?? "—"],
         ["port / bind", `${config.port ?? "—"} · ${config.bind ?? "—"}`],
@@ -754,6 +876,34 @@ const renderConfigPanel = (config) => {
                 ` <button type="button" class="cfg-step" id="max-rounds-inc" aria-label="increase max rounds">+</button>`
             )
         }
+        // blocking severities: cumulative-prefix dropdown (v1.1.13).
+        if (k === "blocking severities" && Array.isArray(v)) {
+            const cur = SEVERITY_ORDER.filter((s) => v.includes(s)).join(",")
+            // The dropdown offers "none" ([] — every finding
+            // informational) plus each cumulative prefix. A hand-edited
+            // config can hold a non-prefix subset (e.g. blocker+minor);
+            // those are the representable values we'd render below.
+            const prefixes = SEVERITY_ORDER.map((_, i) =>
+                SEVERITY_ORDER.slice(0, i + 1).join(",")
+            )
+            const representable = new Set(["", ...prefixes])
+            const noneOpt = `<option value=""${cur === "" ? " selected" : ""}>none</option>`
+            const opts = SEVERITY_ORDER.map((_, i) => {
+                const combo = SEVERITY_ORDER.slice(0, i + 1)
+                const val = combo.join(",")
+                const sel = val === cur ? " selected" : ""
+                return `<option value="${escapeHtml(val)}"${sel}>${escapeHtml(combo.join(" + "))}</option>`
+            }).join("")
+            // Surface a non-prefix current policy as its own selected
+            // option so the dropdown never misreports the active value.
+            const customOpt = representable.has(cur)
+                ? ""
+                : `<option value="${escapeHtml(cur)}" selected>${escapeHtml(
+                      v.join(" + ")
+                  )} (custom)</option>`
+            return `<select class="cfg-select" id="blocking-severities-select" aria-label="blocking severities">${noneOpt}${opts}${customOpt}</select>`
+        }
+        if (v === null || v === undefined) return "—"
         return escapeHtml(String(v))
     }
     return (
@@ -985,6 +1135,10 @@ section h2 { font-size: 14px; margin: 0 0 12px; text-transform: uppercase;
   color: var(--ink); border-radius: 3px; cursor: pointer; }
 .config dd .cfg-step:hover { background: var(--bg); }
 .config dd .cfg-step:disabled { opacity: 0.5; cursor: not-allowed; }
+.config dd .cfg-select { font-family: inherit; font-size: 12px; line-height: 1;
+  padding: 1px 4px; border: 1px solid var(--border); background: var(--card);
+  color: var(--ink); border-radius: 3px; cursor: pointer; }
+.config dd .cfg-select:disabled { opacity: 0.5; cursor: not-allowed; }
 svg.chart { width: 100%; height: auto; display: block; }
 svg.chart .ref { stroke: var(--border); stroke-width: 1; stroke-dasharray: 2 3; }
 svg.chart .ref-label { fill: var(--muted); font-size: 10px;
@@ -1023,8 +1177,11 @@ section.compact > h2 { margin-bottom: 8px; }
 /* Charts row (the two pies, their own section). */
 .charts-row { display: flex; gap: 24px; align-items: flex-start;
   flex-wrap: wrap; justify-content: center; }
+/* Three equal, shrinkable columns so all pies share one line; each
+   SVG scales down within its column (max-width 360 caps the width on
+   wide screens). Below 720px the media query lets them stack. */
 .charts-row .pie-wrap { display: flex; flex-direction: column;
-  align-items: center; gap: 4px; flex: 0 0 360px; min-width: 0; }
+  align-items: center; gap: 4px; flex: 1 1 0; min-width: 0; }
 .charts-row .pie-wrap .label { color: var(--muted); font-size: 11px;
   text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
   text-align: center; }
@@ -1092,14 +1249,18 @@ section.compact > h2 { margin-bottom: 8px; }
 /* In-flight rows */
 #inflight-body { display: flex; flex-direction: column; gap: 8px; }
 .inflight-row { display: flex; align-items: center; gap: 10px; }
+/* if-ctx must shrink and wrap (long unbreakable branch names would
+   otherwise push the elapsed time out past the 300px slot). */
 .inflight-row .if-ctx { font-family: ui-monospace, SFMono-Regular, Menlo,
-  monospace; font-size: 14px; }
-.inflight-row .if-tag { font-size: 10px; text-transform: uppercase;
-  letter-spacing: 0.04em; color: var(--muted); border: 1px solid var(--border);
-  border-radius: 3px; padding: 0 5px; }
+  monospace; font-size: 14px; flex: 1 1 auto; min-width: 0;
+  overflow-wrap: anywhere; }
+.inflight-row .if-tag { flex: 0 0 auto; font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
 .inflight-row .if-tag.force { color: #c2410c; border-color: #c2410c; }
-.inflight-row .if-elapsed { margin-left: auto; font-family: ui-monospace,
-  SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--muted); }
+.inflight-row .if-elapsed { margin-left: auto; flex: 0 0 auto;
+  white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo,
+  monospace; font-size: 13px; color: var(--muted); }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: #22c55e;
   flex: 0 0 auto; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.6);
   animation: pulse 1.4s ease-out infinite; }
@@ -1229,6 +1390,7 @@ export const renderDashboard = ({
     const failures = recordsWithIds.filter((r) => r.status === "ESCALATE")
     const startedAtStr = startedAt ? fmtTs(startedAt) : "—"
     const totalDurationMs = sumDurationByStatus(records).total
+    const gtgTotal = sumGoodToGoByAttempt(records).total
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -1265,6 +1427,10 @@ export const renderDashboard = ({
     <div class="pie-wrap">
       ${renderDurationPie(records)}
       <div class="label">time by result · last ${records.length} · total ${escapeHtml(fmtHms(totalDurationMs))}</div>
+    </div>
+    <div class="pie-wrap">
+      ${renderAttemptsPie(records)}
+      <div class="label">good-to-go attempts · ${gtgTotal} clean pass${gtgTotal === 1 ? "" : "es"}</div>
     </div>
   </div>
 </section>
@@ -1608,6 +1774,35 @@ export const renderDashboard = ({
       });
   });
 
+  // Blocking-severities dropdown (v1.1.13). Delegated so it survives
+  // the refreshSections swap of the config grid.
+  document.addEventListener("change", function (e) {
+    var sel = e.target;
+    if (!sel || sel.id !== "blocking-severities-select") return;
+    var value = sel.value ? sel.value.split(",") : [];
+    sel.disabled = true;
+    fetch("/dashboard/blocking-severities", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value: value }),
+    })
+      .then(bodyToOk)
+      .then(function (r) {
+        if (r.ok) {
+          var label = r.j.value.length ? r.j.value.join(" + ") : "none";
+          setStatus("blocking severities → " + label +
+            (r.j.persisted ? "" : " (in-memory only)"), true);
+        } else {
+          setStatus("error: " + (r.j.error || "failed"), false);
+        }
+      })
+      .catch(function (err) { setStatus("error: " + err.message, false); })
+      .finally(function () {
+        var s = document.getElementById("blocking-severities-select");
+        if (s) s.disabled = false;
+      });
+  });
+
   // Exclusion toggle (v1.1). One delegated listener for every
   // .excl-btn anywhere on the page — survives section refreshes.
   function readExclusionsData() {
@@ -1793,6 +1988,8 @@ export const __test__ = {
     renderRequestPie,
     renderDurationPie,
     sumDurationByStatus,
+    renderAttemptsPie,
+    sumGoodToGoByAttempt,
     renderInFlight,
     renderControls,
     renderConfigPanel,

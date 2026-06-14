@@ -20,6 +20,7 @@ import { mountNotifyChangeRoute } from "./notify-change.js"
 import { mountProviderRoute, handleSetProvider } from "./provider.js"
 import { handleExclusionMutation } from "./exclusions.js"
 import { handleSetMaxRounds } from "./maxRounds.js"
+import { handleSetBlockingSeverities } from "./blockingSeverities.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { createMetrics } from "./metrics.js"
@@ -215,6 +216,20 @@ export const createApp = ({
     // of the dashboard mutation surface.
     app.put("/dashboard/max-rounds", loopbackOnly, (req, res) => {
         const result = handleSetMaxRounds({
+            body: req.body,
+            config,
+            configPath,
+            logger: log,
+            deps,
+        })
+        res.status(result.httpStatus).json(result.body)
+    })
+
+    // Pick which severities count as blocking from the dashboard
+    // (v1.1.13). Live + best-effort persisted, same loopback trust
+    // boundary as the rest of the dashboard mutation surface.
+    app.put("/dashboard/blocking-severities", loopbackOnly, (req, res) => {
+        const result = handleSetBlockingSeverities({
             body: req.body,
             config,
             configPath,

@@ -164,6 +164,22 @@ describe("renderDashboard", () => {
         expect(html).toContain("gemini exited with code 41")
     })
 
+    test("charts section includes the good-to-go attempts pie (v1.1.14)", () => {
+        const html = renderDashboard({
+            version: "1.1.14",
+            config: baseConfig(),
+            records: [
+                goodRecord({ round: 1 }),
+                goodRecord({ round: 2 }),
+                issuesRecord(),
+            ],
+        })
+        expect(html).toContain("good-to-go attempts")
+        expect(html).toContain("2 clean passes")
+        expect(html).toContain("1st attempt")
+        expect(html).toContain("2nd attempt")
+    })
+
     test("empty state shows placeholders for both sections", () => {
         const html = renderDashboard({
             version: "0.1.3",
@@ -267,6 +283,53 @@ describe("renderDashboard", () => {
         expect(html).toMatch(/id="max-rounds-dec"/)
         expect(html).toMatch(/id="max-rounds-inc"/)
         expect(html).toMatch(/data-max-rounds-value[^>]*>5</)
+    })
+
+    test("blocking severities cell carries a cumulative-prefix dropdown (v1.1.13)", () => {
+        const html = renderDashboard({
+            version: "1.1.13",
+            config: baseConfig(),
+            records: [],
+        })
+        expect(html).toMatch(/data-config-key="blocking-severities"/)
+        expect(html).toMatch(/id="blocking-severities-select"/)
+        // A "none" option (empty []) plus cumulative prefixes, with the
+        // current value pre-selected.
+        expect(html).toMatch(/<option value="">none<\/option>/)
+        expect(html).toMatch(/<option value="blocker">blocker<\/option>/)
+        expect(html).toMatch(
+            /<option value="blocker,major" selected>blocker \+ major<\/option>/
+        )
+        expect(html).toMatch(
+            /<option value="blocker,major,minor,nit">blocker \+ major \+ minor \+ nit<\/option>/
+        )
+    })
+
+    test("blocking severities dropdown pre-selects 'none' for an empty policy", () => {
+        const html = renderDashboard({
+            version: "1.1.13",
+            config: { ...baseConfig(), blockingSeverities: [] },
+            records: [],
+        })
+        expect(html).toMatch(/<option value="" selected>none<\/option>/)
+        expect(html).not.toMatch(/<option value="blocker" selected>/)
+    })
+
+    test("blocking severities dropdown adds a selected 'custom' option for a non-prefix policy", () => {
+        const html = renderDashboard({
+            version: "1.1.13",
+            config: {
+                ...baseConfig(),
+                blockingSeverities: ["blocker", "minor"],
+            },
+            records: [],
+        })
+        expect(html).toMatch(
+            /<option value="blocker,minor" selected>blocker \+ minor \(custom\)<\/option>/
+        )
+        // None of the canned prefixes are selected.
+        expect(html).not.toMatch(/<option value="blocker" selected>/)
+        expect(html).not.toMatch(/<option value="" selected>/)
     })
 
     test("hook fetch timeout shows 'auto' when config value is null", () => {
@@ -868,6 +931,84 @@ describe("renderDurationPie", () => {
     })
 })
 
+describe("sumGoodToGoByAttempt (v1.1.14)", () => {
+    const { sumGoodToGoByAttempt } = __test__
+    test("buckets GOOD_TO_GO records by round, folding 4+ together", () => {
+        const out = sumGoodToGoByAttempt([
+            { status: "GOOD_TO_GO", round: 1 },
+            { status: "GOOD_TO_GO", round: 1 },
+            { status: "GOOD_TO_GO", round: 2 },
+            { status: "GOOD_TO_GO", round: 3 },
+            { status: "GOOD_TO_GO", round: 4 },
+            { status: "GOOD_TO_GO", round: 9 },
+            // Non-GOOD_TO_GO statuses do not contribute.
+            { status: "ISSUES", round: 1 },
+            { status: "GOOD_TO_GO_WITH_NOTES", round: 1 },
+            { status: "ESCALATE", round: 2 },
+            // Garbage / missing-or-bad round skipped.
+            { status: "GOOD_TO_GO", round: 0 },
+            { status: "GOOD_TO_GO", round: "nope" },
+            { status: "GOOD_TO_GO" },
+            null,
+        ])
+        expect(out.totals).toEqual({ 1: 2, 2: 1, 3: 1, "4+": 2 })
+        expect(out.total).toBe(6)
+    })
+
+    test("defaults and null input are safe", () => {
+        expect(sumGoodToGoByAttempt().total).toBe(0)
+        expect(sumGoodToGoByAttempt(null).total).toBe(0)
+    })
+})
+
+describe("renderAttemptsPie (v1.1.14)", () => {
+    const { renderAttemptsPie } = __test__
+
+    test("empty input renders an empty-state circle, no slices", () => {
+        const svg = renderAttemptsPie([])
+        expect(svg).toContain("no good-to-go yet")
+        expect(svg).not.toContain("<path ")
+    })
+
+    test("single bucket renders as a full circle (avoids degenerate arc)", () => {
+        const svg = renderAttemptsPie([
+            { status: "GOOD_TO_GO", round: 1 },
+            { status: "GOOD_TO_GO", round: 1 },
+        ])
+        expect(svg).toMatch(/<circle [^>]*fill="#4ade80"/)
+        expect(svg).not.toContain("<path ")
+        expect(svg).toContain("1st attempt")
+        expect(svg).toContain('data-gtg-total="2"')
+    })
+
+    test("multiple buckets render one path each, colored per bucket", () => {
+        const svg = renderAttemptsPie([
+            { status: "GOOD_TO_GO", round: 1 },
+            { status: "GOOD_TO_GO", round: 2 },
+            { status: "GOOD_TO_GO", round: 3 },
+            { status: "GOOD_TO_GO", round: 7 },
+        ])
+        expect(svg.match(/<path /g)?.length).toBe(4)
+        expect(svg).toContain("#4ade80")
+        expect(svg).toContain("#a3e635")
+        expect(svg).toContain("#facc15")
+        expect(svg).toContain("#fb923c")
+        expect(svg).toContain("4+ attempts")
+    })
+
+    test("callouts show count and percentage per slice", () => {
+        const svg = renderAttemptsPie([
+            { status: "GOOD_TO_GO", round: 1 },
+            { status: "GOOD_TO_GO", round: 1 },
+            { status: "GOOD_TO_GO", round: 1 },
+            { status: "GOOD_TO_GO", round: 2 },
+        ])
+        // 3 of 4 on the first attempt = 75%, 1 of 4 second = 25%.
+        expect(svg).toContain("75.0%")
+        expect(svg).toContain("25.0%")
+    })
+})
+
 describe("renderControls (v0.1.35)", () => {
     const { renderControls } = __test__
 
@@ -1314,9 +1455,7 @@ describe("exclusions UI (v1.1)", () => {
         // Header shows a total count, yellow class applied when > 0.
         expect(html).toMatch(/id="exclusions-count" class="exc-count warn">1</)
         // Group header carries the context key.
-        expect(html).toMatch(
-            /class="exc-group-header">\/r\|main<\/div>/
-        )
+        expect(html).toMatch(/class="exc-group-header">\/r\|main<\/div>/)
         // Row exists for the excluded entry.
         expect(html).toMatch(
             /class="exc-row"[^]*data-file="a\.js"[^]*data-action="remove"/
