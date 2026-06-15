@@ -11,6 +11,7 @@ import {
     rmSync,
     writeFileSync,
 } from "node:fs"
+import http from "node:http"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Readable } from "node:stream"
@@ -22,6 +23,7 @@ import {
     resolveFetchTimeoutMs,
     main,
     appendLogLine,
+    nodeHttpFetch,
     stripControl,
     writeCallSnapshot,
 } from "./stop-review.mjs"
@@ -1388,5 +1390,117 @@ describe("main — REVIEW_ORCH_SKIP env", () => {
         })
         expect(code).toBe(0)
         expect(fetchSpy).not.toHaveBeenCalled()
+    })
+})
+
+describe("nodeHttpFetch", () => {
+    // Spin up a real loopback server per test so we exercise the actual
+    // node:http path (the whole point: it has no undici 300s
+    // headers/body timeout that would kill a long review).
+    const listen = (handler) =>
+        new Promise((resolve) => {
+            const srv = http.createServer(handler)
+            srv.listen(0, "127.0.0.1", () => {
+                const { port } = srv.address()
+                resolve({ srv, url: `http://127.0.0.1:${port}/review` })
+            })
+        })
+
+    test("POSTs the body and returns status, header getter, and parsed json", async () => {
+        let received = null
+        const { srv, url } = await listen((req, res) => {
+            const chunks = []
+            req.on("data", (c) => chunks.push(c))
+            req.on("end", () => {
+                received = {
+                    method: req.method,
+                    token: req.headers["x-review-token"],
+                    body: Buffer.concat(chunks).toString("utf8"),
+                }
+                res.setHeader("x-request-id", "abc123")
+                res.setHeader("content-type", "application/json")
+                res.end(JSON.stringify({ status: "ISSUES", ok: true }))
+            })
+        })
+        try {
+            const r = await nodeHttpFetch(url, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    "x-review-token": "tok",
+                },
+                body: JSON.stringify({ cwd: "/x" }),
+            })
+            expect(r.status).toBe(200)
+            // Header getter is case-insensitive like the fetch API.
+            expect(r.headers.get("X-Request-Id")).toBe("abc123")
+            expect(r.headers.get("missing")).toBeNull()
+            expect(await r.json()).toEqual({ status: "ISSUES", ok: true })
+            expect(received.method).toBe("POST")
+            expect(received.token).toBe("tok")
+            expect(JSON.parse(received.body)).toEqual({ cwd: "/x" })
+        } finally {
+            srv.close()
+        }
+    })
+
+    test("connects over an IPv6 loopback URL (brackets stripped from host)", async () => {
+        const srv = http.createServer((req, res) =>
+            res.end(JSON.stringify({ status: "GOOD_TO_GO" }))
+        )
+        await new Promise((resolve, reject) => {
+            srv.listen(0, "::1", resolve)
+            srv.on("error", reject)
+        })
+        try {
+            const { port } = srv.address()
+            const r = await nodeHttpFetch(`http://[::1]:${port}/review`, {
+                method: "POST",
+            })
+            expect(r.status).toBe(200)
+            expect(await r.json()).toEqual({ status: "GOOD_TO_GO" })
+        } finally {
+            srv.close()
+        }
+    })
+
+    test("resolves even when the response is delayed (no premature timeout)", async () => {
+        const { srv, url } = await listen((req, res) => {
+            setTimeout(
+                () => res.end(JSON.stringify({ status: "GOOD_TO_GO" })),
+                120
+            )
+        })
+        try {
+            const r = await nodeHttpFetch(url, { method: "POST" })
+            expect(await r.json()).toEqual({ status: "GOOD_TO_GO" })
+        } finally {
+            srv.close()
+        }
+    })
+
+    test("an aborted signal rejects with an AbortError", async () => {
+        const { srv, url } = await listen((req, res) => {
+            // Never respond — only the abort should end this.
+            setTimeout(() => res.end("{}"), 5000)
+        })
+        const controller = new AbortController()
+        const p = nodeHttpFetch(url, {
+            method: "POST",
+            signal: controller.signal,
+        })
+        controller.abort()
+        try {
+            await expect(p).rejects.toMatchObject({ name: "AbortError" })
+        } finally {
+            srv.close()
+        }
+    })
+
+    test("connection refused rejects (fail-open signal for the caller)", async () => {
+        // Port 1 is privileged/unused on loopback → ECONNREFUSED.
+        await expect(
+            nodeHttpFetch("http://127.0.0.1:1/review", { method: "POST" })
+        ).rejects.toBeDefined()
     })
 })

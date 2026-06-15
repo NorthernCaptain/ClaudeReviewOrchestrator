@@ -285,6 +285,18 @@ describe("renderDashboard", () => {
         expect(html).toMatch(/data-max-rounds-value[^>]*>5</)
     })
 
+    test("max blocks cell carries +/- stepper buttons (v1.1.19)", () => {
+        const html = renderDashboard({
+            version: "1.1.19",
+            config: baseConfig(),
+            records: [],
+        })
+        expect(html).toMatch(/data-config-key="max-blocks"/)
+        expect(html).toMatch(/id="max-blocks-dec"/)
+        expect(html).toMatch(/id="max-blocks-inc"/)
+        expect(html).toMatch(/data-max-blocks-value[^>]*>6</)
+    })
+
     test("blocking severities cell carries a cumulative-prefix dropdown (v1.1.13)", () => {
         const html = renderDashboard({
             version: "1.1.13",
@@ -353,6 +365,32 @@ describe("renderDashboard", () => {
         expect(html).toContain("no findings — clean review")
     })
 
+    test("ESCALATE row in the main list shows the full failure detail inline (v1.1.18)", () => {
+        const r = escalateRecord({
+            reason: "codex exited with code 1",
+            failureDetail: {
+                exitCode: 1,
+                stderrTail:
+                    "=== FILE: a.c ===\n" +
+                    "ERROR: This content was flagged for possible cybersecurity risk\n",
+                stdoutTail: "",
+                schemaError: null,
+                argv: ["codex", "exec"],
+            },
+        })
+        const html = renderSuccessRow(r)
+        // One-line failure banner up top.
+        expect(html).toContain("failed — codex exited with code 1")
+        // Same rich detail as the Failed section: highlighted error,
+        // argv, and the full stderr tail are present inline.
+        expect(html).toContain('<pre class="stderr-error">')
+        expect(html).toContain("flagged for possible cybersecurity risk")
+        expect(html).toContain("codex exec")
+        expect(html).toContain('<pre class="stderr">')
+        // No longer punts the user to the Failed section.
+        expect(html).not.toContain("see Failed section")
+    })
+
     test("failure row schema-error block is rendered when present", () => {
         const r = escalateRecord({
             failureDetail: {
@@ -384,6 +422,47 @@ describe("renderDashboard", () => {
         const html = renderFailureRow(evil)
         // The short-reason cell shows the em-dash placeholder.
         expect(html).toContain("—")
+    })
+
+    test("failure row lifts the real ERROR line out of a noisy stderr tail (v1.1.17)", () => {
+        const r = escalateRecord({
+            reason: "codex exited with code 1",
+            failureDetail: {
+                exitCode: 1,
+                stderrTail:
+                    "=== FILE: a.c (untracked) ===\n" +
+                    "=== FILE: b.c (untracked) ===\n" +
+                    "<<<END_REVIEW_INPUT>>>\n" +
+                    "ERROR: This content was flagged for possible cybersecurity risk … join the Trusted Access for Cyber program\n" +
+                    "ERROR: This content was flagged for possible cybersecurity risk … join the Trusted Access for Cyber program\n",
+                stdoutTail: "",
+                schemaError: null,
+                argv: ["codex", "exec"],
+            },
+        })
+        const html = renderFailureRow(r)
+        // The highlighted block exists and carries the real message.
+        expect(html).toContain('<pre class="stderr-error">')
+        expect(html).toContain("flagged for possible cybersecurity risk")
+        // Duplicate ERROR line is collapsed to a single occurrence in the
+        // highlight block (the full tail below may still contain both).
+        const highlight = html.slice(html.indexOf('class="stderr-error"'))
+        const inBlock = highlight.slice(0, highlight.indexOf("</pre>") + 6)
+        expect(inBlock.match(/cybersecurity risk/g)?.length).toBe(1)
+    })
+
+    test("failure row omits the error highlight when stderr has no ERROR line", () => {
+        const r = escalateRecord({
+            failureDetail: {
+                exitCode: 1,
+                stderrTail: "just some warnings, nothing fatal here",
+                stdoutTail: "",
+                schemaError: null,
+                argv: null,
+            },
+        })
+        const html = renderFailureRow(r)
+        expect(html).not.toContain("stderr-error")
     })
 
     test("long status names use the shortened label in the summary row, full name in the title attribute", () => {
@@ -928,6 +1007,27 @@ describe("renderDurationPie", () => {
         expect(svg).toContain('data-total-ms="60000"')
         // Total minus garbage; pie remains a single-bucket full circle.
         expect(svg).toMatch(/<circle [^>]*fill="#4ade80"/)
+    })
+})
+
+describe("extractStderrErrors (v1.1.17)", () => {
+    const { extractStderrErrors } = __test__
+    test("returns only ERROR-prefixed lines, trimmed and deduped", () => {
+        const tail =
+            "noise line\n" +
+            "  ERROR: boom\n" +
+            "more noise\n" +
+            "ERROR: boom\n" + // duplicate → collapsed
+            "ERROR: second problem\n"
+        expect(extractStderrErrors(tail)).toBe(
+            "ERROR: boom\nERROR: second problem"
+        )
+    })
+    test("empty / non-string input is safe", () => {
+        expect(extractStderrErrors("")).toBe("")
+        expect(extractStderrErrors(null)).toBe("")
+        expect(extractStderrErrors(undefined)).toBe("")
+        expect(extractStderrErrors("no errors at all")).toBe("")
     })
 })
 

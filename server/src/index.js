@@ -20,6 +20,7 @@ import { mountNotifyChangeRoute } from "./notify-change.js"
 import { mountProviderRoute, handleSetProvider } from "./provider.js"
 import { handleExclusionMutation } from "./exclusions.js"
 import { handleSetMaxRounds } from "./maxRounds.js"
+import { handleSetMaxBlocks } from "./maxBlocks.js"
 import { handleSetBlockingSeverities } from "./blockingSeverities.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
@@ -216,6 +217,19 @@ export const createApp = ({
     // of the dashboard mutation surface.
     app.put("/dashboard/max-rounds", loopbackOnly, (req, res) => {
         const result = handleSetMaxRounds({
+            body: req.body,
+            config,
+            configPath,
+            logger: log,
+            deps,
+        })
+        res.status(result.httpStatus).json(result.body)
+    })
+
+    // Adjust the block cap from the dashboard (v1.1.19). Live +
+    // best-effort persisted, same loopback trust boundary.
+    app.put("/dashboard/max-blocks", loopbackOnly, (req, res) => {
+        const result = handleSetMaxBlocks({
             body: req.body,
             config,
             configPath,

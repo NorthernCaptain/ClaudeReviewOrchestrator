@@ -21,8 +21,67 @@ import {
     unlinkSync,
     writeFileSync,
 } from "node:fs"
+import http from "node:http"
 import { homedir } from "node:os"
 import path from "node:path"
+
+// Minimal fetch-shaped client over node:http. We deliberately do NOT
+// use the global fetch (undici) for the /review call: undici imposes a
+// 300s headersTimeout AND a 300s bodyTimeout that fire independently of
+// our AbortController, and the server holds the connection open with no
+// response until the reviewer subprocess finishes. Any review longer
+// than 5 minutes therefore aborts with "fetch failed", the hook fails
+// open, and Claude stops WITHOUT ever seeing the blocking findings.
+// undici can't be reconfigured here (it isn't importable from this
+// dependency-free hook), so we drop to node:http, which has no such cap
+// — the only timeout is the abort signal we wire up below. Returns the
+// subset of the fetch Response API the hook uses.
+export const nodeHttpFetch = (url, { method, headers, body, signal } = {}) =>
+    new Promise((resolve, reject) => {
+        const u = new URL(url)
+        // URL.hostname keeps the brackets on an IPv6 literal
+        // ("[::1]"); http.request would try to resolve that bracketed
+        // string and fail. Strip them so the bare address ("::1") is
+        // passed, which the net layer recognizes as an IPv6 host. This
+        // matters for installs binding "::" / "::1".
+        const hostname = u.hostname.replace(/^\[|\]$/g, "")
+        const req = http.request(
+            {
+                hostname,
+                port: u.port,
+                path: u.pathname + u.search,
+                method,
+                headers,
+            },
+            (res) => {
+                const chunks = []
+                res.on("data", (c) => chunks.push(c))
+                res.on("end", () => {
+                    const text = Buffer.concat(chunks).toString("utf8")
+                    resolve({
+                        status: res.statusCode,
+                        headers: {
+                            get: (name) =>
+                                res.headers[String(name).toLowerCase()] ?? null,
+                        },
+                        json: async () => JSON.parse(text),
+                    })
+                })
+            }
+        )
+        req.on("error", reject)
+        if (signal) {
+            const onAbort = () => {
+                const err = new Error("aborted")
+                err.name = "AbortError"
+                req.destroy(err)
+            }
+            if (signal.aborted) onAbort()
+            else signal.addEventListener("abort", onAbort, { once: true })
+        }
+        if (body) req.write(body)
+        req.end()
+    })
 
 const DEFAULT_CONFIG_PATH = () =>
     path.join(homedir(), ".config", "review-orchestrator", "config.json")
@@ -521,7 +580,7 @@ export const main = async ({
     stdin = process.stdin,
     stdout = process.stdout,
     stderr = process.stderr,
-    fetchFn = globalThis.fetch,
+    fetchFn = nodeHttpFetch,
     now = Date.now,
     log = appendLogLine,
     snapshot = defaultSnapshotForEnv(),

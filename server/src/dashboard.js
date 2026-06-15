@@ -876,6 +876,14 @@ const renderConfigPanel = (config) => {
                 ` <button type="button" class="cfg-step" id="max-rounds-inc" aria-label="increase max rounds">+</button>`
             )
         }
+        // max blocks: inline stepper buttons (v1.1.19).
+        if (k === "max blocks" && typeof v === "number") {
+            return (
+                `<span class="cfg-val" data-max-blocks-value>${escapeHtml(String(v))}</span>` +
+                ` <button type="button" class="cfg-step" id="max-blocks-dec" aria-label="decrease max blocks">−</button>` +
+                ` <button type="button" class="cfg-step" id="max-blocks-inc" aria-label="increase max blocks">+</button>`
+            )
+        }
         // blocking severities: cumulative-prefix dropdown (v1.1.13).
         if (k === "blocking severities" && Array.isArray(v)) {
             const cur = SEVERITY_ORDER.filter((s) => v.includes(s)).join(",")
@@ -968,19 +976,18 @@ const renderFinding = (f, opts = {}) => {
 }
 
 // Row body for an ESCALATE-status review when shown in the unified
-// reviews list (the standalone Failed section uses renderFailureRow's
-// richer layout). Single-line reason here keeps the row compact;
-// users wanting the full stderr/argv expand the Failed section.
+// reviews list. Leads with a one-line failure banner, then the same
+// rich detail (error highlight + stderr/argv/schema) the standalone
+// Failed section shows, so expanding either place gives the full story.
 const renderEscalateBody = (r) => {
     const reasonStr =
         r.reason === null || r.reason === undefined ? "—" : String(r.reason)
-    return (
+    const banner =
         `<div class="empty" style="color:${ESCALATE_COLOR}">` +
         `failed — ${escapeHtml(reasonStr.slice(0, 240))}` +
         (reasonStr.length > 240 ? "…" : "") +
-        ` <em>(see Failed section below for full details)</em>` +
         `</div>`
-    )
+    return banner + renderFailureDetailBody(r)
 }
 
 const renderReviewRow = (r) => {
@@ -1034,6 +1041,72 @@ const renderReviewRow = (r) => {
 // stays stable. Removed in a follow-up once tests migrate.
 const renderSuccessRow = renderReviewRow
 
+// Pull the salient error line(s) out of a noisy stderr tail. The
+// reviewer CLIs prefix fatal messages with "ERROR:" but precede them
+// with a large echo of the prompt / file list, so the real cause (e.g.
+// a codex content-filter refusal) ends up buried at the very bottom of
+// the tail. Surfacing just these lines lets the dashboard show the real
+// error up front. Consecutive duplicates (codex emits the same refusal
+// twice) are collapsed.
+const extractStderrErrors = (stderrTail) => {
+    if (!stderrTail || typeof stderrTail !== "string") return ""
+    const seen = new Set()
+    const out = []
+    for (const raw of stderrTail.split("\n")) {
+        const line = raw.trim()
+        if (!/^ERROR\b/i.test(line)) continue
+        if (seen.has(line)) continue
+        seen.add(line)
+        out.push(line)
+    }
+    return out.join("\n")
+}
+
+// Shared inner body for a failed review: the real error lifted out of
+// the stderr tail (highlighted), then reason, argv, the full stderr /
+// stdout tails, and any schema error. Used both by the standalone
+// Failed section (renderFailureRow) and by the ESCALATE rows in the
+// unified reviews list, so expanding either gives the same detail.
+const renderFailureDetailBody = (r) => {
+    const d = r.failureDetail ?? {}
+    const kv = (k, v) =>
+        v === null || v === undefined || v === ""
+            ? ""
+            : `<div class="kv"><dt>${escapeHtml(k)}</dt><dd><code>${escapeHtml(String(v))}</code></dd></div>`
+    const argvHtml = Array.isArray(d.argv)
+        ? `<div class="kv"><dt>argv</dt><dd><code>${escapeHtml(d.argv.join(" "))}</code></dd></div>`
+        : ""
+    const stderr = d.stderrTail
+        ? `<pre class="stderr">${escapeHtml(d.stderrTail)}</pre>`
+        : ""
+    const errLines = extractStderrErrors(d.stderrTail)
+    const errHighlight = errLines
+        ? `<div class="kv"><dt>error</dt><dd><pre class="stderr-error">${escapeHtml(errLines)}</pre></dd></div>`
+        : ""
+    const stdout = d.stdoutTail
+        ? `<details class="stdout"><summary>stdout tail (last 800B)</summary><pre>${escapeHtml(d.stdoutTail)}</pre></details>`
+        : ""
+    const schema = d.schemaError
+        ? `<pre class="schema">${escapeHtml(
+              JSON.stringify(d.schemaError, null, 2)
+          )}</pre>`
+        : ""
+    return (
+        errHighlight +
+        kv("reason", r.reason) +
+        argvHtml +
+        (stderr
+            ? `<div class="kv"><dt>stderr tail</dt><dd>${stderr}</dd></div>`
+            : "") +
+        (stdout
+            ? `<div class="kv"><dt>stdout tail</dt><dd>${stdout}</dd></div>`
+            : "") +
+        (schema
+            ? `<div class="kv"><dt>schema error</dt><dd>${schema}</dd></div>`
+            : "")
+    )
+}
+
 const renderFailureRow = (r) => {
     const d = r.failureDetail ?? {}
     const ctxAttr = r._contextKey
@@ -1053,24 +1126,6 @@ const renderFailureRow = (r) => {
         `<span class="dur">${escapeHtml(fmtMs(r.durationMs))}</span>` +
         `<span class="reason">${escapeHtml(shortReason)}${reasonStr.length > 120 ? "…" : ""}</span>` +
         `</summary>`
-    const kv = (k, v) =>
-        v === null || v === undefined || v === ""
-            ? ""
-            : `<div class="kv"><dt>${escapeHtml(k)}</dt><dd><code>${escapeHtml(String(v))}</code></dd></div>`
-    const argvHtml = Array.isArray(d.argv)
-        ? `<div class="kv"><dt>argv</dt><dd><code>${escapeHtml(d.argv.join(" "))}</code></dd></div>`
-        : ""
-    const stderr = d.stderrTail
-        ? `<pre class="stderr">${escapeHtml(d.stderrTail)}</pre>`
-        : ""
-    const stdout = d.stdoutTail
-        ? `<details class="stdout"><summary>stdout tail (last 800B)</summary><pre>${escapeHtml(d.stdoutTail)}</pre></details>`
-        : ""
-    const schema = d.schemaError
-        ? `<pre class="schema">${escapeHtml(
-              JSON.stringify(d.schemaError, null, 2)
-          )}</pre>`
-        : ""
     const meta =
         `<div class="meta">` +
         `<span>code ${escapeHtml(r.code ?? "?")}</span>` +
@@ -1079,17 +1134,7 @@ const renderFailureRow = (r) => {
         `</div>`
     return (
         `<details class="fail"${ctxAttr}>${summary}${meta}` +
-        kv("reason", r.reason) +
-        argvHtml +
-        (stderr
-            ? `<div class="kv"><dt>stderr tail</dt><dd>${stderr}</dd></div>`
-            : "") +
-        (stdout
-            ? `<div class="kv"><dt>stdout tail</dt><dd>${stdout}</dd></div>`
-            : "") +
-        (schema
-            ? `<div class="kv"><dt>schema error</dt><dd>${schema}</dd></div>`
-            : "") +
+        renderFailureDetailBody(r) +
         `</details>`
     )
 }
@@ -1315,6 +1360,11 @@ ul.findings li:first-child { border-top: 0; }
   font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 pre { padding: 8px 10px; overflow: auto; max-height: 240px; white-space: pre-wrap;
   word-break: break-word; }
+/* The real reviewer error, lifted out of the stderr tail and shown up
+   front so a content-filter refusal isn't buried under the prompt echo. */
+pre.stderr-error { background: rgba(239, 68, 68, 0.12);
+  border-left: 3px solid #ef4444; color: var(--fg); font-size: 12px;
+  font-weight: 600; }
 .empty { color: var(--muted); padding: 8px 0; font-style: italic; }
 footer { color: var(--muted); font-size: 11px; text-align: center;
   margin-top: 32px; }
@@ -1725,31 +1775,35 @@ export const renderDashboard = ({
     }
   }
 
-  // Max-rounds stepper (v1.1.8). Delegated so it survives the
-  // refreshSections swap of the config grid.
-  function maxRoundsValueCell() {
-    return document.querySelector("[data-max-rounds-value]");
-  }
-  function readMaxRounds() {
-    var cell = maxRoundsValueCell();
-    if (!cell) return null;
-    var n = Number(cell.textContent);
-    return Number.isFinite(n) ? n : null;
-  }
+  // Config steppers (max rounds v1.1.8, max blocks v1.1.19). One
+  // delegated handler for every .cfg-step button — survives the
+  // refreshSections swap of the config grid. Each stepper is described
+  // by its button ids, value-cell selector, PUT endpoint, and label.
+  var STEPPERS = [
+    { label: "max rounds", endpoint: "/dashboard/max-rounds",
+      sel: "[data-max-rounds-value]", dec: "max-rounds-dec", inc: "max-rounds-inc" },
+    { label: "max blocks", endpoint: "/dashboard/max-blocks",
+      sel: "[data-max-blocks-value]", dec: "max-blocks-dec", inc: "max-blocks-inc" },
+  ];
   document.addEventListener("click", function (e) {
     var btn = e.target && e.target.closest && e.target.closest(".cfg-step");
     if (!btn) return;
-    var delta = btn.id === "max-rounds-inc" ? 1 :
-                btn.id === "max-rounds-dec" ? -1 : 0;
-    if (!delta) return;
-    var cur = readMaxRounds();
-    if (cur == null) return;
+    var step = null, delta = 0;
+    for (var i = 0; i < STEPPERS.length; i++) {
+      if (btn.id === STEPPERS[i].inc) { step = STEPPERS[i]; delta = 1; break; }
+      if (btn.id === STEPPERS[i].dec) { step = STEPPERS[i]; delta = -1; break; }
+    }
+    if (!step) return;
+    var cell = document.querySelector(step.sel);
+    if (!cell) return;
+    var cur = Number(cell.textContent);
+    if (!Number.isFinite(cur)) return;
     var next = cur + delta;
-    var dec = document.getElementById("max-rounds-dec");
-    var inc = document.getElementById("max-rounds-inc");
-    if (dec) dec.disabled = true;
-    if (inc) inc.disabled = true;
-    fetch("/dashboard/max-rounds", {
+    var decEl = document.getElementById(step.dec);
+    var incEl = document.getElementById(step.inc);
+    if (decEl) decEl.disabled = true;
+    if (incEl) incEl.disabled = true;
+    fetch(step.endpoint, {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ value: next }),
@@ -1757,9 +1811,9 @@ export const renderDashboard = ({
       .then(bodyToOk)
       .then(function (r) {
         if (r.ok) {
-          var cell = maxRoundsValueCell();
-          if (cell) cell.textContent = String(r.j.value);
-          setStatus("max rounds → " + r.j.value +
+          var c = document.querySelector(step.sel);
+          if (c) c.textContent = String(r.j.value);
+          setStatus(step.label + " → " + r.j.value +
             (r.j.persisted ? "" : " (in-memory only)"), true);
         } else {
           setStatus("error: " + (r.j.error || "failed"), false);
@@ -1767,10 +1821,10 @@ export const renderDashboard = ({
       })
       .catch(function (err) { setStatus("error: " + err.message, false); })
       .finally(function () {
-        var d = document.getElementById("max-rounds-dec");
-        var i = document.getElementById("max-rounds-inc");
+        var d = document.getElementById(step.dec);
+        var i2 = document.getElementById(step.inc);
         if (d) d.disabled = false;
-        if (i) i.disabled = false;
+        if (i2) i2.disabled = false;
       });
   });
 
@@ -1996,6 +2050,7 @@ export const __test__ = {
     renderFinding,
     renderSuccessRow,
     renderFailureRow,
+    extractStderrErrors,
     computeAxisTicks,
     fmtAxisLabel,
 }
