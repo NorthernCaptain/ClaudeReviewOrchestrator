@@ -38,6 +38,22 @@ import path from "node:path"
 // subset of the fetch Response API the hook uses.
 export const nodeHttpFetch = (url, { method, headers, body, signal } = {}) =>
     new Promise((resolve, reject) => {
+        // Settle exactly once: a connection drop after headers, an abort
+        // mid-response, and a normal end can otherwise race. Without this
+        // guard the hook could see an unhandled stream error or a promise
+        // that never settles until the outer timeout — both break its
+        // fail-open contract.
+        let settled = false
+        const fail = (err) => {
+            if (settled) return
+            settled = true
+            reject(err)
+        }
+        const succeed = (value) => {
+            if (settled) return
+            settled = true
+            resolve(value)
+        }
         const u = new URL(url)
         // URL.hostname keeps the brackets on an IPv6 literal
         // ("[::1]"); http.request would try to resolve that bracketed
@@ -54,11 +70,16 @@ export const nodeHttpFetch = (url, { method, headers, body, signal } = {}) =>
                 headers,
             },
             (res) => {
+                // The server can drop the connection or abort the stream
+                // after headers are sent; surface those as a rejection
+                // instead of hanging or throwing unhandled.
+                res.once("error", fail)
+                res.once("aborted", () => fail(new Error("response aborted")))
                 const chunks = []
                 res.on("data", (c) => chunks.push(c))
                 res.on("end", () => {
                     const text = Buffer.concat(chunks).toString("utf8")
-                    resolve({
+                    succeed({
                         status: res.statusCode,
                         headers: {
                             get: (name) =>
@@ -69,7 +90,7 @@ export const nodeHttpFetch = (url, { method, headers, body, signal } = {}) =>
                 })
             }
         )
-        req.on("error", reject)
+        req.on("error", fail)
         if (signal) {
             const onAbort = () => {
                 const err = new Error("aborted")

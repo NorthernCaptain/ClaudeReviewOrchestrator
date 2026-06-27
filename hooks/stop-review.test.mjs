@@ -1524,4 +1524,44 @@ describe("nodeHttpFetch", () => {
             nodeHttpFetch("http://127.0.0.1:1/review", { method: "POST" })
         ).rejects.toBeDefined()
     })
+
+    test("rejects (does not hang) when the server drops the connection after headers", async () => {
+        // Server sends headers, then destroys the socket mid-body. The
+        // response stream errors/aborts — the hook must settle, not wait
+        // for the outer timeout.
+        const { srv, url } = await listen((req, res) => {
+            res.writeHead(200, { "content-type": "application/json" })
+            res.write('{"partial":')
+            // Drop the underlying socket without ending the response.
+            res.socket.destroy()
+        })
+        try {
+            await expect(
+                nodeHttpFetch(url, { method: "POST" })
+            ).rejects.toBeDefined()
+        } finally {
+            srv.close()
+        }
+    })
+
+    test("abort after the response has started still settles once", async () => {
+        const controller = new AbortController()
+        const { srv, url } = await listen((req, res) => {
+            res.writeHead(200, { "content-type": "application/json" })
+            res.write('{"partial":')
+            // Trigger the abort while the response is in progress; the
+            // promise must reject exactly once and not throw unhandled.
+            controller.abort()
+        })
+        try {
+            await expect(
+                nodeHttpFetch(url, {
+                    method: "POST",
+                    signal: controller.signal,
+                })
+            ).rejects.toBeDefined()
+        } finally {
+            srv.close()
+        }
+    })
 })
