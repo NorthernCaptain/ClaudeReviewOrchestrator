@@ -374,6 +374,22 @@ describe("runAndParse", () => {
         expect(result.raw.exitCode).toBe(0)
     })
 
+    test("tags the reviewer subprocess with REVIEW_ORCH_SKIP=1", async () => {
+        const spawn = fakeSpawn((child) => {
+            child.stdout.write(wrap({ status: "GOOD_TO_GO", findings: [] }))
+            child.stdout.end()
+            child.stderr.end()
+            child.emit("close", 0, null)
+        })
+        await runAndParse({
+            repoRoot: "/r",
+            prompt: "ignored",
+            config: baseConfig(),
+            spawn,
+        })
+        expect(spawn.mock.calls[0][2].env.REVIEW_ORCH_SKIP).toBe("1")
+    })
+
     test("non-zero exit with unparseable stdout maps to ESCALATE with the exit code", async () => {
         const result = await runAndParse({
             repoRoot: "/r",

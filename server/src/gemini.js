@@ -208,6 +208,11 @@ export const runGemini = ({
             child = spawn(binary, args, {
                 cwd: repoRoot,
                 stdio: ["pipe", "pipe", "pipe"],
+                // Mark the reviewer's process tree so any Stop hook it
+                // fires short-circuits instead of recursively calling
+                // the orchestrator (hooks/stop-review.mjs honors
+                // REVIEW_ORCH_SKIP).
+                env: { ...process.env, REVIEW_ORCH_SKIP: "1" },
             })
         } catch (err) {
             reject(err)

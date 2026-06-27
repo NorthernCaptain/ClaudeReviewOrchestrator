@@ -237,7 +237,9 @@ echo "  endpoint:  $BIND:$PORT (client URL host: $CLIENT_HOST)"
 run_helper "~/.claude.json (MCP entry)" "$REPO_ROOT/install/merge-mcp.mjs" \
     "$CLAUDE_JSON" "$HEADERS_SCRIPT" "$PORT" "$CLIENT_HOST"
 
-# 5a. Stop hook entry in ~/.claude/settings.json
+# 5a. Stop hook entry in ~/.claude/settings.json. The harness timeout is
+# a fixed value (one buffer above the hook's hard wait ceiling), so it
+# never desyncs from runtime config — no need to pass the config path.
 run_helper "~/.claude/settings.json (Stop hook)" "$REPO_ROOT/install/merge-stop-hook.mjs" "$SETTINGS_JSON" "$HOOK_PATH"
 
 # 5b. PostToolUse hook entry in ~/.claude/settings.json (Write|Edit|MultiEdit,

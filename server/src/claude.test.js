@@ -403,6 +403,34 @@ describe("runAndParse", () => {
         expect(result.raw.exitCode).toBe(0)
     })
 
+    test("tags the reviewer subprocess with REVIEW_ORCH_SKIP=1", async () => {
+        // The `claude` reviewer carries the orchestrator's own Stop hook;
+        // without this the reviewer's Stop would recurse into /review.
+        const spawn = fakeSpawn((child) => {
+            child.stdout.write(
+                JSON.stringify({
+                    type: "result",
+                    subtype: "success",
+                    result: JSON.stringify({
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                    }),
+                    is_error: false,
+                })
+            )
+            child.stdout.end()
+            child.stderr.end()
+            child.emit("close", 0, null)
+        })
+        await runAndParse({
+            repoRoot: "/r",
+            prompt: "x",
+            config: baseConfig(),
+            spawn,
+        })
+        expect(spawn.mock.calls[0][2].env.REVIEW_ORCH_SKIP).toBe("1")
+    })
+
     test("verbose stderr does not trigger oversize; succeeds with a valid envelope", async () => {
         const cfg = {
             ...baseConfig(),

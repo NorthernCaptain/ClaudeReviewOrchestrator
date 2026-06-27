@@ -124,6 +124,30 @@ describe("ConfigSchema", () => {
         const r = ConfigSchema.parse({ authToken: "abc" })
         expect(r.payload.fallbackToHead).toBe(false)
     })
+    test("caps reviewer timeouts at MAX_REVIEWER_TIMEOUT_SECONDS (1680)", () => {
+        // The Stop hook waits reviewer+60s and is clamped to a fixed
+        // ceiling the installed harness timeout sits above; a reviewer
+        // timeout beyond the cap would let codex outlive the hook's
+        // wait, so the schema rejects it.
+        expect(() =>
+            ConfigSchema.parse({
+                authToken: "x",
+                limits: { codexTimeoutSeconds: 1681 },
+            })
+        ).toThrow()
+        expect(() =>
+            ConfigSchema.parse({
+                authToken: "x",
+                reviewer: { claude: { timeoutSeconds: 5000 } },
+            })
+        ).toThrow()
+        // The cap itself is accepted.
+        const r = ConfigSchema.parse({
+            authToken: "x",
+            limits: { codexTimeoutSeconds: 1680 },
+        })
+        expect(r.limits.codexTimeoutSeconds).toBe(1680)
+    })
     test("payload.verifyCleanTree defaults to false", () => {
         const r = ConfigSchema.parse({ authToken: "abc" })
         expect(r.payload.verifyCleanTree).toBe(false)

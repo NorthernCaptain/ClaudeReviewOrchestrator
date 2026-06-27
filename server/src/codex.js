@@ -4,7 +4,7 @@
  */
 
 import { spawn as nodeSpawn } from "node:child_process"
-import { readFileSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -44,24 +44,34 @@ export const toStrictSchema = (node) => {
 }
 
 // Lazily materialize the strict schema to a temp file and return its
-// path. Cached per process. Only used for codex's --output-schema; the
-// ajv validator always compiles the canonical (rich) schema.
+// path. Only used for codex's --output-schema; the ajv validator always
+// compiles the canonical (rich) schema.
+//
+// The path is remembered across calls, but we re-materialize the file
+// whenever it's missing — not just on the first call. macOS's periodic
+// tmp reaper purges files in $TMPDIR (/var/folders/.../T) that haven't
+// been touched for a few days, so a long-running server would otherwise
+// hand codex a path to a deleted file and every review would fail
+// instantly with "Failed to read output schema file" (os error 2). The
+// existence check is one stat() per review — negligible next to a codex
+// run, and it makes the server self-healing against tmp reaping.
 let cachedStrictPath = null
 const strictSchemaPathFor = (schemaPath, deps = {}) => {
     // A caller-supplied custom schema path (tests) is passed through
     // verbatim so buildCodexArgs stays trivially testable.
     if (schemaPath !== DEFAULT_SCHEMA_PATH) return schemaPath
-    if (cachedStrictPath) return cachedStrictPath
     const read = deps.readFileSync ?? readFileSync
     const write = deps.writeFileSync ?? writeFileSync
-    const rich = JSON.parse(read(DEFAULT_SCHEMA_PATH, "utf8"))
-    const strict = toStrictSchema(rich)
-    const outPath = path.join(
-        tmpdir(),
-        "review-orchestrator-codex-strict.schema.json"
-    )
-    write(outPath, JSON.stringify(strict, null, 2) + "\n", "utf8")
-    cachedStrictPath = outPath
+    const exists = deps.existsSync ?? existsSync
+    const outPath =
+        cachedStrictPath ??
+        path.join(tmpdir(), "review-orchestrator-codex-strict.schema.json")
+    if (!cachedStrictPath || !exists(outPath)) {
+        const rich = JSON.parse(read(DEFAULT_SCHEMA_PATH, "utf8"))
+        const strict = toStrictSchema(rich)
+        write(outPath, JSON.stringify(strict, null, 2) + "\n", "utf8")
+        cachedStrictPath = outPath
+    }
     return outPath
 }
 
@@ -247,6 +257,13 @@ export const runCodex = ({
         try {
             child = spawn(config.codex.binary, args, {
                 stdio: ["pipe", "pipe", "pipe"],
+                // Mark the reviewer's process tree so any Stop hook it
+                // fires short-circuits instead of recursively calling
+                // the orchestrator (hooks/stop-review.mjs honors
+                // REVIEW_ORCH_SKIP). Matters most for the `claude`
+                // reviewer, which carries the Stop hook itself; harmless
+                // and consistent for codex/gemini.
+                env: { ...process.env, REVIEW_ORCH_SKIP: "1" },
             })
         } catch (err) {
             reject(err)

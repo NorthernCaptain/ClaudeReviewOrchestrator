@@ -25,6 +25,17 @@ const DEFAULT_IGNORE_PATHS = [
 
 const Severity = z.enum(["blocker", "major", "minor", "nit"])
 
+// Hard cap on any reviewer-run timeout (codex / claude / gemini), in
+// seconds. The Stop hook waits reviewer + 60s for the server and is
+// itself clamped to a fixed ceiling (hooks/stop-review.mjs
+// MAX_FETCH_TIMEOUT_MS = 1_740_000ms = 1740s), above which the
+// installed Claude Code harness timeout sits (1800s). Capping the
+// reviewer here at 1740 − 60 = 1680s keeps codex from outliving the
+// hook's wait, so the whole chain (reviewer < hook-wait < harness)
+// holds for ANY config without a reinstall. Bumping this REQUIRES
+// bumping MAX_FETCH_TIMEOUT_MS and the harness timeout in lockstep.
+export const MAX_REVIEWER_TIMEOUT_SECONDS = 1680
+
 const ConfigSchema = z
     .object({
         port: z.number().int().min(1).max(65535).default(7777),
@@ -93,7 +104,12 @@ const ConfigSchema = z
                                 "WebSearch",
                                 "Task",
                             ]),
-                        timeoutSeconds: z.number().int().min(1).default(240),
+                        timeoutSeconds: z
+                            .number()
+                            .int()
+                            .min(1)
+                            .max(MAX_REVIEWER_TIMEOUT_SECONDS)
+                            .default(240),
                         extraArgs: z.array(z.string()).default([]),
                     })
                     .default({}),
@@ -118,7 +134,12 @@ const ConfigSchema = z
                         approvalMode: z
                             .enum(["default", "auto_edit", "yolo", "plan"])
                             .default("plan"),
-                        timeoutSeconds: z.number().int().min(1).default(240),
+                        timeoutSeconds: z
+                            .number()
+                            .int()
+                            .min(1)
+                            .max(MAX_REVIEWER_TIMEOUT_SECONDS)
+                            .default(240),
                         extraArgs: z.array(z.string()).default([]),
                     })
                     .default({}),
@@ -129,7 +150,12 @@ const ConfigSchema = z
                 maxCodexRounds: z.number().int().min(1).default(5),
                 maxBlocks: z.number().int().min(1).default(6),
                 idleResetMinutes: z.number().int().min(1).default(10),
-                codexTimeoutSeconds: z.number().int().min(1).default(240),
+                codexTimeoutSeconds: z
+                    .number()
+                    .int()
+                    .min(1)
+                    .max(MAX_REVIEWER_TIMEOUT_SECONDS)
+                    .default(240),
                 maxCodexOutputBytes: z
                     .number()
                     .int()

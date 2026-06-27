@@ -611,6 +611,41 @@ describe("toStrictSchema — OpenAI strict compliance", () => {
         expect("allOf" in written).toBe(false)
         __defaults__.resetStrictSchemaCache()
     })
+
+    test("strictSchemaPathFor re-materializes when the tmp file was reaped", () => {
+        // Regression: macOS purges untouched $TMPDIR files after a few
+        // days. A long-running server must rewrite the schema instead
+        // of handing codex a path to a now-deleted file.
+        __defaults__.resetStrictSchemaCache()
+        const writes = []
+        let present = false // simulate the OS having reaped the file
+        const deps = {
+            readFileSync: () =>
+                readFileSync(__defaults__.DEFAULT_SCHEMA_PATH, "utf8"),
+            writeFileSync: (p, data) => {
+                writes.push({ p, data })
+                present = true
+            },
+            existsSync: () => present,
+        }
+        const p1 = __defaults__.strictSchemaPathFor(
+            __defaults__.DEFAULT_SCHEMA_PATH,
+            deps
+        )
+        expect(writes).toHaveLength(1) // first call writes
+        // Second call while the file still exists: no rewrite.
+        __defaults__.strictSchemaPathFor(__defaults__.DEFAULT_SCHEMA_PATH, deps)
+        expect(writes).toHaveLength(1)
+        // The reaper deletes it; next call must rewrite to the same path.
+        present = false
+        const p3 = __defaults__.strictSchemaPathFor(
+            __defaults__.DEFAULT_SCHEMA_PATH,
+            deps
+        )
+        expect(writes).toHaveLength(2)
+        expect(p3).toBe(p1)
+        __defaults__.resetStrictSchemaCache()
+    })
 })
 
 describe("runCodex (mocked spawn)", () => {
@@ -636,6 +671,9 @@ describe("runCodex (mocked spawn)", () => {
         expect(out.rawStdout).toMatch(/GOOD_TO_GO/)
         expect(out.timedOut).toBe(false)
         expect(out.argv[0]).toBe("codex")
+        // The reviewer subprocess is tagged so its own Stop hook (if
+        // any) skips review instead of recursing into the orchestrator.
+        expect(spawn.mock.calls[0][2].env.REVIEW_ORCH_SKIP).toBe("1")
     })
 
     test("returns timedOut=true when child exceeds timeout", async () => {

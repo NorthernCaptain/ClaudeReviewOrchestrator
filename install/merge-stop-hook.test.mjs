@@ -6,7 +6,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { mergeStopHook } from "./merge-stop-hook.mjs"
+import { mergeStopHook, HARNESS_TIMEOUT_SECONDS } from "./merge-stop-hook.mjs"
 
 const makeTmp = () => mkdtempSync(path.join(tmpdir(), "merge-stop-hook-"))
 
@@ -65,7 +65,7 @@ describe("mergeStopHook", () => {
                 {
                     type: "command",
                     command: HOOK,
-                    timeout: 720000,
+                    timeout: HARNESS_TIMEOUT_SECONDS,
                 },
             ],
         }
@@ -101,7 +101,7 @@ describe("mergeStopHook", () => {
         const r = mergeStopHook({ settingsPath: p, hookPath: HOOK })
         expect(r.action).toBe("updated")
         const s = JSON.parse(readFileSync(p, "utf8"))
-        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(720000)
+        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
     })
 
     test("preserves unrelated top-level keys", () => {
@@ -164,7 +164,7 @@ describe("mergeStopHook", () => {
         expect(s.hooks.Stop[0].hooks).toHaveLength(2)
         expect(s.hooks.Stop[0].hooks[0]).toEqual(sibling)
         expect(s.hooks.Stop[0].hooks[1].command).toBe(HOOK)
-        expect(s.hooks.Stop[0].hooks[1].timeout).toBe(720000)
+        expect(s.hooks.Stop[0].hooks[1].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
     })
 
     test("multiple canonical blocks: keeps our hook in ONE block, strips dupes from the rest", () => {
@@ -211,7 +211,7 @@ describe("mergeStopHook", () => {
             (h) => h.command === HOOK
         )
         expect(occurrences).toHaveLength(1)
-        expect(occurrences[0].timeout).toBe(720000)
+        expect(occurrences[0].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
         // The user's sibling block still has only the sibling.
         const userBlock = s.hooks.Stop.find((b) =>
             b.hooks.some((h) => h.command === userSibling.command)
@@ -252,7 +252,7 @@ describe("mergeStopHook", () => {
         expect(s.hooks.Stop).toHaveLength(1)
         const ours = s.hooks.Stop[0].hooks.filter((h) => h.command === HOOK)
         expect(ours).toHaveLength(1)
-        expect(ours[0].timeout).toBe(720000)
+        expect(ours[0].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
         expect(s.hooks.Stop[0].hooks).toContainEqual(sibling)
     })
 
@@ -283,7 +283,7 @@ describe("mergeStopHook", () => {
         const s = JSON.parse(readFileSync(p, "utf8"))
         expect(s.hooks.Stop).toHaveLength(1)
         expect(s.hooks.Stop[0].hooks).toHaveLength(1)
-        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(720000)
+        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
     })
 
     test("writes a backup only when bytes change", () => {
@@ -302,5 +302,17 @@ describe("mergeStopHook", () => {
         })
         expect(r2.action).toBe("unchanged")
         expect(() => readFileSync(`${p}.bak.ts2`)).toThrow()
+    })
+
+    test("installs a fixed harness timeout, independent of any config", () => {
+        // The harness timeout is a static value (HARNESS_TIMEOUT_SECONDS)
+        // set above the hook's hard wait ceiling — NOT derived from the
+        // install-time config — so it can't desync when the operator
+        // later raises the reviewer timeout without reinstalling.
+        const p = path.join(dir, "settings.json")
+        mergeStopHook({ settingsPath: p, hookPath: HOOK })
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
+        expect(HARNESS_TIMEOUT_SECONDS).toBe(1800)
     })
 })

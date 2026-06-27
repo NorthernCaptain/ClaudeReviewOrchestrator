@@ -15,7 +15,7 @@
 //         {
 //           "matcher": "",
 //           "hooks": [
-//             { "type": "command", "command": "<hookPath>", "timeout": 300000 }
+//             { "type": "command", "command": "<hookPath>", "timeout": 1320 }
 //           ]
 //         }
 //       ]
@@ -24,8 +24,26 @@
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import path from "node:path"
+// MAX_FETCH_TIMEOUT_MS is the hard ceiling the Stop hook clamps its own
+// fetch wait to (regardless of config). We bake the harness timeout one
+// buffer above THAT — a fixed value, NOT derived from the install-time
+// config. resolveFetchTimeoutMs clamps to this ceiling, so this static
+// harness timeout always sits above the hook's actual wait for any
+// config, even after the operator raises the reviewer timeout without
+// rerunning the installer. Single shared constant, no drift.
+import { MAX_FETCH_TIMEOUT_MS } from "../hooks/stop-review.mjs"
 
 const isObj = (v) => v && typeof v === "object" && !Array.isArray(v)
+
+// Seconds the installed Claude Code hook `timeout` keeps ABOVE the
+// hook's hard wait ceiling. Claude Code kills the hook process at this
+// timeout no matter what; keeping it above the (clamped) fetch ceiling
+// guarantees the hook aborts cleanly first and a long review is never
+// cut off mid-flight. Static and config-independent by construction:
+//   reviewer (≤cap) +60 → hook wait (≤ceiling) +60 → harness.
+const HARNESS_BUFFER_SECONDS = 60
+export const HARNESS_TIMEOUT_SECONDS =
+    MAX_FETCH_TIMEOUT_MS / 1000 + HARNESS_BUFFER_SECONDS // 1800 (30 min)
 
 const writeAtomic = (filePath, content, mode = 0o644) => {
     const tmp = `${filePath}.tmp`
@@ -45,12 +63,16 @@ const backupIfDifferent = (filePath, newContent, nowStr) => {
 export const mergeStopHook = ({
     settingsPath,
     hookPath,
-    // 12 minutes. Codex high-effort reviews on a large repo can run
-    // 2–5 minutes; multiple rounds plus the server's own wait push
-    // total Stop-hook time toward 10+. Claude Code kills the hook
-    // process at this timeout regardless of what the server is doing,
-    // so this needs to be larger than any realistic review.
-    timeout = 720000,
+    // The Claude Code hook `timeout`, in SECONDS (that is the unit
+    // Claude Code reads — its own default is 600s). A fixed value, set
+    // one buffer above the hook's hard wait ceiling, so it never needs
+    // to track per-install config: the hook clamps its own wait to that
+    // ceiling, so this stays above the actual wait for any config.
+    //
+    // NOTE: an earlier version hard-coded 720000 — written as if this
+    // field were milliseconds (720000ms = 12min), but Claude Code reads
+    // SECONDS, so it silently became ~200 hours and never backstopped.
+    timeout = HARNESS_TIMEOUT_SECONDS,
     now = () => new Date().toISOString().replace(/[:.]/g, "-"),
     existsFn = existsSync,
     readFile = readFileSync,

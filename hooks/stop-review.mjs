@@ -102,6 +102,18 @@ const DEFAULT_TIMEOUT_MS = 280 * 1000
 // hook's fetch timeout. Gives the server enough time to kill the
 // subprocess and write the ESCALATE response before the hook gives up.
 const AUTO_BUFFER_MS = 60 * 1000
+// Hard ceiling on how long the hook will EVER wait for the server,
+// regardless of config. This is the linchpin that lets the installer
+// bake a STATIC Claude Code harness timeout (set one more buffer above
+// this — see install/merge-stop-hook.mjs) without it ever desyncing
+// from runtime config: raising the reviewer timeout in config can never
+// push the hook's wait past the harness, so no reinstall is needed and
+// a long review is never silently cut off. The server caps the reviewer
+// timeout below this (config.js MAX_REVIEWER_TIMEOUT_SECONDS), so codex
+// cannot outlive the hook's wait either. Reviews needing longer than
+// this are not supported.
+//   reviewer (≤1680s) +60 → hook wait (≤1740s) +60 → harness (1800s)
+export const MAX_FETCH_TIMEOUT_MS = 1_740_000 // 29 min
 
 // Map a server `config.bind` value to the host portion of a CLIENT URL.
 // Wildcard binds (0.0.0.0, ::) are translated to their loopback
@@ -128,18 +140,27 @@ export const clientHostFromBind = (bind) => {
 //      server needs to kill a runaway subprocess and serialize the
 //      ESCALATE response after the kill.
 //   3. DEFAULT_TIMEOUT_MS — last-resort fallback for malformed configs.
+// The result is hard-clamped to MAX_FETCH_TIMEOUT_MS so the hook never
+// waits past the installed harness ceiling, even if a hand-edited
+// config sets a reviewer/hook timeout above the server-enforced cap.
 export const resolveFetchTimeoutMs = (parsed) => {
     const explicit = parsed?.hook?.fetchTimeoutSeconds
-    if (Number.isInteger(explicit) && explicit > 0) return explicit * 1000
-
-    const claudeSec = parsed?.reviewer?.claude?.timeoutSeconds
-    const geminiSec = parsed?.reviewer?.gemini?.timeoutSeconds
-    const codexSec = parsed?.limits?.codexTimeoutSeconds
-    const candidates = [claudeSec, geminiSec, codexSec].filter(
-        (v) => Number.isInteger(v) && v > 0
-    )
-    if (candidates.length === 0) return DEFAULT_TIMEOUT_MS
-    return Math.max(...candidates) * 1000 + AUTO_BUFFER_MS
+    let ms
+    if (Number.isInteger(explicit) && explicit > 0) {
+        ms = explicit * 1000
+    } else {
+        const claudeSec = parsed?.reviewer?.claude?.timeoutSeconds
+        const geminiSec = parsed?.reviewer?.gemini?.timeoutSeconds
+        const codexSec = parsed?.limits?.codexTimeoutSeconds
+        const candidates = [claudeSec, geminiSec, codexSec].filter(
+            (v) => Number.isInteger(v) && v > 0
+        )
+        ms =
+            candidates.length === 0
+                ? DEFAULT_TIMEOUT_MS
+                : Math.max(...candidates) * 1000 + AUTO_BUFFER_MS
+    }
+    return Math.min(MAX_FETCH_TIMEOUT_MS, ms)
 }
 
 // Read the local server's connection info from the config file. Both the

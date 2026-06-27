@@ -21,6 +21,7 @@ import {
     formatBlockingFindings,
     readToken,
     resolveFetchTimeoutMs,
+    MAX_FETCH_TIMEOUT_MS,
     main,
     appendLogLine,
     nodeHttpFetch,
@@ -201,6 +202,26 @@ describe("resolveFetchTimeoutMs", () => {
     test("falls back to the 280s default when nothing is configured", () => {
         expect(resolveFetchTimeoutMs(null)).toBe(280_000)
         expect(resolveFetchTimeoutMs({})).toBe(280_000)
+    })
+
+    test("hard-clamps to MAX_FETCH_TIMEOUT_MS for over-cap config", () => {
+        // A hand-edited reviewer timeout above the server cap (or an
+        // over-large explicit hook timeout) must never push the hook's
+        // wait past the installed harness ceiling.
+        expect(MAX_FETCH_TIMEOUT_MS).toBe(1_740_000)
+        expect(
+            resolveFetchTimeoutMs({ limits: { codexTimeoutSeconds: 99999 } })
+        ).toBe(MAX_FETCH_TIMEOUT_MS)
+        expect(
+            resolveFetchTimeoutMs({ hook: { fetchTimeoutSeconds: 99999 } })
+        ).toBe(MAX_FETCH_TIMEOUT_MS)
+    })
+
+    test("a value at the server cap (1680s) lands just under the ceiling", () => {
+        // 1680 reviewer + 60s buffer = 1740s = the ceiling exactly.
+        expect(
+            resolveFetchTimeoutMs({ limits: { codexTimeoutSeconds: 1680 } })
+        ).toBe(MAX_FETCH_TIMEOUT_MS)
     })
 })
 
