@@ -14,6 +14,13 @@
 #   - the Stop + PostToolUse hook entries in ~/.claude/settings.json
 #   - the review-orchestrator block in ~/.claude/CLAUDE.md
 #
+# Pass --codex to ALSO wire codex CLI as a main developer (additive —
+# the Claude wiring above still runs):
+#   - ~/.codex/hooks/stop-review.mjs + notify-change.mjs (reused as-is)
+#   - the [mcp_servers.review] table in ~/.codex/config.toml
+#   - the Stop + PostToolUse entries in ~/.codex/hooks.json
+#   - the code-review-loop skill in ~/.codex/skills/code-review-loop/
+#
 # Pass --launch to also drop the launchd plist into
 # ~/Library/LaunchAgents and bootstrap it as a background agent.
 #
@@ -27,19 +34,24 @@ REPO_ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 
 LAUNCH=0
 DRY_RUN=0
+CODEX=0
 HOME_DIR="${HOME:-}"
 
 usage() {
     cat <<'EOF'
-Usage: ./install.sh [--launch] [--dry-run] [--home <dir>] [--help]
+Usage: ./install.sh [--codex] [--launch] [--dry-run] [--home <dir>] [--help]
 
+  --codex      Also wire codex CLI as a main developer (config.toml MCP
+               entry, hooks.json Stop + PostToolUse, and the
+               code-review-loop skill in ~/.codex). Additive — the Claude
+               wiring still runs.
   --launch     Also install the launchd plist in ~/Library/LaunchAgents
                and bootstrap the daemon. Without this, the daemon must
                be started manually (npm start) for the MCP entry and
                Stop hook to do anything.
   --dry-run    Print what would happen without writing.
-  --home DIR   Install into DIR/.config and DIR/.claude instead of $HOME.
-               Primarily for the test harness.
+  --home DIR   Install into DIR/.config, DIR/.claude, DIR/.codex instead
+               of $HOME. Primarily for the test harness.
   --help, -h   Show this help.
 
 Idempotent: rerun any time. Existing authToken is preserved.
@@ -48,6 +60,7 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --codex) CODEX=1; shift ;;
         --launch) LAUNCH=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --home)
@@ -75,6 +88,13 @@ NOTIFY_HOOK_PATH="$HOOKS_DIR/notify-change.mjs"
 CLAUDE_JSON="$HOME_DIR/.claude.json"
 SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
+CODEX_DIR="$HOME_DIR/.codex"
+CODEX_HOOKS_DIR="$CODEX_DIR/hooks"
+CODEX_STOP_HOOK="$CODEX_HOOKS_DIR/stop-review.mjs"
+CODEX_NOTIFY_HOOK="$CODEX_HOOKS_DIR/notify-change.mjs"
+CODEX_CONFIG_TOML="$CODEX_DIR/config.toml"
+CODEX_HOOKS_JSON="$CODEX_DIR/hooks.json"
+CODEX_SKILL="$CODEX_DIR/skills/code-review-loop/SKILL.md"
 LAUNCHAGENTS_DIR="$HOME_DIR/Library/LaunchAgents"
 PLIST_NAME="com.leo.review-orchestrator.plist"
 PLIST_DST="$LAUNCHAGENTS_DIR/$PLIST_NAME"
@@ -194,6 +214,7 @@ run_helper() {
 echo "review-orchestrator install"
 echo "  REPO_ROOT: $REPO_ROOT"
 echo "  HOME:      $HOME_DIR"
+echo "  --codex:   $([ "$CODEX" -eq 1 ] && echo yes || echo no)"
 echo "  --launch:  $([ "$LAUNCH" -eq 1 ] && echo yes || echo no)"
 echo "  --dry-run: $([ "$DRY_RUN" -eq 1 ] && echo yes || echo no)"
 echo
@@ -248,6 +269,21 @@ run_helper "~/.claude/settings.json (PostToolUse hook)" "$REPO_ROOT/install/merg
 
 # 6. claude-md-snippet.md into ~/.claude/CLAUDE.md
 run_helper "~/.claude/CLAUDE.md (snippet)" "$REPO_ROOT/install/merge-claude-md.mjs" "$CLAUDE_MD" "$REPO_ROOT/claude-md-snippet.md"
+
+# 6c. (optional) codex CLI as a main developer. The hook SCRIPTS are the
+# same ones Claude uses (identical stdin + decision:block contract); only
+# the registration shape differs (config.toml MCP + hooks.json + skill).
+if [ "$CODEX" -eq 1 ]; then
+    install_file_idempotent "$REPO_ROOT/hooks/stop-review.mjs" "$CODEX_STOP_HOOK" 0700 "codex Stop hook"
+    install_file_idempotent "$REPO_ROOT/hooks/notify-change.mjs" "$CODEX_NOTIFY_HOOK" 0700 "codex PostToolUse hook"
+    install_file_idempotent "$REPO_ROOT/codex/skill/SKILL.md" "$CODEX_SKILL" 0644 "codex skill"
+    run_helper "~/.codex/config.toml (MCP entry)" "$REPO_ROOT/install/merge-codex-mcp.mjs" \
+        "$CODEX_CONFIG_TOML" "$CONFIG_PATH" "$PORT" "$CLIENT_HOST"
+    run_helper "~/.codex/hooks.json (Stop + PostToolUse)" "$REPO_ROOT/install/merge-codex-hooks.mjs" \
+        "$CODEX_HOOKS_JSON" "$CODEX_STOP_HOOK" "$CODEX_NOTIFY_HOOK"
+else
+    note "  skipped:   codex wiring (--codex not passed)"
+fi
 
 # 7. (optional) launchd
 if [ "$LAUNCH" -eq 1 ]; then

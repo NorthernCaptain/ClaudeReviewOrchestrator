@@ -54,11 +54,17 @@ See "Phase 0 — Repo scaffolding" in [README.md](README.md). Briefly:
 server/src/                    // implementation modules
   codex-output.schema.json     // JSON Schema enforced via codex --output-schema
 hooks/stop-review.mjs          // Node 24 Stop hook (not bash — no jq dep)
+hooks/notify-change.mjs        // Node 24 PostToolUse hook (shared Claude + codex)
+codex/skill/SKILL.md           // code-review-loop skill — installed into ~/.codex/skills
 launchd/                       // launchd plist for the server
 claude-mcp.json                // MCP entry — installed into ~/.claude.json
 claude-md-snippet.md           // guidance — appended to ~/.claude/CLAUDE.md
-install.sh                     // generates token, launchd, hook, Claude config
+install.sh                     // token, launchd, hook, Claude (+ --codex) config
 ```
+
+The codex integration (`install.sh --codex`) reuses the same hook scripts
+and wires `~/.codex/config.toml` (MCP), `~/.codex/hooks.json`, and the
+skill via `install/merge-codex-*.mjs` / `remove-codex-*.mjs`.
 
 `reviews/` is generated at runtime — do not commit it. `node_modules/`,
 `coverage/`, and persisted state under `~/.cache/review-orchestrator/` are

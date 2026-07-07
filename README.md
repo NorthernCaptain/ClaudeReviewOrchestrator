@@ -673,6 +673,38 @@ required.
 Pass `--launch` to also drop the launchd plist into
 `~/Library/LaunchAgents` and bootstrap the daemon.
 
+### Using codex as a main developer (`--codex`)
+
+The same review loop can drive the **codex CLI** as the coding agent, not
+just Claude Code. Codex's extension model maps onto the same primitives:
+lifecycle hooks (`Stop`, `PostToolUse`) with the identical stdin payload
+and `{ "decision": "block", "reason": … }` output, streamable-HTTP MCP
+servers, and skills. So the **same** hook scripts are reused — only the
+registration shape differs.
+
+`./install.sh --codex` is additive (the Claude wiring still runs) and also:
+
+1. Copies `~/.codex/hooks/stop-review.mjs` + `notify-change.mjs` (mode `0700`).
+2. Merges a marker-delimited `[mcp_servers.review]` table (with the
+   `X-Review-Token` header) into `~/.codex/config.toml`.
+3. Merges `Stop` (timeout 1800s) + `PostToolUse` (matcher
+   `^(apply_patch|Edit|Write|exec_command|write_stdin|Bash)$`, timeout 10s)
+   entries into `~/.codex/hooks.json` — codex's top-level event shape, not
+   Claude's `{ hooks: { … } }` wrapper. codex's command tools (`exec_command`
+   / `write_stdin`) are included so command-side edits (formatters, codegen)
+   also mark the context dirty and can't slip past the `NO_CHANGES` fast path.
+4. Installs the `code-review-loop` skill at
+   `~/.codex/skills/code-review-loop/SKILL.md` (auto-matched by description;
+   also listed under `/skills`).
+
+`./uninstall.sh --codex` reverses exactly these. Every step is idempotent
+and writes a `.bak` only when bytes change, same as the Claude path.
+
+Note: running codex as the developer **and** as the default reviewer is
+fine — the reviewer subprocess is spawned with `REVIEW_ORCH_SKIP=1`, so the
+reviewer's own `Stop` hook short-circuits instead of recursing into
+`/review`.
+
 Tools the MCP server advertises (v1.0):
 
 - `request_review` — input
@@ -1313,14 +1345,21 @@ limits are in v1 — not deferred.
       logger.js
     test/                      // jest, *.test.js next to each src file
   hooks/
-    stop-review.mjs            // Node Stop hook
+    stop-review.mjs            // Node Stop hook (shared by Claude + codex)
+    notify-change.mjs          // Node PostToolUse hook (shared)
+  codex/
+    skill/SKILL.md             // code-review-loop skill → ~/.codex/skills/...
   launchd/
     com.leo.review-orchestrator.plist
   claude-mcp.json              // MCP entry to merge into ~/.claude.json
   claude-md-snippet.md         // guidance text appended to ~/.claude/CLAUDE.md
-  install.sh                   // launchd, hook copy, Claude config edits, token gen
+  install.sh                   // launchd, hook copy, Claude (+ --codex) config, token gen
   README.md                    // this file
   ```
+
+  `install/` also holds the codex wiring helpers: `merge-codex-mcp.mjs`
+  (config.toml MCP table), `merge-codex-hooks.mjs` (hooks.json), and their
+  `remove-codex-*` counterparts.
 
 ### Phase 1 — Minimum viable server with auth & size limits
 

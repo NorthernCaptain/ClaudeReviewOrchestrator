@@ -14,16 +14,20 @@ REPO_ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 
 LAUNCH=0
 DRY_RUN=0
+CODEX=0
 HOME_DIR="${HOME:-}"
 KEEP_CONFIG=0
 
 usage() {
     cat <<'EOF'
-Usage: ./uninstall.sh [--launch] [--dry-run] [--home <dir>] [--keep-config] [--help]
+Usage: ./uninstall.sh [--codex] [--launch] [--dry-run] [--home <dir>] [--keep-config] [--help]
 
+  --codex         Also remove the codex wiring (config.toml MCP table,
+                  hooks.json entries, the code-review-loop skill, and the
+                  ~/.codex/hooks scripts).
   --launch        Also remove the launchd plist + bootout the agent.
   --dry-run       Print what would happen without writing.
-  --home DIR      Operate on DIR/.config and DIR/.claude instead of $HOME.
+  --home DIR      Operate on DIR/.config, DIR/.claude, DIR/.codex instead of $HOME.
   --keep-config   Keep ~/.config/review-orchestrator/ intact (preserves
                   authToken + reviewsDir state in case of reinstall).
   --help, -h      Show this help.
@@ -32,6 +36,7 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --codex) CODEX=1; shift ;;
         --launch) LAUNCH=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --home)
@@ -59,6 +64,13 @@ NOTIFY_HOOK_PATH="$CLAUDE_DIR/hooks/notify-change.mjs"
 CLAUDE_JSON="$HOME_DIR/.claude.json"
 SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
+CODEX_DIR="$HOME_DIR/.codex"
+CODEX_STOP_HOOK="$CODEX_DIR/hooks/stop-review.mjs"
+CODEX_NOTIFY_HOOK="$CODEX_DIR/hooks/notify-change.mjs"
+CODEX_CONFIG_TOML="$CODEX_DIR/config.toml"
+CODEX_HOOKS_JSON="$CODEX_DIR/hooks.json"
+CODEX_SKILL_DIR="$CODEX_DIR/skills/code-review-loop"
+CODEX_SKILL="$CODEX_SKILL_DIR/SKILL.md"
 PLIST_NAME="com.leo.review-orchestrator.plist"
 PLIST_DST="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME"
 
@@ -102,6 +114,7 @@ run_helper() {
 echo "review-orchestrator uninstall"
 echo "  REPO_ROOT:   $REPO_ROOT"
 echo "  HOME:        $HOME_DIR"
+echo "  --codex:     $([ "$CODEX" -eq 1 ] && echo yes || echo no)"
 echo "  --launch:    $([ "$LAUNCH" -eq 1 ] && echo yes || echo no)"
 echo "  --dry-run:   $([ "$DRY_RUN" -eq 1 ] && echo yes || echo no)"
 echo "  keep config: $([ "$KEEP_CONFIG" -eq 1 ] && echo yes || echo no)"
@@ -127,6 +140,22 @@ run_helper "~/.claude.json (MCP entry)" "$REPO_ROOT/install/remove-mcp.mjs" "$CL
 
 # 4. CLAUDE.md snippet
 run_helper "~/.claude/CLAUDE.md (snippet)" "$REPO_ROOT/install/remove-claude-md.mjs" "$CLAUDE_MD"
+
+# 4c. (optional) codex wiring.
+if [ "$CODEX" -eq 1 ]; then
+    run_helper "~/.codex/config.toml (MCP entry)" "$REPO_ROOT/install/remove-codex-mcp.mjs" "$CODEX_CONFIG_TOML"
+    run_helper "~/.codex/hooks.json (Stop + PostToolUse)" "$REPO_ROOT/install/remove-codex-hooks.mjs" \
+        "$CODEX_HOOKS_JSON" "$CODEX_STOP_HOOK" "$CODEX_NOTIFY_HOOK"
+    remove_file_idempotent "$CODEX_STOP_HOOK" "codex Stop hook"
+    remove_file_idempotent "$CODEX_NOTIFY_HOOK" "codex PostToolUse hook"
+    remove_file_idempotent "$CODEX_SKILL" "codex skill"
+    # Drop the skill dir if our SKILL.md was its only content.
+    if [ -d "$CODEX_SKILL_DIR" ] && [ -z "$(ls -A "$CODEX_SKILL_DIR" 2>/dev/null)" ]; then
+        if maybe "rmdir $CODEX_SKILL_DIR"; then
+            rmdir "$CODEX_SKILL_DIR" 2>/dev/null && note "  removed:   codex skill dir ($CODEX_SKILL_DIR)" || true
+        fi
+    fi
+fi
 
 # 5. Hook files
 remove_file_idempotent "$HOOK_PATH" "Stop hook"

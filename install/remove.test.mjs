@@ -10,6 +10,10 @@ import { removeMcp } from "./remove-mcp.mjs"
 import { removeStopHook } from "./remove-stop-hook.mjs"
 import { removePostToolUseHook } from "./remove-post-tool-use-hook.mjs"
 import { removeClaudeMd } from "./remove-claude-md.mjs"
+import { removeCodexMcp } from "./remove-codex-mcp.mjs"
+import { removeCodexHooks } from "./remove-codex-hooks.mjs"
+import { mergeCodexMcp } from "./merge-codex-mcp.mjs"
+import { mergeCodexHooks } from "./merge-codex-hooks.mjs"
 
 const makeTmp = () => mkdtempSync(path.join(tmpdir(), "remove-"))
 
@@ -332,6 +336,114 @@ describe("removePostToolUseHook", () => {
         const s = JSON.parse(readFileSync(p, "utf8"))
         expect(s.hooks.PostToolUse).toHaveLength(1)
         expect(s.hooks.PostToolUse[0].hooks).toEqual([sibling])
+    })
+})
+
+describe("removeCodexMcp", () => {
+    let dir
+    beforeEach(() => {
+        dir = makeTmp()
+    })
+    afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+    test("absent → absent", () => {
+        expect(
+            removeCodexMcp({
+                configTomlPath: path.join(dir, "absent.toml"),
+            }).action
+        ).toBe("absent")
+    })
+
+    test("unchanged when our managed block isn't present", () => {
+        const p = path.join(dir, "config.toml")
+        writeFileSync(p, 'model = "gpt-5.5"\n')
+        expect(removeCodexMcp({ configTomlPath: p }).action).toBe("unchanged")
+    })
+
+    test("removes our block, preserves surrounding TOML, idempotent rerun", () => {
+        const p = path.join(dir, "config.toml")
+        writeFileSync(
+            p,
+            'model = "gpt-5.5"\n\n[mcp_servers.other]\nurl = "x"\n'
+        )
+        mergeCodexMcp({ configTomlPath: p, token: "tok" })
+        const r = removeCodexMcp({ configTomlPath: p })
+        expect(r.action).toBe("removed")
+        const s = readFileSync(p, "utf8")
+        expect(s).toContain('model = "gpt-5.5"')
+        expect(s).toContain("[mcp_servers.other]")
+        expect(s).not.toContain("[mcp_servers.review]")
+        expect(s).not.toContain("review-orchestrator:")
+        expect(removeCodexMcp({ configTomlPath: p }).action).toBe("unchanged")
+    })
+})
+
+describe("removeCodexHooks", () => {
+    const STOP = "/h/stop-review.mjs"
+    const NOTIFY = "/h/notify-change.mjs"
+    let dir
+    beforeEach(() => {
+        dir = makeTmp()
+    })
+    afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+    const args = (over = {}) => ({
+        hooksJsonPath: path.join(dir, "hooks.json"),
+        stopHookPath: STOP,
+        notifyHookPath: NOTIFY,
+        ...over,
+    })
+
+    test("absent → absent", () => {
+        expect(
+            removeCodexHooks(args({ hooksJsonPath: path.join(dir, "x.json") }))
+                .action
+        ).toBe("absent")
+    })
+
+    test("unchanged when our entries aren't present", () => {
+        const p = path.join(dir, "hooks.json")
+        writeFileSync(p, JSON.stringify({ SessionStart: [] }))
+        expect(removeCodexHooks(args()).action).toBe("unchanged")
+    })
+
+    test("removes both events, prunes empties, preserves siblings", () => {
+        const p = path.join(dir, "hooks.json")
+        const sibling = { type: "command", command: "/x/s.sh" }
+        writeFileSync(
+            p,
+            JSON.stringify({
+                Stop: [
+                    { hooks: [sibling, { type: "command", command: STOP }] },
+                ],
+                PostToolUse: [
+                    {
+                        matcher: "apply_patch|Edit|Write",
+                        hooks: [{ type: "command", command: NOTIFY }],
+                    },
+                ],
+                SessionStart: [{ hooks: [{ type: "command", command: "/k" }] }],
+            })
+        )
+        const r = removeCodexHooks(args())
+        expect(r.action).toBe("removed")
+        const s = JSON.parse(readFileSync(p, "utf8"))
+        // Stop keeps the sibling; PostToolUse pruned entirely; SessionStart intact.
+        expect(s.Stop[0].hooks).toEqual([sibling])
+        expect("PostToolUse" in s).toBe(false)
+        expect(s.SessionStart[0].hooks[0].command).toBe("/k")
+    })
+
+    test("idempotent rerun after a real merge", () => {
+        mergeCodexHooks(args())
+        removeCodexHooks(args())
+        expect(removeCodexHooks(args()).action).toBe("unchanged")
+    })
+
+    test("rejects invalid JSON", () => {
+        const p = path.join(dir, "hooks.json")
+        writeFileSync(p, "{ not json")
+        expect(() => removeCodexHooks(args())).toThrow(/failed to parse/)
     })
 })
 
