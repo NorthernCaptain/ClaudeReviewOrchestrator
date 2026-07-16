@@ -1223,7 +1223,7 @@ example below shows every supported key and the current default):
 
   "codex": {
     "binary": "codex",
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-sol",
     "reasoningEffort": "high",
     "ignoreProjectRules": true,
     "extraArgs": []
@@ -1233,7 +1233,7 @@ example below shows every supported key and the current default):
     "provider": "codex",
     "claude": {
       "binary": "claude",
-      "model": "claude-opus-4-7",
+      "model": "claude-opus-4-8",
       "effort": "high",
       "permissionMode": "bypassPermissions",
       "disallowedTools": ["Bash","Edit","Write","NotebookEdit","WebFetch","WebSearch","Task"],
@@ -1559,7 +1559,7 @@ These are settled for v1.
 - **Default provider:** `codex` (`config.reviewer.provider`). Alternatives
   are `claude` and `gemini` — see *Reviewer providers* above. Each
   provider's model and effort/mode are configured under its own sub-key
-  (e.g. `reviewer.gemini.model`). The codex default model is `gpt-5.5`;
+  (e.g. `reviewer.gemini.model`). The codex default model is `gpt-5.6-sol`;
   override via `config.codex.model`.
 - **Diff scope:** uncommitted only — tracked modifications + untracked
   non-ignored files. Server builds the payload itself and passes it on

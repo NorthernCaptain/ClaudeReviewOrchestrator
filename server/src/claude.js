@@ -161,7 +161,7 @@ export const buildClaudeArgs = ({
         "--session-id",
         sessionId,
         "--model",
-        c.model ?? "claude-opus-4-7",
+        c.model ?? "claude-opus-4-8",
         "--effort",
         c.effort ?? "high",
         "--permission-mode",

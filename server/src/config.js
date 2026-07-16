@@ -48,7 +48,7 @@ const ConfigSchema = z
         codex: z
             .object({
                 binary: z.string().default("codex"),
-                model: z.string().default("gpt-5.5"),
+                model: z.string().default("gpt-5.6-sol"),
                 // Maps to `-c model_reasoning_effort=<value>`. Explicit so
                 // review behavior doesn't drift with the user's interactive
                 // ~/.codex/config.toml. "high" is the orchestrator default
@@ -73,7 +73,7 @@ const ConfigSchema = z
                 claude: z
                     .object({
                         binary: z.string().default("claude"),
-                        model: z.string().default("claude-opus-4-7"),
+                        model: z.string().default("claude-opus-4-8"),
                         // Maps to `--effort <level>` on the Claude CLI.
                         effort: z
                             .enum(["low", "medium", "high", "xhigh", "max"])

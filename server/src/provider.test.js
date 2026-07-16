@@ -6,7 +6,9 @@
 import { describe, expect, jest, test } from "@jest/globals"
 import {
     handleSetProvider,
+    handleSetReviewerPreset,
     mountProviderRoute,
+    REVIEWER_PRESETS,
     VALID_PROVIDERS,
 } from "./provider.js"
 
@@ -162,6 +164,71 @@ describe("handleSetProvider — persistence", () => {
         expect(r.body.persisted).toBe(false)
         expect(r.body.persistError).toMatch(/disk gone/)
         expect(warn).toHaveBeenCalled()
+    })
+})
+
+describe("handleSetReviewerPreset", () => {
+    test("changes codex model and reasoning effort live and on disk", () => {
+        const config = {
+            codex: { model: "gpt-5.5", reasoningEffort: "high" },
+            reviewer: { provider: "codex" },
+        }
+        const fs = makeFs(JSON.stringify(config))
+        const r = handleSetReviewerPreset({
+            body: { preset: "gpt-5.6-terra:medium" },
+            config,
+            configPath: "/cfg.json",
+            deps: { fs },
+        })
+        expect(r.httpStatus).toBe(200)
+        expect(config.codex).toMatchObject({
+            model: "gpt-5.6-terra",
+            reasoningEffort: "medium",
+        })
+        expect(JSON.parse(fs.__store.content).codex.reasoningEffort).toBe(
+            "medium"
+        )
+    })
+
+    test("changes the active Claude preset without altering its provider", () => {
+        const config = { reviewer: { provider: "claude", claude: {} } }
+        const fs = makeFs(JSON.stringify(config))
+        const r = handleSetReviewerPreset({
+            body: { preset: "claude-sonnet-5:high" },
+            config,
+            configPath: "/cfg.json",
+            deps: { fs },
+        })
+        expect(r.body).toMatchObject({
+            provider: "claude",
+            model: "claude-sonnet-5",
+            effortOrMode: "high",
+        })
+        expect(config.reviewer.claude).toMatchObject({
+            model: "claude-sonnet-5",
+            effort: "high",
+        })
+    })
+
+    test("rejects a preset that is not valid for the active provider", () => {
+        const r = handleSetReviewerPreset({
+            body: { preset: "claude-sonnet-5:high" },
+            config: { reviewer: { provider: "codex" } },
+        })
+        expect(r.httpStatus).toBe(400)
+        expect(r.body.error).toMatch(/unknown model preset/)
+    })
+
+    test("catalog exposes model and effort choices for every provider", () => {
+        expect(REVIEWER_PRESETS.codex).toContainEqual(
+            expect.objectContaining({ id: "gpt-5.6-sol:high" })
+        )
+        expect(REVIEWER_PRESETS.claude).toContainEqual(
+            expect.objectContaining({ id: "claude-sonnet-5:high" })
+        )
+        expect(REVIEWER_PRESETS.gemini).toContainEqual(
+            expect.objectContaining({ id: "gemini-3.5-flash:plan" })
+        )
     })
 })
 

@@ -34,11 +34,8 @@ const DEFAULTS = {
     allowedRoots: [],
     codex: {
         binary: "codex",
-        // gpt-5.5 is the Codex CLI's default model name that's accepted by
-        // both ChatGPT-account auth and API-key auth. gpt-5-codex is API-
-        // key-only (the ChatGPT subscription rejects it with HTTP 400),
-        // so we default to gpt-5.5 to work for both auth modes.
-        model: "gpt-5.5",
+        // gpt-5.6-sol is Codex CLI's current default frontier coding model.
+        model: "gpt-5.6-sol",
         reasoningEffort: "high",
         ignoreProjectRules: true,
         extraArgs: [],
@@ -51,7 +48,7 @@ const DEFAULTS = {
         provider: "codex",
         claude: {
             binary: "claude",
-            model: "claude-opus-4-7",
+            model: "claude-opus-4-8",
             effort: "high",
             permissionMode: "bypassPermissions",
             disallowedTools: [

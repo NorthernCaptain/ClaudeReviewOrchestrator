@@ -17,7 +17,11 @@ import { mountMcpRoute } from "./mcp.js"
 import { mountStatusRoute } from "./status.js"
 import { mountDashboardRoute } from "./dashboard.js"
 import { mountNotifyChangeRoute } from "./notify-change.js"
-import { mountProviderRoute, handleSetProvider } from "./provider.js"
+import {
+    mountProviderRoute,
+    handleSetProvider,
+    handleSetReviewerPreset,
+} from "./provider.js"
 import { handleExclusionMutation } from "./exclusions.js"
 import { handleSetMaxRounds } from "./maxRounds.js"
 import { handleSetMaxBlocks } from "./maxBlocks.js"
@@ -196,6 +200,16 @@ export const createApp = ({
     })
     app.put("/dashboard/provider", loopbackOnly, (req, res) => {
         const result = handleSetProvider({
+            body: req.body,
+            config,
+            configPath,
+            logger: log,
+            deps,
+        })
+        res.status(result.httpStatus).json(result.body)
+    })
+    app.put("/dashboard/reviewer-preset", loopbackOnly, (req, res) => {
+        const result = handleSetReviewerPreset({
             body: req.body,
             config,
             configPath,

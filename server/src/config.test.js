@@ -38,7 +38,7 @@ describe("ConfigSchema", () => {
         const result = ConfigSchema.parse({ authToken: "abc" })
         expect(result.port).toBe(7777)
         expect(result.bind).toBe("127.0.0.1")
-        expect(result.codex.model).toBe("gpt-5.5")
+        expect(result.codex.model).toBe("gpt-5.6-sol")
         expect(result.codex.reasoningEffort).toBe("high")
         expect(result.limits.maxCodexRounds).toBe(5)
         expect(result.blockingSeverities).toEqual(["blocker", "major"])
@@ -54,7 +54,7 @@ describe("ConfigSchema", () => {
     test("reviewer block defaults to provider=codex with claude sub-defaults", () => {
         const r = ConfigSchema.parse({ authToken: "abc" })
         expect(r.reviewer.provider).toBe("codex")
-        expect(r.reviewer.claude.model).toBe("claude-opus-4-7")
+        expect(r.reviewer.claude.model).toBe("claude-opus-4-8")
         expect(r.reviewer.claude.effort).toBe("high")
         expect(r.reviewer.claude.permissionMode).toBe("bypassPermissions")
         expect(r.reviewer.claude.disallowedTools).toEqual(

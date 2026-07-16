@@ -12,6 +12,8 @@
 // The chart is inline SVG; row expand/collapse uses native
 // <details>/<summary> so no JS at all.
 
+import { REVIEWER_PRESETS } from "./provider.js"
+
 const STATUS_COLORS = {
     GOOD_TO_GO: "#4ade80",
     NO_CHANGES: "#22c55e",
@@ -665,18 +667,11 @@ export const renderInFlight = (inFlight = []) =>
     `<div id="inflight-body">${renderInFlightRows(inFlight)}</div>` +
     `</div>`
 
-// Inline dashboard controls (v0.1.35). The dashboard is unauthed
-// localhost-only, so these post to /dashboard/* convenience routes
-// that share handlers with the canonical /reset and /provider
-// endpoints. The provider <select> auto-submits on change; the reset
-// button consumes the selected context dropdown.
+// Inline dashboard controls (v0.1.35). Provider and model controls live
+// directly in the active-config grid; this bar only holds context actions.
 const VALID_PROVIDER_OPTIONS = ["codex", "claude", "gemini"]
 
-export const renderControls = (currentProvider, contexts = []) => {
-    const providerOpts = VALID_PROVIDER_OPTIONS.map(
-        (p) =>
-            `<option value="${p}"${p === currentProvider ? " selected" : ""}>${p}</option>`
-    ).join("")
+export const renderControls = (_currentProvider, contexts = []) => {
     const sorted = [...(contexts ?? [])].sort((a, b) =>
         String(a.key ?? "").localeCompare(String(b.key ?? ""))
     )
@@ -725,10 +720,6 @@ export const renderControls = (currentProvider, contexts = []) => {
         : `<option value="">(no contexts)</option>`
     return (
         `<div class="controls" aria-label="dashboard controls">` +
-        `<label class="control">` +
-        `<span class="ctl-label">provider</span>` +
-        `<select id="provider-select" class="select">${providerOpts}</select>` +
-        `</label>` +
         `<div class="control">` +
         `<span class="ctl-label">reset</span>` +
         `<select id="reset-context-select" class="select"${sorted.length ? "" : " disabled"}>${ctxOpts}</select>` +
@@ -868,6 +859,27 @@ const renderConfigPanel = (config) => {
     // PROVIDER value cell without a full refetch).
     const slug = (k) => k.replace(/[^a-z0-9]+/gi, "-").toLowerCase()
     const renderValue = (k, v) => {
+        if (k === "provider") {
+            const options = VALID_PROVIDER_OPTIONS.map(
+                (p) =>
+                    `<option value="${p}"${p === provider ? " selected" : ""}>${p}</option>`
+            ).join("")
+            return `<select class="cfg-select" id="provider-select" aria-label="provider">${options}</select>`
+        }
+        if (k === "model") {
+            const presets = REVIEWER_PRESETS[provider] ?? []
+            const current = `${config.model ?? ""}:${config.effortOrMode ?? ""}`
+            const options = presets
+                .map((p) => {
+                    const selected = p.id === current ? " selected" : ""
+                    return `<option value="${escapeHtml(p.id)}"${selected}>${escapeHtml(p.model)} · ${escapeHtml(p.effortOrMode)}</option>`
+                })
+                .join("")
+            const custom = presets.some((p) => p.id === current)
+                ? ""
+                : `<option value="" selected>${escapeHtml(String(config.model ?? "—"))} · ${escapeHtml(String(config.effortOrMode ?? "—"))} (custom)</option>`
+            return `<select class="cfg-select" id="reviewer-preset-select" aria-label="model and effort">${options}${custom}</select>`
+        }
         // max rounds: inline stepper buttons (v1.1.8).
         if (k === "max rounds" && typeof v === "number") {
             return (
@@ -1714,10 +1726,6 @@ export const renderDashboard = ({
   function bodyToOk(r) {
     return r.json().then(function (j) { return { ok: r.ok, j: j }; });
   }
-  function updateProviderCell(p) {
-    var cell = document.querySelector('[data-config-key="provider"]');
-    if (cell) cell.textContent = p;
-  }
   function wireControls() {
     var ps = document.getElementById("provider-select");
     if (ps) {
@@ -1731,17 +1739,44 @@ export const renderDashboard = ({
           .then(bodyToOk)
           .then(function (r) {
             if (r.ok) {
-              // Update the PROVIDER value cell in the active-config
-              // grid right away so the UI stays consistent without
-              // waiting for the next section refresh.
-              updateProviderCell(r.j.provider || picked);
               setStatus("provider → " + (r.j.provider || picked) +
                 (r.j.persisted ? "" : " (in-memory only)"), true);
+              // A provider has a distinct model/effort catalog, so swap
+              // the config grid to show the selected provider's choices.
+              refreshSections();
             } else {
               setStatus("error: " + (r.j.error || "failed"), false);
             }
           })
           .catch(function (e) { setStatus("error: " + e.message, false); });
+      });
+    }
+    var ms = document.getElementById("reviewer-preset-select");
+    if (ms) {
+      ms.addEventListener("change", function () {
+        var preset = ms.value;
+        if (!preset) return;
+        ms.disabled = true;
+        fetch("/dashboard/reviewer-preset", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ preset: preset }),
+        })
+          .then(bodyToOk)
+          .then(function (r) {
+            if (r.ok) {
+              setStatus("model → " + r.j.model + " · " + r.j.effortOrMode +
+                (r.j.persisted ? "" : " (in-memory only)"), true);
+              refreshSections();
+            } else {
+              setStatus("error: " + (r.j.error || "failed"), false);
+            }
+          })
+          .catch(function (e) { setStatus("error: " + e.message, false); })
+          .finally(function () {
+            var sel = document.getElementById("reviewer-preset-select");
+            if (sel) sel.disabled = false;
+          });
       });
     }
     var rb = document.getElementById("reset-button");

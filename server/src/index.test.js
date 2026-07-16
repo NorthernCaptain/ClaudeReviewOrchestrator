@@ -232,6 +232,42 @@ describe("createApp wiring", () => {
         }
     })
 
+    test("PUT /dashboard/reviewer-preset updates the active provider's model and effort", async () => {
+        let writtenJson = null
+        const fakeFs = {
+            readFileSync: () =>
+                JSON.stringify({
+                    codex: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+                    reviewer: { provider: "codex" },
+                }),
+            writeFileSync: (_p, data) => {
+                writtenJson = data
+            },
+        }
+        const cfg = minimalConfig({ reviewer: { provider: "codex" } })
+        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+        try {
+            const r = await fetch(`${url}/dashboard/reviewer-preset`, {
+                method: "PUT",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ preset: "gpt-5.6-terra:medium" }),
+            })
+            expect(r.status).toBe(200)
+            expect(await r.json()).toMatchObject({
+                ok: true,
+                model: "gpt-5.6-terra",
+                effortOrMode: "medium",
+            })
+            expect(cfg.codex).toMatchObject({
+                model: "gpt-5.6-terra",
+                reasoningEffort: "medium",
+            })
+            expect(writtenJson).toMatch(/"reasoningEffort": "medium"/)
+        } finally {
+            await close()
+        }
+    })
+
     test("PUT /dashboard/max-rounds switches in-memory and persists (v1.1.8)", async () => {
         let writtenJson = null
         const fakeFs = {

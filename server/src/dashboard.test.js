@@ -1112,14 +1112,9 @@ describe("renderAttemptsPie (v1.1.14)", () => {
 describe("renderControls (v0.1.35)", () => {
     const { renderControls } = __test__
 
-    test("provider <select> includes all three providers and pre-selects the current", () => {
+    test("keeps provider control in the active-config grid", () => {
         const html = renderControls("gemini", [])
-        expect(html).toContain('id="provider-select"')
-        expect(html).toContain('<option value="codex">codex</option>')
-        expect(html).toContain(
-            '<option value="gemini" selected>gemini</option>'
-        )
-        expect(html).toContain('<option value="claude">claude</option>')
+        expect(html).not.toContain('id="provider-select"')
     })
 
     test("context dropdown lists each as `repo:branch`, value=contextKey, sorted by key (v0.1.36)", () => {
@@ -1266,14 +1261,21 @@ describe("renderControls (v0.1.35)", () => {
 })
 
 describe("live updates (v0.1.37)", () => {
-    test("config cells carry data-config-key so the provider can be poked in place", () => {
+    test("provider and model presets are inline in their active-config cells", () => {
         const html = renderDashboard({
             version: "0.1.37",
-            config: { provider: "gemini", model: "auto" },
+            config: {
+                provider: "gemini",
+                model: "auto",
+                effortOrMode: "plan",
+            },
             records: [],
         })
-        expect(html).toMatch(/<dd data-config-key="provider">gemini<\/dd>/)
-        expect(html).toMatch(/<dd data-config-key="model">auto<\/dd>/)
+        expect(html).toMatch(/<dd data-config-key="provider"><select/)
+        expect(html).toContain('id="provider-select"')
+        expect(html).toMatch(/<dd data-config-key="model"><select/)
+        expect(html).toContain('id="reviewer-preset-select"')
+        expect(html).toContain("gemini-3.5-flash · plan")
     })
 
     test("client script wires section refresh on in-flight count drop", () => {
@@ -1290,12 +1292,20 @@ describe("live updates (v0.1.37)", () => {
         }
     })
 
-    test("provider switcher updates the PROVIDER value cell in place", () => {
-        const html = renderDashboard({ version: "x", records: [] })
-        // The success handler pokes [data-config-key="provider"] with
-        // the new value so the active-config grid stays in sync.
+    test("provider and model switchers refresh the inline config controls", () => {
+        const html = renderDashboard({
+            version: "x",
+            config: {
+                provider: "codex",
+                model: "gpt-5.5",
+                effortOrMode: "high",
+            },
+            records: [],
+        })
         expect(html).toContain('data-config-key="provider"')
-        expect(html).toContain("updateProviderCell(")
+        expect(html).toContain('fetch("/dashboard/provider"')
+        expect(html).toContain('fetch("/dashboard/reviewer-preset"')
+        expect(html).toContain("refreshSections();")
     })
 
     test("reset button also triggers a section refresh on success", () => {
