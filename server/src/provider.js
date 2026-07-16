@@ -71,6 +71,11 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
         {
+            id: "claude-opus-4-8:xhigh",
+            model: "claude-opus-4-8",
+            effortOrMode: "xhigh",
+        },
+        {
             id: "claude-fable-5:high",
             model: "claude-fable-5",
             effortOrMode: "high",
@@ -81,6 +86,11 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
         {
+            id: "claude-fable-5:xhigh",
+            model: "claude-fable-5",
+            effortOrMode: "xhigh",
+        },
+        {
             id: "claude-sonnet-5:high",
             model: "claude-sonnet-5",
             effortOrMode: "high",
@@ -89,6 +99,11 @@ export const REVIEWER_PRESETS = {
             id: "claude-sonnet-5:medium",
             model: "claude-sonnet-5",
             effortOrMode: "medium",
+        },
+        {
+            id: "claude-sonnet-5:xhigh",
+            model: "claude-sonnet-5",
+            effortOrMode: "xhigh",
         },
     ],
     gemini: [

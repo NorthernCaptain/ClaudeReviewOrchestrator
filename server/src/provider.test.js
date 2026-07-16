@@ -226,6 +226,9 @@ describe("handleSetReviewerPreset", () => {
         expect(REVIEWER_PRESETS.claude).toContainEqual(
             expect.objectContaining({ id: "claude-sonnet-5:high" })
         )
+        expect(REVIEWER_PRESETS.claude).toContainEqual(
+            expect.objectContaining({ id: "claude-sonnet-5:xhigh" })
+        )
         expect(REVIEWER_PRESETS.gemini).toContainEqual(
             expect.objectContaining({ id: "gemini-3.5-flash:plan" })
         )
