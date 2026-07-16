@@ -35,20 +35,19 @@ describe("mergeCodexHooks", () => {
     const read = () =>
         JSON.parse(readFileSync(path.join(dir, "hooks.json"), "utf8"))
 
-    test("creates hooks.json with Stop + PostToolUse at the top level", () => {
+    test("creates hooks.json with the Codex config envelope", () => {
         const r = run()
         expect(r.action).toBe("installed")
         const s = read()
-        expect(Array.isArray(s.Stop)).toBe(true)
-        expect(Array.isArray(s.PostToolUse)).toBe(true)
-        // Codex shape: events at top level, NOT under a `hooks` wrapper.
-        expect(s.hooks).toBeUndefined()
-        expect(s.Stop[0].hooks[0]).toEqual({
+        expect(s.description).toBeTruthy()
+        expect(Array.isArray(s.hooks.Stop)).toBe(true)
+        expect(Array.isArray(s.hooks.PostToolUse)).toBe(true)
+        expect(s.hooks.Stop[0].hooks[0]).toEqual({
             type: "command",
             command: STOP,
             timeout: HARNESS_TIMEOUT_SECONDS,
         })
-        const post = s.PostToolUse[0]
+        const post = s.hooks.PostToolUse[0]
         expect(post.matcher).toBe(POST_MATCHER)
         expect(post.hooks[0]).toEqual({
             type: "command",
@@ -59,7 +58,7 @@ describe("mergeCodexHooks", () => {
 
     test("Stop block carries no matcher key", () => {
         run()
-        expect("matcher" in read().Stop[0]).toBe(false)
+        expect("matcher" in read().hooks.Stop[0]).toBe(false)
     })
 
     test("PostToolUse matcher covers file edits AND shell commands", () => {
@@ -99,10 +98,10 @@ describe("mergeCodexHooks", () => {
         const r = run()
         expect(r.action).toBe("updated")
         const s = read()
-        expect(s.Stop[0].hooks[0].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
-        expect(s.Stop[0].hooks.filter((h) => h.command === STOP)).toHaveLength(
-            1
-        )
+        expect(s.hooks.Stop[0].hooks[0].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
+        expect(
+            s.hooks.Stop[0].hooks.filter((h) => h.command === STOP)
+        ).toHaveLength(1)
     })
 
     test("preserves sibling hooks in the same event", () => {
@@ -112,7 +111,7 @@ describe("mergeCodexHooks", () => {
         run()
         const s = read()
         // Our entry joins the existing canonical (no-matcher) block.
-        const cmds = s.Stop.flatMap((b) => b.hooks).map((h) => h.command)
+        const cmds = s.hooks.Stop.flatMap((b) => b.hooks).map((h) => h.command)
         expect(cmds).toContain("/x/other.sh")
         expect(cmds).toContain(STOP)
     })
@@ -129,8 +128,8 @@ describe("mergeCodexHooks", () => {
         )
         run()
         const s = read()
-        expect(s.SessionStart[0].hooks[0].command).toBe("/x/s.sh")
-        expect(s.Stop[0].hooks[0].command).toBe(STOP)
+        expect(s.hooks.SessionStart[0].hooks[0].command).toBe("/x/s.sh")
+        expect(s.hooks.Stop[0].hooks[0].command).toBe(STOP)
     })
 
     test("dedupes our hook listed twice in one block to a single entry", () => {
@@ -149,7 +148,9 @@ describe("mergeCodexHooks", () => {
             })
         )
         run()
-        const ours = read().Stop[0].hooks.filter((h) => h.command === STOP)
+        const ours = read().hooks.Stop[0].hooks.filter(
+            (h) => h.command === STOP
+        )
         expect(ours).toHaveLength(1)
         expect(ours[0].timeout).toBe(HARNESS_TIMEOUT_SECONDS)
     })

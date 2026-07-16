@@ -429,9 +429,10 @@ describe("removeCodexHooks", () => {
         expect(r.action).toBe("removed")
         const s = JSON.parse(readFileSync(p, "utf8"))
         // Stop keeps the sibling; PostToolUse pruned entirely; SessionStart intact.
-        expect(s.Stop[0].hooks).toEqual([sibling])
-        expect("PostToolUse" in s).toBe(false)
-        expect(s.SessionStart[0].hooks[0].command).toBe("/k")
+        // A legacy top-level fixture is normalized to Codex's hooks envelope.
+        expect(s.hooks.Stop[0].hooks).toEqual([sibling])
+        expect("PostToolUse" in s.hooks).toBe(false)
+        expect(s.hooks.SessionStart[0].hooks[0].command).toBe("/k")
     })
 
     test("idempotent rerun after a real merge", () => {

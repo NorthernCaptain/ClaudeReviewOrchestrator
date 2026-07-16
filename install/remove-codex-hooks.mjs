@@ -78,23 +78,34 @@ export const removeCodexHooks = ({
         throw new Error(`${hooksJsonPath} is valid JSON but not an object`)
     }
 
-    const next = { ...root }
+    // Current Codex expects event mappings below `hooks`. Also accept the
+    // legacy top-level shape so users of an older installer can uninstall
+    // cleanly, and normalize it while doing so.
+    const legacyRoot = !isObj(root.hooks)
+    const hooks = legacyRoot ? root : root.hooks
+    const nextHooks = { ...hooks }
     let removed = false
     for (const [event, command] of [
         ["Stop", stopHookPath],
         ["PostToolUse", notifyHookPath],
     ]) {
-        if (!Array.isArray(root[event])) continue
-        const res = stripEvent(root[event], [command])
+        if (!Array.isArray(hooks[event])) continue
+        const res = stripEvent(hooks[event], [command])
         if (!res.removed) continue
         removed = true
-        if (res.list.length === 0) delete next[event]
-        else next[event] = res.list
+        if (res.list.length === 0) delete nextHooks[event]
+        else nextHooks[event] = res.list
     }
 
     if (!removed) {
         return { action: "unchanged", path: hooksJsonPath }
     }
+    const next = legacyRoot
+        ? {
+              description: "Review Orchestrator lifecycle hooks",
+              hooks: nextHooks,
+          }
+        : { ...root, hooks: nextHooks }
     const serialized = JSON.stringify(next, null, 2) + "\n"
     const ts = now()
     const bak = backup(hooksJsonPath, serialized, ts)

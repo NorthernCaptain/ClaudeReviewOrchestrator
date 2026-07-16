@@ -6,12 +6,15 @@
 
 // Add our Stop + PostToolUse hook entries to ~/.codex/hooks.json.
 //
-// Codex's hooks.json has the event names at the TOP level (unlike Claude
-// Code's settings.json, which nests them under a `hooks` object):
+// Codex's hooks.json has a small config envelope (unlike Claude Code's
+// settings.json):
 //
 //   {
-//     "Stop":        [ { "hooks": [ { type, command, timeout } ] } ],
-//     "PostToolUse": [ { "matcher": "...", "hooks": [ { ... } ] } ]
+//     "description": "...",
+//     "hooks": {
+//       "Stop":        [ { "hooks": [ { type, command, timeout } ] } ],
+//       "PostToolUse": [ { "matcher": "...", "hooks": [ { ... } ] } ]
+//     }
 //   }
 //
 // The stdin contract and the { decision:"block", reason } Stop output are
@@ -23,7 +26,7 @@
 // user-authored hooks in the same or other blocks are left intact. This
 // is the merge-post-tool-use-hook.mjs algorithm generalized to either
 // event (matcher present → PostToolUse; matcher null → Stop) and to the
-// top-level codex shape.
+// Codex's hooks envelope.
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import path from "node:path"
@@ -47,6 +50,7 @@ export const POST_MATCHER =
     "^(apply_patch|Edit|Write|exec_command|write_stdin|Bash)$"
 // notify-change is a fire-and-forget fast path; it never needs long.
 export const POST_TIMEOUT_SECONDS = 10
+export const DESCRIPTION = "Review Orchestrator lifecycle hooks"
 
 const isObj = (v) => v && typeof v === "object" && !Array.isArray(v)
 
@@ -178,14 +182,22 @@ export const mergeCodexHooks = ({
         timeout: postTimeout,
     }
 
-    const stop = mergeEvent(root.Stop, stopEntry, null)
-    const post = mergeEvent(root.PostToolUse, postEntry, postMatcher)
+    // Versions of this installer before Codex's hooks-config envelope was
+    // discovered wrote event names at the root. Migrate that exact legacy
+    // shape on the next install; it is not accepted by current Codex.
+    const legacyRoot = !isObj(root.hooks)
+    const hooks = legacyRoot ? root : root.hooks
+    const stop = mergeEvent(hooks.Stop, stopEntry, null)
+    const post = mergeEvent(hooks.PostToolUse, postEntry, postMatcher)
 
-    if (existed && !stop.changed && !post.changed) {
+    if (existed && !legacyRoot && !stop.changed && !post.changed) {
         return { action: "unchanged", path: hooksJsonPath }
     }
 
-    const next = { ...root, Stop: stop.list, PostToolUse: post.list }
+    const nextHooks = { ...hooks, Stop: stop.list, PostToolUse: post.list }
+    const next = legacyRoot
+        ? { description: DESCRIPTION, hooks: nextHooks }
+        : { ...root, hooks: nextHooks }
     const serialized = JSON.stringify(next, null, 2) + "\n"
     const ts = now()
     const bak = backup(hooksJsonPath, serialized, ts)

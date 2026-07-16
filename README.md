@@ -689,8 +689,8 @@ registration shape differs.
    `X-Review-Token` header) into `~/.codex/config.toml`.
 3. Merges `Stop` (timeout 1800s) + `PostToolUse` (matcher
    `^(apply_patch|Edit|Write|exec_command|write_stdin|Bash)$`, timeout 10s)
-   entries into `~/.codex/hooks.json` — codex's top-level event shape, not
-   Claude's `{ hooks: { … } }` wrapper. codex's command tools (`exec_command`
+   entries into the `hooks` object in `~/.codex/hooks.json`, alongside its
+   required config envelope. codex's command tools (`exec_command`
    / `write_stdin`) are included so command-side edits (formatters, codegen)
    also mark the context dirty and can't slip past the `NO_CHANGES` fast path.
 4. Installs the `code-review-loop` skill at
