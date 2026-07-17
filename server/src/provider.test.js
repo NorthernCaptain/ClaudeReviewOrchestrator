@@ -236,6 +236,19 @@ describe("handleSetReviewerPreset", () => {
             expect.objectContaining({ id: "gemini-3.5-flash:plan" })
         )
     })
+
+    test("orders effort variants from xhigh through medium for each model", () => {
+        expect(
+            REVIEWER_PRESETS.codex
+                .filter((p) => p.model === "gpt-5.6-sol")
+                .map((p) => p.effortOrMode)
+        ).toEqual(["xhigh", "high", "medium"])
+        expect(
+            REVIEWER_PRESETS.claude
+                .filter((p) => p.model === "claude-sonnet-5")
+                .map((p) => p.effortOrMode)
+        ).toEqual(["xhigh", "high", "medium"])
+    })
 })
 
 describe("mountProviderRoute", () => {

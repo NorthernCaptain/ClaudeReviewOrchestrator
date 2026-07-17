@@ -25,6 +25,11 @@ export const VALID_PROVIDERS = ["codex", "claude", "gemini"]
 // explicit names are the current coding-capable choices, plus its router.
 export const REVIEWER_PRESETS = {
     codex: [
+        {
+            id: "gpt-5.6-sol:xhigh",
+            model: "gpt-5.6-sol",
+            effortOrMode: "xhigh",
+        },
         { id: "gpt-5.6-sol:high", model: "gpt-5.6-sol", effortOrMode: "high" },
         {
             id: "gpt-5.6-sol:medium",
@@ -32,8 +37,8 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
         {
-            id: "gpt-5.6-sol:xhigh",
-            model: "gpt-5.6-sol",
+            id: "gpt-5.6-terra:xhigh",
+            model: "gpt-5.6-terra",
             effortOrMode: "xhigh",
         },
         {
@@ -47,8 +52,8 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
         {
-            id: "gpt-5.6-terra:xhigh",
-            model: "gpt-5.6-terra",
+            id: "gpt-5.6-luna:xhigh",
+            model: "gpt-5.6-luna",
             effortOrMode: "xhigh",
         },
         {
@@ -61,21 +66,21 @@ export const REVIEWER_PRESETS = {
             model: "gpt-5.6-luna",
             effortOrMode: "medium",
         },
-        {
-            id: "gpt-5.6-luna:xhigh",
-            model: "gpt-5.6-luna",
-            effortOrMode: "xhigh",
-        },
+        { id: "gpt-5.5:xhigh", model: "gpt-5.5", effortOrMode: "xhigh" },
         { id: "gpt-5.5:high", model: "gpt-5.5", effortOrMode: "high" },
         {
             id: "gpt-5.5:medium",
             model: "gpt-5.5",
             effortOrMode: "medium",
         },
-        { id: "gpt-5.5:xhigh", model: "gpt-5.5", effortOrMode: "xhigh" },
         { id: "gpt-5.5:low", model: "gpt-5.5", effortOrMode: "low" },
     ],
     claude: [
+        {
+            id: "claude-opus-4-8:xhigh",
+            model: "claude-opus-4-8",
+            effortOrMode: "xhigh",
+        },
         {
             id: "claude-opus-4-8:high",
             model: "claude-opus-4-8",
@@ -87,8 +92,8 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
         {
-            id: "claude-opus-4-8:xhigh",
-            model: "claude-opus-4-8",
+            id: "claude-fable-5:xhigh",
+            model: "claude-fable-5",
             effortOrMode: "xhigh",
         },
         {
@@ -102,8 +107,8 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
         {
-            id: "claude-fable-5:xhigh",
-            model: "claude-fable-5",
+            id: "claude-sonnet-5:xhigh",
+            model: "claude-sonnet-5",
             effortOrMode: "xhigh",
         },
         {
@@ -115,11 +120,6 @@ export const REVIEWER_PRESETS = {
             id: "claude-sonnet-5:medium",
             model: "claude-sonnet-5",
             effortOrMode: "medium",
-        },
-        {
-            id: "claude-sonnet-5:xhigh",
-            model: "claude-sonnet-5",
-            effortOrMode: "xhigh",
         },
     ],
     gemini: [
