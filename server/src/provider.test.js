@@ -223,6 +223,9 @@ describe("handleSetReviewerPreset", () => {
         expect(REVIEWER_PRESETS.codex).toContainEqual(
             expect.objectContaining({ id: "gpt-5.6-sol:high" })
         )
+        expect(REVIEWER_PRESETS.codex).toContainEqual(
+            expect.objectContaining({ id: "gpt-5.6-sol:xhigh" })
+        )
         expect(REVIEWER_PRESETS.claude).toContainEqual(
             expect.objectContaining({ id: "claude-sonnet-5:high" })
         )

@@ -51,6 +51,14 @@ describe("ConfigSchema", () => {
             })
         ).toThrow()
     })
+    test("accepts Codex xhigh reasoning effort", () => {
+        expect(
+            ConfigSchema.parse({
+                authToken: "x",
+                codex: { reasoningEffort: "xhigh" },
+            }).codex.reasoningEffort
+        ).toBe("xhigh")
+    })
     test("reviewer block defaults to provider=codex with claude sub-defaults", () => {
         const r = ConfigSchema.parse({ authToken: "abc" })
         expect(r.reviewer.provider).toBe("codex")

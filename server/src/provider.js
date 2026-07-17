@@ -32,6 +32,11 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
         {
+            id: "gpt-5.6-sol:xhigh",
+            model: "gpt-5.6-sol",
+            effortOrMode: "xhigh",
+        },
+        {
             id: "gpt-5.6-terra:high",
             model: "gpt-5.6-terra",
             effortOrMode: "high",
@@ -40,6 +45,11 @@ export const REVIEWER_PRESETS = {
             id: "gpt-5.6-terra:medium",
             model: "gpt-5.6-terra",
             effortOrMode: "medium",
+        },
+        {
+            id: "gpt-5.6-terra:xhigh",
+            model: "gpt-5.6-terra",
+            effortOrMode: "xhigh",
         },
         {
             id: "gpt-5.6-luna:high",
@@ -51,12 +61,18 @@ export const REVIEWER_PRESETS = {
             model: "gpt-5.6-luna",
             effortOrMode: "medium",
         },
+        {
+            id: "gpt-5.6-luna:xhigh",
+            model: "gpt-5.6-luna",
+            effortOrMode: "xhigh",
+        },
         { id: "gpt-5.5:high", model: "gpt-5.5", effortOrMode: "high" },
         {
             id: "gpt-5.5:medium",
             model: "gpt-5.5",
             effortOrMode: "medium",
         },
+        { id: "gpt-5.5:xhigh", model: "gpt-5.5", effortOrMode: "xhigh" },
         { id: "gpt-5.5:low", model: "gpt-5.5", effortOrMode: "low" },
     ],
     claude: [

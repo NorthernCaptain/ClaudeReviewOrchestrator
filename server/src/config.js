@@ -54,7 +54,7 @@ const ConfigSchema = z
                 // ~/.codex/config.toml. "high" is the orchestrator default
                 // because reviews are infrequent and worth the latency.
                 reasoningEffort: z
-                    .enum(["minimal", "low", "medium", "high"])
+                    .enum(["minimal", "low", "medium", "high", "xhigh"])
                     .default("high"),
                 ignoreProjectRules: z.boolean().default(true),
                 extraArgs: z.array(z.string()).default([]),

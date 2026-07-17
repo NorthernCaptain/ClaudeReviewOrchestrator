@@ -272,6 +272,18 @@ describe("buildCodexArgs", () => {
         expect(idx).toBeGreaterThan(0)
         expect(args[idx + 1]).toBe("model_reasoning_effort=medium")
     })
+    test("passes xhigh reasoning effort through -c", () => {
+        const cfg = baseConfig()
+        cfg.codex.reasoningEffort = "xhigh"
+        const args = buildCodexArgs({
+            repoRoot: "/r",
+            config: cfg,
+            schemaPath: "/s",
+        })
+        const idx = args.indexOf("-c")
+        expect(idx).toBeGreaterThan(0)
+        expect(args[idx + 1]).toBe("model_reasoning_effort=xhigh")
+    })
     test("skips the -c flag when reasoningEffort is missing or unknown", () => {
         const cfg = baseConfig()
         delete cfg.codex.reasoningEffort

@@ -213,7 +213,13 @@ const defaultValidator = () => {
 // Whitelist the reasoning-effort values codex actually accepts. Anything
 // else falls through silently — config-schema validation already rejected
 // unknown values, so reaching the `else` here means a future config bug.
-const REASONING_EFFORT_VALUES = new Set(["minimal", "low", "medium", "high"])
+const REASONING_EFFORT_VALUES = new Set([
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+])
 
 export const buildCodexArgs = ({ repoRoot, config, schemaPath }) => {
     const args = [
