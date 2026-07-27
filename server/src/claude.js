@@ -6,17 +6,17 @@
 // Claude Code CLI adapter for the reviewer.
 //
 // CLI surface verified against:
-//   $ claude --version  → 2.1.148 (Claude Code)  (2026-05-22)
+//   $ claude --version  → 2.1.220 (Claude Code)  (2026-07-27)
 //   $ claude --help     confirmed flags used here:
 //     -p, --print                    non-interactive single-shot mode
 //     --output-format json           emits the single-result envelope
 //                                    (the shape is pinned by the test
 //                                    fixture in claude.test.js — see
 //                                    "claude_envelope_fixture")
-//     --json-schema <schema>         accepts INLINE JSON TEXT (verified
-//                                    end-to-end with a real review that
-//                                    produced findings; see PR history)
-//     --model <id>                   accepts "claude-opus-4-7" and the
+//     --json-schema <schema>         accepts INLINE JSON TEXT, but only a
+//                                    sanitized subset of our bundled
+//                                    schema — see claudeSchemaText()
+//     --model <id>                   accepts "claude-opus-5" and the
 //                                    "opus"/"sonnet" aliases
 //     --effort <level>               low|medium|high|xhigh|max
 //     --permission-mode <mode>       includes "bypassPermissions"
@@ -29,8 +29,8 @@
 // Mirrors the shape of codex.js — same runAndParse contract so the
 // review pipeline can switch providers without knowing the difference.
 // Differences vs codex:
-//   * Schema is passed as inline JSON via --json-schema (codex takes a
-//     path via --output-schema).
+//   * Schema is passed as sanitized inline JSON via --json-schema (codex
+//     takes the file path via --output-schema).
 //   * Output is wrapped in a Claude envelope { type: "result", subtype:
 //     "success", result: "<assistant text>", is_error: false, ... } —
 //     see the fixture-based test for the full real-world shape we
@@ -125,8 +125,34 @@ const extractFirstJsonObject = (s) => {
     return null
 }
 
-const loadSchemaText = (schemaPath) => readFileSync(schemaPath, "utf8")
-const loadSchemaJson = (schemaPath) => JSON.parse(loadSchemaText(schemaPath))
+const loadSchemaJson = (schemaPath) =>
+    JSON.parse(readFileSync(schemaPath, "utf8"))
+
+// The bundled schema can't go over --json-schema verbatim. The CLI compiles
+// it with its own draft-07 ajv instance and then forwards it to the API as a
+// strict tool input_schema, and each stage rejects something we declare:
+//   * "$schema": the 2020-12 meta-schema isn't registered in the CLI's ajv,
+//     so the whole run dies before spawning with
+//     `--json-schema is not a valid JSON Schema: no schema with key or ref
+//     "https://json-schema.org/draft/2020-12/schema"` (claude 2.1.220).
+//   * top-level "allOf": the API rejects oneOf/allOf/anyOf at the top level
+//     of a tool input_schema (`400 ... input_schema does not support oneOf,
+//     allOf, or anyOf at the top level`).
+// "$id" goes too — it names a document we're inlining, so it buys nothing
+// and risks a duplicate-key collision inside the CLI's ajv. $defs/$ref and
+// the ["string", "null"] union survive both stages, so the finding shape is
+// still enforced end-to-end.
+//
+// Dropping allOf loses the status<->findings conditional; parseClaudeOutput
+// re-derives status from the findings instead, and the server derives the
+// public status from the findings regardless.
+const claudeSchemaText = (schemaPath) => {
+    const schema = loadSchemaJson(schemaPath)
+    delete schema.$schema
+    delete schema.$id
+    delete schema.allOf
+    return JSON.stringify(schema)
+}
 
 const compileValidator = (schemaPath) => {
     const ajv = new Ajv({ allErrors: true, strict: false })
@@ -161,7 +187,7 @@ export const buildClaudeArgs = ({
         "--session-id",
         sessionId,
         "--model",
-        c.model ?? "claude-opus-4-8",
+        c.model ?? "claude-opus-5",
         "--effort",
         c.effort ?? "high",
         "--permission-mode",
@@ -171,7 +197,7 @@ export const buildClaudeArgs = ({
         "--output-format",
         "json",
         "--json-schema",
-        loadSchemaText(schemaPath),
+        claudeSchemaText(schemaPath),
         "--append-system-prompt",
         REVIEWER_DIRECTIVE,
     ]
@@ -316,12 +342,13 @@ export const runClaude = ({
 // with shape:
 //   { type: "result", subtype: "success" | "error_*", result: string,
 //     is_error: bool, ... }
-// When --json-schema is supplied, Claude refuses to finalize until the
-// assistant text JSON-validates against the schema — so on the
-// "success" path, `result` is guaranteed schema-conformant and we can
-// strict-parse it. We still re-validate locally with ajv because (a) the
-// CLI's schema enforcement is a contract we don't get to audit and (b)
-// the server's downstream code has to trust the value.
+// When --json-schema is supplied, Claude pushes the assistant text
+// toward the schema, so on the "success" path `result` is usually
+// schema-conformant and we can strict-parse it. We still re-validate
+// locally with ajv — against the FULL bundled schema, not the reduced
+// one the CLI got — because (a) the CLI's enforcement is a contract we
+// don't get to audit and (b) the server's downstream code has to trust
+// the value.
 export const parseClaudeOutput = (
     rawStdout,
     validator = defaultValidator()
@@ -422,21 +449,14 @@ export const parseClaudeOutput = (
         }
     }
 
-    // Defense in depth: occasionally a model emits a server-side
-    // public status (GOOD_TO_GO_WITH_NOTES, NO_CHANGES, …) even when
-    // the schema is enforced via --json-schema. Coerce to the
-    // schema-valid pair so derivePublicStatus() can re-derive the
-    // public form correctly downstream.
-    if (parsed && typeof parsed.status === "string") {
-        const STATUS_COERCE = {
-            GOOD_TO_GO_WITH_NOTES: "ISSUES",
-            NO_PROGRESS_WITH_OPEN_ISSUES: "ISSUES",
-            NO_CHANGES: "GOOD_TO_GO",
-            ESCALATE: "ISSUES",
-        }
-        if (STATUS_COERCE[parsed.status]) {
-            parsed.status = STATUS_COERCE[parsed.status]
-        }
+    // The schema handed to the CLI has no status<->findings conditional
+    // (see claudeSchemaText), and models occasionally answer with a
+    // server-side public status (GOOD_TO_GO_WITH_NOTES, NO_CHANGES, …)
+    // besides. Findings are the substance of the review, so re-derive
+    // status from them rather than rejecting an otherwise-valid review;
+    // derivePublicStatus() re-derives the public form downstream anyway.
+    if (parsed && Array.isArray(parsed.findings)) {
+        parsed.status = parsed.findings.length === 0 ? "GOOD_TO_GO" : "ISSUES"
     }
 
     parsed = normalizeFindings(parsed)

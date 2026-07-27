@@ -48,7 +48,7 @@ const DEFAULTS = {
         provider: "codex",
         claude: {
             binary: "claude",
-            model: "claude-opus-4-8",
+            model: "claude-opus-5",
             effort: "high",
             permissionMode: "bypassPermissions",
             disallowedTools: [

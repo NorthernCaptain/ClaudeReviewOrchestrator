@@ -77,18 +77,18 @@ export const REVIEWER_PRESETS = {
     ],
     claude: [
         {
-            id: "claude-opus-4-8:xhigh",
-            model: "claude-opus-4-8",
+            id: "claude-opus-5:xhigh",
+            model: "claude-opus-5",
             effortOrMode: "xhigh",
         },
         {
-            id: "claude-opus-4-8:high",
-            model: "claude-opus-4-8",
+            id: "claude-opus-5:high",
+            model: "claude-opus-5",
             effortOrMode: "high",
         },
         {
-            id: "claude-opus-4-8:medium",
-            model: "claude-opus-4-8",
+            id: "claude-opus-5:medium",
+            model: "claude-opus-5",
             effortOrMode: "medium",
         },
         {

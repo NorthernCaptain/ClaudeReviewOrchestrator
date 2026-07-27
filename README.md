@@ -512,7 +512,7 @@ for the canonical builders):
 
 ```bash
 # codex
-codex exec --cd <repoRoot> --ephemeral --sandbox read-only \
+codex exec --cd <repoRoot> --ephemeral --ignore-user-config --sandbox read-only \
   --model <reviewer.codex.model> \
   --output-schema <bundled-schema.json> \
   -c model_reasoning_effort=<reviewer.codex.reasoningEffort> \
@@ -522,7 +522,7 @@ codex exec --cd <repoRoot> --ephemeral --sandbox read-only \
 claude -p --no-session-persistence --session-id <uuid> \
   --model <reviewer.claude.model> --effort <reviewer.claude.effort> \
   --permission-mode <reviewer.claude.permissionMode> \
-  --add-dir <repoRoot> --output-format json --json-schema <inline> \
+  --add-dir <repoRoot> --output-format json --json-schema <sanitized inline> \
   --append-system-prompt <directive> --disallowed-tools <csv>
 
 # gemini
@@ -536,12 +536,17 @@ Common ground:
 - The reviewer's CWD is the repo root.
 - The reviewer is started ephemeral (no session persistence) so prior
   runs don't bleed in across our explicit `priorFindings` hand-off.
+- Codex also uses `--ignore-user-config`, preventing user-configured MCP
+  servers and hooks from loading; the orchestrator explicitly supplies its
+  model, effort, sandbox, and output-schema settings, while Codex auth remains
+  available.
 - The reviewer is read-only via per-CLI sandbox/permission flags +
   (for claude) an explicit `--disallowed-tools` block.
 - Output is JSON validated against `server/src/codex-output.schema.json`.
   Codex enforces the schema via `--output-schema`; claude via
-  `--json-schema`; gemini relies on the prompt directive plus our salvage
-  parser + ajv re-validation.
+  `--json-schema` (a sanitized subset — see "Reviewer providers"); gemini
+  relies on the prompt directive plus our salvage parser + ajv
+  re-validation.
 - If `config.codex.ignoreProjectRules: true` (default), codex gets
   `--ignore-rules` so the repo's `AGENTS.md` / `.codex/instructions.md`
   cannot contradict the reviewer system preamble or the output contract.
@@ -851,7 +856,7 @@ The reviewer is pluggable. `config.reviewer.provider` picks one of:
 | Provider | Binary  | Schema enforcement              | Auth                                   | Notes |
 |----------|---------|----------------------------------|----------------------------------------|-------|
 | `codex`  | `codex` | `--output-schema <path>` (strict) | Codex CLI's own login (ChatGPT or API key) | Default. The original adapter; tightest schema enforcement. |
-| `claude` | `claude` | `--json-schema <inline>` (best-effort) | OAuth keychain via `claude login`, or `ANTHROPIC_API_KEY` | Salvage parser handles prose lead-ins; defense-in-depth status coercion. |
+| `claude` | `claude` | `--json-schema <sanitized inline>` (best-effort) | OAuth keychain via `claude login`, or `ANTHROPIC_API_KEY` | Salvage parser handles prose lead-ins; status re-derived from findings. |
 | `gemini` | `gemini` | none (prompt-only contract)      | `GEMINI_API_KEY` env, or `gemini auth login` (OAuth) | `--model auto` is the "Auto (Gemini 3)" router; status coercion required. |
 
 Each adapter implements the same `runAndParse({repoRoot, prompt, config})`
@@ -863,6 +868,16 @@ and `ISSUES`. Every other public status (`GOOD_TO_GO_WITH_NOTES`, `NO_CHANGES`,
 two plus the on-disk change state and the configured `blockingSeverities`. If
 a model returns a server-side status name anyway, the adapter coerces it back
 to the schema-valid pair before validation as defense in depth.
+
+The `claude` adapter cannot pass that schema over `--json-schema` verbatim:
+the CLI compiles it with its own draft-07 ajv (which has no `$schema`
+`2020-12` meta-schema) and then hands it to the API as a strict tool
+`input_schema` (which rejects a top-level `allOf`). `claudeSchemaText()` in
+[`claude.js`](./server/src/claude.js) strips `$schema`, `$id`, and the
+top-level `allOf` before inlining; the finding shape (`$defs`/`$ref`, enums,
+`["string","null"]`) survives intact. Since the stripped `allOf` was what
+tied `status` to `findings.length`, the adapter re-derives `status` from the
+findings before validating against the **full** bundled schema.
 
 Switch providers by editing the config and restarting the server:
 
@@ -1233,7 +1248,7 @@ example below shows every supported key and the current default):
     "provider": "codex",
     "claude": {
       "binary": "claude",
-      "model": "claude-opus-4-8",
+      "model": "claude-opus-5",
       "effort": "high",
       "permissionMode": "bypassPermissions",
       "disallowedTools": ["Bash","Edit","Write","NotebookEdit","WebFetch","WebSearch","Task"],

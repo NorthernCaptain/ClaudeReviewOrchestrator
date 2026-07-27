@@ -73,7 +73,7 @@ const ConfigSchema = z
                 claude: z
                     .object({
                         binary: z.string().default("claude"),
-                        model: z.string().default("claude-opus-4-8"),
+                        model: z.string().default("claude-opus-5"),
                         // Maps to `--effort <level>` on the Claude CLI.
                         effort: z
                             .enum(["low", "medium", "high", "xhigh", "max"])

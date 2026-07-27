@@ -227,6 +227,9 @@ export const buildCodexArgs = ({ repoRoot, config, schemaPath }) => {
         "--cd",
         repoRoot,
         "--ephemeral",
+        // Reviews must not initialize user-configured MCP servers, hooks, or
+        // other personal defaults. Auth remains available to the CLI.
+        "--ignore-user-config",
         "--sandbox",
         "read-only",
         "--model",

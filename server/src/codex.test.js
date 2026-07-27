@@ -248,6 +248,7 @@ describe("buildCodexArgs", () => {
             "--cd",
             "/repo",
             "--ephemeral",
+            "--ignore-user-config",
             "--sandbox",
             "read-only",
             "--model",

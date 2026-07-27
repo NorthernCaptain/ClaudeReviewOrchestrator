@@ -48,7 +48,7 @@ describe("ensureToken", () => {
         // Claude sub-config preloaded so flipping the provider needs no
         // hand-edits beyond the one key.
         expect(cfg.reviewer.provider).toBe("codex")
-        expect(cfg.reviewer.claude.model).toBe("claude-opus-4-8")
+        expect(cfg.reviewer.claude.model).toBe("claude-opus-5")
         expect(cfg.reviewer.claude.effort).toBe("high")
         expect(cfg.reviewer.claude.permissionMode).toBe("bypassPermissions")
     })

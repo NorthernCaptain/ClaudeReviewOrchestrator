@@ -6,6 +6,7 @@
 import { jest } from "@jest/globals"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
+import Ajv2020 from "ajv/dist/2020.js"
 import {
     buildClaudeArgs,
     parseClaudeOutput,
@@ -113,6 +114,71 @@ describe("buildClaudeArgs", () => {
         const idx = args.indexOf("--append-system-prompt")
         expect(idx).toBeGreaterThan(0)
         expect(args[idx + 1]).toMatch(/EXACTLY ONE JSON object/)
+    })
+
+    test("defaults --model to claude-opus-5", () => {
+        const cfg = baseConfig()
+        delete cfg.reviewer.claude.model
+        const args = buildClaudeArgs({
+            repoRoot: "/r",
+            config: cfg,
+            sessionId: "u",
+        })
+        expect(args[args.indexOf("--model") + 1]).toBe("claude-opus-5")
+    })
+
+    test("strips $schema, $id and the top-level allOf from --json-schema", () => {
+        // Both stages of the CLI's schema handling reject parts of the
+        // bundled document: its draft-07 ajv can't resolve the 2020-12
+        // meta-schema, and the API rejects a top-level allOf in a tool
+        // input_schema. See claudeSchemaText in claude.js.
+        const args = buildClaudeArgs({
+            repoRoot: "/r",
+            config: baseConfig(),
+            sessionId: "u",
+        })
+        const inlined = JSON.parse(args[args.indexOf("--json-schema") + 1])
+        expect(inlined.$schema).toBeUndefined()
+        expect(inlined.$id).toBeUndefined()
+        expect(inlined.allOf).toBeUndefined()
+        // Everything that carries the finding contract stays.
+        expect(inlined.required).toEqual(["status", "findings"])
+        expect(inlined.properties.findings.items.$ref).toBe(
+            "#/$defs/finding"
+        )
+        expect(inlined.$defs.finding.properties.severity.enum).toContain(
+            "blocker"
+        )
+    })
+
+    test("the sanitized schema still validates a conforming review", () => {
+        // Guards against over-stripping: the reduced document must accept
+        // what the full bundled schema accepts.
+        const args = buildClaudeArgs({
+            repoRoot: "/r",
+            config: baseConfig(),
+            sessionId: "u",
+        })
+        const inlined = JSON.parse(args[args.indexOf("--json-schema") + 1])
+        const ajv = new Ajv2020({ allErrors: true, strict: false })
+        const validate = ajv.compile(inlined)
+        expect(
+            validate({
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "blocker",
+                        category: "bug",
+                        message: "boom",
+                        suggestion: null,
+                    },
+                ],
+            })
+        ).toBe(true)
+        expect(validate({ status: "GOOD_TO_GO", findings: [] })).toBe(true)
+        expect(validate({ status: "MAYBE", findings: [] })).toBe(false)
     })
 })
 
@@ -372,6 +438,33 @@ describe("parseClaudeOutput", () => {
             expect(out.ok).toBe(true)
             expect(out.value.status).toBe(expected)
         }
+    })
+
+    test("re-derives status from findings when the two disagree", () => {
+        // The schema the CLI enforces has no status<->findings
+        // conditional (the API rejects a top-level allOf), so a
+        // mismatch is now reachable. Findings win.
+        const f = {
+            file: "a.js",
+            line: 7,
+            severity: "major",
+            category: "bug",
+            message: "x",
+            suggestion: null,
+        }
+        const withFindings = parseClaudeOutput(
+            wrap({ status: "GOOD_TO_GO", findings: [f] }),
+            validator
+        )
+        expect(withFindings.ok).toBe(true)
+        expect(withFindings.value.status).toBe("ISSUES")
+
+        const empty = parseClaudeOutput(
+            wrap({ status: "ISSUES", findings: [] }),
+            validator
+        )
+        expect(empty.ok).toBe(true)
+        expect(empty.value.status).toBe("GOOD_TO_GO")
     })
 })
 
