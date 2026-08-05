@@ -21,6 +21,14 @@
 #   - the Stop + PostToolUse entries in ~/.codex/hooks.json
 #   - the code-review-loop skill in ~/.codex/skills/code-review-loop/
 #
+# Pass --opencode to ALSO wire opencode CLI as a main developer (additive):
+#   - ~/.config/opencode/plugin/review-orchestrator.js (auto-discovered;
+#     replaces both hooks AND the MCP config entry — see the plugin header)
+#   - ~/.config/review-orchestrator/lib/stop-review.mjs (the /review
+#     protocol the plugin imports; same file the other CLIs run as a hook)
+#   - the code-review-loop skill in ~/.config/opencode/skill/
+#   - the review-orchestrator block in ~/.config/opencode/AGENTS.md
+#
 # Pass --launch to also drop the launchd plist into
 # ~/Library/LaunchAgents and bootstrap it as a background agent.
 #
@@ -35,16 +43,22 @@ REPO_ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 LAUNCH=0
 DRY_RUN=0
 CODEX=0
+OPENCODE=0
 HOME_DIR="${HOME:-}"
 
 usage() {
     cat <<'EOF'
-Usage: ./install.sh [--codex] [--launch] [--dry-run] [--home <dir>] [--help]
+Usage: ./install.sh [--codex] [--opencode] [--launch] [--dry-run] [--home <dir>] [--help]
 
   --codex      Also wire codex CLI as a main developer (config.toml MCP
                entry, hooks.json Stop + PostToolUse, and the
                code-review-loop skill in ~/.codex). Additive — the Claude
                wiring still runs.
+  --opencode   Also wire opencode CLI as a main developer (the
+               review-orchestrator plugin, the shared protocol lib, the
+               code-review-loop skill, and the AGENTS.md block in
+               ~/.config/opencode). Additive. Restart opencode afterwards
+               — it loads config once at startup.
   --launch     Also install the launchd plist in ~/Library/LaunchAgents
                and bootstrap the daemon. Without this, the daemon must
                be started manually (npm start) for the MCP entry and
@@ -61,6 +75,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --codex) CODEX=1; shift ;;
+        --opencode) OPENCODE=1; shift ;;
         --launch) LAUNCH=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --home)
@@ -95,6 +110,11 @@ CODEX_NOTIFY_HOOK="$CODEX_HOOKS_DIR/notify-change.mjs"
 CODEX_CONFIG_TOML="$CODEX_DIR/config.toml"
 CODEX_HOOKS_JSON="$CODEX_DIR/hooks.json"
 CODEX_SKILL="$CODEX_DIR/skills/code-review-loop/SKILL.md"
+OPENCODE_DIR="$HOME_DIR/.config/opencode"
+OPENCODE_PLUGIN="$OPENCODE_DIR/plugin/review-orchestrator.js"
+OPENCODE_SKILL="$OPENCODE_DIR/skill/code-review-loop/SKILL.md"
+OPENCODE_AGENTS_MD="$OPENCODE_DIR/AGENTS.md"
+LIB_STOP_REVIEW="$CONFIG_DIR/lib/stop-review.mjs"
 LAUNCHAGENTS_DIR="$HOME_DIR/Library/LaunchAgents"
 PLIST_NAME="com.leo.review-orchestrator.plist"
 PLIST_DST="$LAUNCHAGENTS_DIR/$PLIST_NAME"
@@ -215,6 +235,7 @@ echo "review-orchestrator install"
 echo "  REPO_ROOT: $REPO_ROOT"
 echo "  HOME:      $HOME_DIR"
 echo "  --codex:   $([ "$CODEX" -eq 1 ] && echo yes || echo no)"
+echo "  --opencode:$([ "$OPENCODE" -eq 1 ] && echo " yes" || echo " no")"
 echo "  --launch:  $([ "$LAUNCH" -eq 1 ] && echo yes || echo no)"
 echo "  --dry-run: $([ "$DRY_RUN" -eq 1 ] && echo yes || echo no)"
 echo
@@ -283,6 +304,22 @@ if [ "$CODEX" -eq 1 ]; then
         "$CODEX_HOOKS_JSON" "$CODEX_STOP_HOOK" "$CODEX_NOTIFY_HOOK"
 else
     note "  skipped:   codex wiring (--codex not passed)"
+fi
+
+# 6d. (optional) opencode CLI as a main developer. opencode has no external
+# hook process and no blocking end-of-turn hook, so one auto-discovered
+# plugin covers all three jobs the other CLIs split across hooks + config:
+# MCP registration, change notification, and the end-of-turn review. It
+# imports the /review protocol from the installed copy of the same
+# stop-review.mjs the other two run, so the three clients cannot drift.
+if [ "$OPENCODE" -eq 1 ]; then
+    install_file_idempotent "$REPO_ROOT/hooks/stop-review.mjs" "$LIB_STOP_REVIEW" 0644 "opencode protocol lib"
+    install_file_idempotent "$REPO_ROOT/opencode/plugin/review-orchestrator.js" "$OPENCODE_PLUGIN" 0644 "opencode plugin"
+    install_file_idempotent "$REPO_ROOT/opencode/skill/SKILL.md" "$OPENCODE_SKILL" 0644 "opencode skill"
+    run_helper "~/.config/opencode/AGENTS.md (snippet)" "$REPO_ROOT/install/merge-claude-md.mjs" \
+        "$OPENCODE_AGENTS_MD" "$REPO_ROOT/opencode-agents-snippet.md"
+else
+    note "  skipped:   opencode wiring (--opencode not passed)"
 fi
 
 # 7. (optional) launchd
@@ -355,4 +392,8 @@ if [ "$LAUNCH" -eq 0 ]; then
     echo "Start the daemon now with:  (cd $REPO_ROOT && npm start)"
 else
     echo "review-orchestrator: install complete (launchd agent installed)."
+fi
+
+if [ "$OPENCODE" -eq 1 ]; then
+    echo "opencode loads its config once at startup — restart it to pick this up."
 fi

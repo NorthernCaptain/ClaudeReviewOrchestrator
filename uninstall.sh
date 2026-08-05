@@ -15,16 +15,20 @@ REPO_ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 LAUNCH=0
 DRY_RUN=0
 CODEX=0
+OPENCODE=0
 HOME_DIR="${HOME:-}"
 KEEP_CONFIG=0
 
 usage() {
     cat <<'EOF'
-Usage: ./uninstall.sh [--codex] [--launch] [--dry-run] [--home <dir>] [--keep-config] [--help]
+Usage: ./uninstall.sh [--codex] [--opencode] [--launch] [--dry-run] [--home <dir>] [--keep-config] [--help]
 
   --codex         Also remove the codex wiring (config.toml MCP table,
                   hooks.json entries, the code-review-loop skill, and the
                   ~/.codex/hooks scripts).
+  --opencode      Also remove the opencode wiring (the plugin, the shared
+                  protocol lib, the code-review-loop skill, and the
+                  AGENTS.md block in ~/.config/opencode).
   --launch        Also remove the launchd plist + bootout the agent.
   --dry-run       Print what would happen without writing.
   --home DIR      Operate on DIR/.config, DIR/.claude, DIR/.codex instead of $HOME.
@@ -37,6 +41,7 @@ EOF
 while [ $# -gt 0 ]; do
     case "$1" in
         --codex) CODEX=1; shift ;;
+        --opencode) OPENCODE=1; shift ;;
         --launch) LAUNCH=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --home)
@@ -71,6 +76,13 @@ CODEX_CONFIG_TOML="$CODEX_DIR/config.toml"
 CODEX_HOOKS_JSON="$CODEX_DIR/hooks.json"
 CODEX_SKILL_DIR="$CODEX_DIR/skills/code-review-loop"
 CODEX_SKILL="$CODEX_SKILL_DIR/SKILL.md"
+OPENCODE_DIR="$HOME_DIR/.config/opencode"
+OPENCODE_PLUGIN="$OPENCODE_DIR/plugin/review-orchestrator.js"
+OPENCODE_SKILL_DIR="$OPENCODE_DIR/skill/code-review-loop"
+OPENCODE_SKILL="$OPENCODE_SKILL_DIR/SKILL.md"
+OPENCODE_AGENTS_MD="$OPENCODE_DIR/AGENTS.md"
+LIB_DIR="$CONFIG_DIR/lib"
+LIB_STOP_REVIEW="$LIB_DIR/stop-review.mjs"
 PLIST_NAME="com.leo.review-orchestrator.plist"
 PLIST_DST="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME"
 
@@ -115,6 +127,7 @@ echo "review-orchestrator uninstall"
 echo "  REPO_ROOT:   $REPO_ROOT"
 echo "  HOME:        $HOME_DIR"
 echo "  --codex:     $([ "$CODEX" -eq 1 ] && echo yes || echo no)"
+echo "  --opencode:  $([ "$OPENCODE" -eq 1 ] && echo yes || echo no)"
 echo "  --launch:    $([ "$LAUNCH" -eq 1 ] && echo yes || echo no)"
 echo "  --dry-run:   $([ "$DRY_RUN" -eq 1 ] && echo yes || echo no)"
 echo "  keep config: $([ "$KEEP_CONFIG" -eq 1 ] && echo yes || echo no)"
@@ -157,6 +170,24 @@ if [ "$CODEX" -eq 1 ]; then
     fi
 fi
 
+# 4d. (optional) opencode wiring.
+if [ "$OPENCODE" -eq 1 ]; then
+    run_helper "~/.config/opencode/AGENTS.md (snippet)" "$REPO_ROOT/install/remove-claude-md.mjs" "$OPENCODE_AGENTS_MD"
+    remove_file_idempotent "$OPENCODE_PLUGIN" "opencode plugin"
+    remove_file_idempotent "$OPENCODE_SKILL" "opencode skill"
+    remove_file_idempotent "$LIB_STOP_REVIEW" "opencode protocol lib"
+    # Child dirs before their parents; the guard only rmdirs when empty, so
+    # a user's own plugins/skills keep those dirs alive.
+    for d in "$OPENCODE_SKILL_DIR" "$OPENCODE_DIR/skill" \
+        "$OPENCODE_DIR/plugin" "$LIB_DIR"; do
+        if [ -d "$d" ] && [ -z "$(ls -A "$d" 2>/dev/null)" ]; then
+            if maybe "rmdir $d"; then
+                rmdir "$d" 2>/dev/null && note "  removed:   empty dir ($d)" || true
+            fi
+        fi
+    done
+fi
+
 # 5. Hook files
 remove_file_idempotent "$HOOK_PATH" "Stop hook"
 remove_file_idempotent "$NOTIFY_HOOK_PATH" "PostToolUse hook"
@@ -167,6 +198,14 @@ if [ "$KEEP_CONFIG" -eq 1 ]; then
 else
     remove_file_idempotent "$HEADERS_SCRIPT" "mcp-headers.sh"
     remove_file_idempotent "$CONFIG_PATH" "config.json"
+    # lib/ is ours unconditionally, so it goes even without --opencode —
+    # otherwise it orphans here and the rmdir below silently fails.
+    remove_file_idempotent "$LIB_STOP_REVIEW" "protocol lib"
+    if [ -d "$LIB_DIR" ] && [ -z "$(ls -A "$LIB_DIR" 2>/dev/null)" ]; then
+        if maybe "rmdir $LIB_DIR"; then
+            rmdir "$LIB_DIR" 2>/dev/null && note "  removed:   lib dir ($LIB_DIR)" || true
+        fi
+    fi
     if [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR" 2>/dev/null)" ]; then
         if maybe "rmdir $CONFIG_DIR"; then
             rmdir "$CONFIG_DIR" 2>/dev/null && note "  removed:   config dir ($CONFIG_DIR)" || true

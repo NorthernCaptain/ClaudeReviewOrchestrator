@@ -705,6 +705,29 @@ registration shape differs.
 `./uninstall.sh --codex` reverses exactly these. Every step is idempotent
 and writes a `.bak` only when bytes change, same as the Claude path.
 
+`./install.sh --opencode` is likewise additive and:
+
+1. Copies `hooks/stop-review.mjs` to
+   `~/.config/review-orchestrator/lib/stop-review.mjs` — not as a hook, but
+   as the module the plugin imports for the `/review` protocol and the
+   status→decision mapping. It lives under our own config dir because
+   opencode scans its `plugin/` dir and would try to load a stray module
+   there as a plugin.
+2. Copies `opencode/plugin/review-orchestrator.js` to
+   `~/.config/opencode/plugin/` (auto-discovered — no `opencode.json` edit,
+   so the `X-Review-Token` never lands in opencode's config).
+3. Installs the `code-review-loop` skill at
+   `~/.config/opencode/skill/code-review-loop/SKILL.md`.
+4. Appends the `opencode-agents-snippet.md` block to
+   `~/.config/opencode/AGENTS.md` (same marker-delimited merge as
+   `CLAUDE.md`, so hand-written content around it survives).
+
+`./uninstall.sh --opencode` reverses exactly these. opencode reads its
+config once at startup — restart it after installing. See
+[§5b](#5b-client-clis-who-calls-the-orchestrator) for the two opencode
+constraints (single-export plugin modules; the automatic review needs a
+long-lived server).
+
 Note: running codex as the developer **and** as the default reviewer is
 fine — the reviewer subprocess is spawned with `REVIEW_ORCH_SKIP=1`, so the
 reviewer's own `Stop` hook short-circuits instead of recursing into
@@ -848,6 +871,47 @@ text.
 The snippet must tell Claude to **always pass `cwd`** to `request_review`
 and `reset_review_context`, using the current working directory of the
 session.
+
+### 5b. Client CLIs (who calls the orchestrator)
+
+Three CLIs can drive the loop. All three hit the same `/review`, `/mcp` and
+`/notify-change` endpoints with the same `X-Review-Token`, and all three
+send `trigger: "stop_hook"` for the end-of-turn review, so the server's
+round/block accounting, `NO_PROGRESS` detection and `MAX_BLOCKS` cap behave
+identically no matter who is calling.
+
+| | Claude Code | codex | opencode |
+|---|---|---|---|
+| Installed by | `install.sh` (default) | `install.sh --codex` | `install.sh --opencode` |
+| MCP entry | `mcpServers.review` in `~/.claude.json` (token via `headersHelper`) | `[mcp_servers.review]` in `~/.codex/config.toml` (token inline, 0600) | injected at startup by the plugin's `config` hook (token never written to opencode's config) |
+| End-of-turn review | `Stop` hook → `decision: "block"` | `Stop` hook in `~/.codex/hooks.json` | plugin `event` hook on `session.idle` → findings sent back via `session.promptAsync` |
+| Change notification | `PostToolUse` on `Write\|Edit\|MultiEdit` | `PostToolUse` on `apply_patch` / `exec_command` | plugin `tool.execute.after` on `write` / `edit` / `patch` / `bash` |
+| Guidance | block in `~/.claude/CLAUDE.md` | skill in `~/.codex/skills/` | skill in `~/.config/opencode/skill/` + block in `~/.config/opencode/AGENTS.md` |
+
+opencode differs in kind, not just in registration shape, because it has no
+external hook processes at all — it has **plugins**: JS modules
+auto-discovered from a config scope's `plugin/` dir. One plugin
+([`opencode/plugin/review-orchestrator.js`](./opencode/plugin/review-orchestrator.js))
+therefore covers all three jobs. Two constraints found by probing opencode
+1.18.13 and worth knowing before editing it:
+
+- **A plugin module must export ONLY the plugin.** opencode treats every
+  export as a plugin candidate; one non-`Plugin` export makes it skip the
+  module silently — no error, no hooks, nothing in the log. The plugin's
+  test seams are therefore extra keys on its input object, not extra
+  exports.
+- **The end-of-turn review needs a long-lived server** (TUI or
+  `opencode serve`). Headless `opencode run` exits as the turn ends and
+  aborts the in-flight review, so there the agent must call
+  `request_review` itself — which the skill tells it to do.
+
+Because opencode has no blocking-hook primitive, "blocking" is a new user
+turn carrying the review's block reason. The reason text is produced by the
+same `decideStopHookResponse` the Claude hook uses: the plugin imports it
+from the installed copy of `hooks/stop-review.mjs`
+(`~/.config/review-orchestrator/lib/stop-review.mjs`) rather than
+reimplementing the status→decision mapping, so the three clients cannot
+drift on the one contract they must share.
 
 ### 6. Reviewer providers
 
@@ -1364,17 +1428,24 @@ limits are in v1 — not deferred.
     notify-change.mjs          // Node PostToolUse hook (shared)
   codex/
     skill/SKILL.md             // code-review-loop skill → ~/.codex/skills/...
+  opencode/
+    plugin/review-orchestrator.js  // the whole opencode integration (one plugin)
+    skill/SKILL.md             // code-review-loop skill → ~/.config/opencode/skill/...
   launchd/
     com.leo.review-orchestrator.plist
   claude-mcp.json              // MCP entry to merge into ~/.claude.json
   claude-md-snippet.md         // guidance text appended to ~/.claude/CLAUDE.md
-  install.sh                   // launchd, hook copy, Claude (+ --codex) config, token gen
+  opencode-agents-snippet.md   // guidance appended to ~/.config/opencode/AGENTS.md
+  install.sh                   // launchd, hook copy, Claude (+ --codex/--opencode) config, token gen
   README.md                    // this file
   ```
 
   `install/` also holds the codex wiring helpers: `merge-codex-mcp.mjs`
   (config.toml MCP table), `merge-codex-hooks.mjs` (hooks.json), and their
-  `remove-codex-*` counterparts.
+  `remove-codex-*` counterparts. The opencode path needs no new helper —
+  its plugin is a plain file copy, and its AGENTS.md block reuses
+  `merge-claude-md.mjs` / `remove-claude-md.mjs` (both take the target path
+  as an argument and key off the same markers).
 
 ### Phase 1 — Minimum viable server with auth & size limits
 

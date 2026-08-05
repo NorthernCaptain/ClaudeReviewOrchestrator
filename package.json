@@ -1,6 +1,6 @@
 {
     "name": "review-orchestrator",
-    "version": "1.1.39",
+    "version": "1.1.40",
     "private": true,
     "description": "Local code-review orchestrator for Claude Code, using Codex CLI as a meticulous read-only reviewer.",
     "type": "module",
@@ -13,7 +13,7 @@
         "test": "NODE_OPTIONS=--experimental-vm-modules jest --passWithNoTests",
         "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
         "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage --passWithNoTests",
-        "lint": "eslint server hooks install",
+        "lint": "eslint server hooks install opencode",
         "format": "prettier --write ."
     },
     "author": "Leo Khramov",
@@ -43,12 +43,14 @@
         "testMatch": [
             "<rootDir>/server/**/*.test.js",
             "<rootDir>/hooks/**/*.test.mjs",
-            "<rootDir>/install/**/*.test.mjs"
+            "<rootDir>/install/**/*.test.mjs",
+            "<rootDir>/opencode/**/*.test.js"
         ],
         "collectCoverageFrom": [
             "server/src/**/*.js",
             "hooks/**/*.mjs",
             "install/**/*.mjs",
+            "opencode/**/*.js",
             "!**/*.test.js",
             "!**/*.test.mjs"
         ],
