@@ -237,6 +237,53 @@ describe("handleSetReviewerPreset", () => {
         )
     })
 
+    test("catalog lists the newest generation first with every effort", () => {
+        const models = (provider) => [
+            ...new Set(REVIEWER_PRESETS[provider].map((p) => p.model)),
+        ]
+        expect(models("codex").slice(0, 3)).toEqual([
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "gpt-6-luna",
+        ])
+        expect(models("claude").slice(0, 3)).toEqual([
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+        ])
+        for (const model of [
+            "gpt-6-sol",
+            "gpt-6-astra",
+            "gpt-6-luna",
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+        ]) {
+            const provider = model.startsWith("gpt") ? "codex" : "claude"
+            expect(
+                REVIEWER_PRESETS[provider]
+                    .filter((p) => p.model === model)
+                    .map((p) => p.id)
+            ).toEqual([`${model}:xhigh`, `${model}:high`, `${model}:medium`])
+        }
+    })
+
+    test("applies a new-generation Claude preset", () => {
+        const config = { reviewer: { provider: "claude", claude: {} } }
+        const fs = makeFs(JSON.stringify(config))
+        const r = handleSetReviewerPreset({
+            body: { preset: "claude-fable-5-1:xhigh" },
+            config,
+            configPath: "/cfg.json",
+            deps: { fs },
+        })
+        expect(r.httpStatus).toBe(200)
+        expect(JSON.parse(fs.__store.content).reviewer.claude).toMatchObject({
+            model: "claude-fable-5-1",
+            effort: "xhigh",
+        })
+    })
+
     test("orders effort variants from xhigh through medium for each model", () => {
         expect(
             REVIEWER_PRESETS.codex

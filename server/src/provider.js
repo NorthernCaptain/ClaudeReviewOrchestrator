@@ -20,11 +20,56 @@ import { defaultConfigPath } from "./config.js"
 
 export const VALID_PROVIDERS = ["codex", "claude", "gemini"]
 
-// Curated, CLI-compatible reviewer choices for the dashboard. Claude's
-// aliases deliberately track the latest model in each family; Gemini's
-// explicit names are the current coding-capable choices, plus its router.
+// Curated, CLI-compatible reviewer choices for the dashboard, newest
+// generation first. Gemini's explicit names are the current coding-capable
+// choices, plus its router.
 export const REVIEWER_PRESETS = {
     codex: [
+        {
+            id: "gpt-6-sol:xhigh",
+            model: "gpt-6-sol",
+            effortOrMode: "xhigh",
+        },
+        {
+            id: "gpt-6-sol:high",
+            model: "gpt-6-sol",
+            effortOrMode: "high",
+        },
+        {
+            id: "gpt-6-sol:medium",
+            model: "gpt-6-sol",
+            effortOrMode: "medium",
+        },
+        {
+            id: "gpt-6-astra:xhigh",
+            model: "gpt-6-astra",
+            effortOrMode: "xhigh",
+        },
+        {
+            id: "gpt-6-astra:high",
+            model: "gpt-6-astra",
+            effortOrMode: "high",
+        },
+        {
+            id: "gpt-6-astra:medium",
+            model: "gpt-6-astra",
+            effortOrMode: "medium",
+        },
+        {
+            id: "gpt-6-luna:xhigh",
+            model: "gpt-6-luna",
+            effortOrMode: "xhigh",
+        },
+        {
+            id: "gpt-6-luna:high",
+            model: "gpt-6-luna",
+            effortOrMode: "high",
+        },
+        {
+            id: "gpt-6-luna:medium",
+            model: "gpt-6-luna",
+            effortOrMode: "medium",
+        },
         {
             id: "gpt-5.6-sol:xhigh",
             model: "gpt-5.6-sol",
@@ -76,6 +121,51 @@ export const REVIEWER_PRESETS = {
         { id: "gpt-5.5:low", model: "gpt-5.5", effortOrMode: "low" },
     ],
     claude: [
+        {
+            id: "claude-opus-5-5:xhigh",
+            model: "claude-opus-5-5",
+            effortOrMode: "xhigh",
+        },
+        {
+            id: "claude-opus-5-5:high",
+            model: "claude-opus-5-5",
+            effortOrMode: "high",
+        },
+        {
+            id: "claude-opus-5-5:medium",
+            model: "claude-opus-5-5",
+            effortOrMode: "medium",
+        },
+        {
+            id: "claude-fable-5-1:xhigh",
+            model: "claude-fable-5-1",
+            effortOrMode: "xhigh",
+        },
+        {
+            id: "claude-fable-5-1:high",
+            model: "claude-fable-5-1",
+            effortOrMode: "high",
+        },
+        {
+            id: "claude-fable-5-1:medium",
+            model: "claude-fable-5-1",
+            effortOrMode: "medium",
+        },
+        {
+            id: "claude-sonnet-5-5:xhigh",
+            model: "claude-sonnet-5-5",
+            effortOrMode: "xhigh",
+        },
+        {
+            id: "claude-sonnet-5-5:high",
+            model: "claude-sonnet-5-5",
+            effortOrMode: "high",
+        },
+        {
+            id: "claude-sonnet-5-5:medium",
+            model: "claude-sonnet-5-5",
+            effortOrMode: "medium",
+        },
         {
             id: "claude-opus-5:xhigh",
             model: "claude-opus-5",
