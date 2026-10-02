@@ -168,21 +168,17 @@ const ConfigSchema = z
             .default({}),
         ignorePaths: z.array(z.string()).default(DEFAULT_IGNORE_PATHS),
         // Payload-shaping options. fallbackToHead lets buildPayload
-        // review the most recent commit range when the working tree is
-        // clean — catches the "I committed before the Stop hook fired"
+        // review the most recent commit range when the working tree has
+        // no reviewable change (clean, or only ignorePaths files changed)
+        // — catches the "I committed before the Stop hook fired"
         // case. Range resolution: merge-base(HEAD, @{upstream})..HEAD
         // when an upstream exists, otherwise HEAD~1..HEAD. Cache logic
         // is unchanged: the resulting payload is byte-deterministic
         // for a given HEAD so repeat Stop hooks hit NO_CHANGES.
         //
-        // verifyCleanTree adds a `git status --porcelain -z` probe to
-        // the change-notification fast path. Default false — trusts
-        // the dirty flag set by the PostToolUse hook. Turn ON if you
-        // also edit files outside Claude (IDE auto-save, terminal
-        // edits) and want the fast path to defer in those cases. The
-        // HEAD-equality probe runs unconditionally either way; that
-        // one is correctness-critical (catches commit/pull/rebase
-        // outside Claude) and remains a cheap ~3ms rev-parse.
+        // verifyCleanTree is deprecated and ignored: the fast path now
+        // always probes the working tree. Still accepted because the
+        // schema is strict and older installers wrote it to disk.
         payload: z
             .object({
                 fallbackToHead: z.boolean().default(false),

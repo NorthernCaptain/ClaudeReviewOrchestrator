@@ -4,7 +4,7 @@
  */
 
 import { jest } from "@jest/globals"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -52,6 +52,7 @@ const happyContext = {
 // seed that wants to hit the unchanged branch must include the hash for
 // the config it's testing under.
 const seededBaseline = (progressHash, cfg = minimalConfig()) => ({
+    headSha: "abc1234",
     progressHash,
     reviewConfigHash: computeReviewConfigHash(cfg),
 })
@@ -71,6 +72,8 @@ const makePayload = (overrides = {}) => ({
     promptHash: "p-hash-1",
     progressHash: "g-hash-1",
     priorFindingPaths: [],
+    blockHashes: ["block-a.js"],
+    contentHashes: ["content-a.js"],
     empty: false,
     nonBinaryFileCount: 1,
     ...overrides,
@@ -1372,6 +1375,7 @@ describe("handleReview — reviewConfigHash invalidation", () => {
             codexRounds: 1,
             blockCount: 0,
             lastBaseline: {
+                headSha: "abc1234",
                 progressHash: "g-hash-1",
                 reviewConfigHash: computeReviewConfigHash(merged),
             },
@@ -2248,7 +2252,7 @@ describe("computeReviewConfigHash — payload.fallbackToHead", () => {
         expect(absent).toBe(off)
     })
 
-    test("flipping payload.verifyCleanTree also busts the cache", () => {
+    test("deprecated payload.verifyCleanTree does not affect the hash", () => {
         const off = computeReviewConfigHash({
             blockingSeverities: ["blocker", "major"],
             ignorePaths: [],
@@ -2263,7 +2267,7 @@ describe("computeReviewConfigHash — payload.fallbackToHead", () => {
             limits: {},
             payload: { verifyCleanTree: true },
         })
-        expect(off).not.toBe(on)
+        expect(off).toBe(on)
     })
 
     // v0.1.23 — provider is part of the review policy.
@@ -2704,25 +2708,12 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
         expect(runSpy).not.toHaveBeenCalled()
     })
 
-    test("with verifyCleanTree=true, falls through when tree probe disagrees (IDE-edit guard)", async () => {
-        // payload.verifyCleanTree must be ON for the second probe to
-        // run. HEAD matches the cached baseline but the tree is dirty
-        // — e.g. the user edited in their IDE without a PostToolUse
-        // ping. Fast path MUST defer so the edits get reviewed.
+    test("without a dirty signal, reviews edits made outside the hook (e.g. a Bash-run script)", async () => {
+        // dirty=false and HEAD matches, but a script rewrote a file
+        // without firing PostToolUse. The tree probe must catch it and
+        // the changed progressHash must send it to the reviewer.
         seed()
-        const cfg = { ...minimalConfig() }
-        cfg.payload = { ...(cfg.payload ?? {}), verifyCleanTree: true }
-        const buildSpy = jest.fn(() =>
-            makePayload({
-                files: {
-                    modified: [{ path: "a.js" }],
-                    untracked: [],
-                    deleted: [],
-                    renamed: [],
-                    priorFindingContext: [],
-                },
-            })
-        )
+        const buildSpy = jest.fn(() => makePayload({ progressHash: "changed" }))
         const runSpy = jest.fn(async () => ({
             status: "GOOD_TO_GO",
             findings: [],
@@ -2730,7 +2721,7 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
         }))
         const r = await handleReview({
             body: { cwd: "/repo", trigger: "stop_hook" },
-            config: cfg,
+            config: minimalConfig(),
             store,
             deps: makeDeps({
                 buildPayload: buildSpy,
@@ -2740,20 +2731,41 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             }),
         })
         expect(buildSpy).toHaveBeenCalled()
+        expect(runSpy).toHaveBeenCalledTimes(1)
         expect(r.body.status).toBe("GOOD_TO_GO")
     })
 
-    test("with verifyCleanTree=false (default), trusts the dirty flag and skips the tree probe", async () => {
-        // Even if the tree IS dirty (e.g. an IDE edit slipped past
-        // the PostToolUse hook), with verifyCleanTree off the fast
-        // path trusts dirty=false → returns NO_CHANGES. This is the
-        // user-opted-in trade-off when they work mostly via Claude.
+    test("without a dirty signal, an uncommitted diff identical to the last review is NO_CHANGES without a reviewer run", async () => {
+        // The usual post-GOOD_TO_GO state: reviewed edits are still
+        // uncommitted, so the tree probe says dirty. The progressHash
+        // comparison is what decides there is nothing new.
         seed()
-        const treeCleanSpy = jest.fn(() => false) // would say "dirty" if asked
-        const buildSpy = jest.fn()
+        const runSpy = jest.fn()
         const r = await handleReview({
             body: { cwd: "/repo", trigger: "stop_hook" },
-            config: minimalConfig(), // verifyCleanTree omitted → defaults off
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({ progressHash: "p", headSha: "abc" }),
+                runAndParse: runSpy,
+                currentHeadSha: () => "abc",
+                isWorkingTreeClean: () => false,
+            }),
+        })
+        expect(r.body.status).toBe("NO_CHANGES")
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+
+    test("legacy payload.verifyCleanTree=false no longer skips the tree probe", async () => {
+        seed()
+        const cfg = { ...minimalConfig() }
+        cfg.payload = { ...(cfg.payload ?? {}), verifyCleanTree: false }
+        const treeCleanSpy = jest.fn(() => false)
+        const buildSpy = jest.fn(() => makePayload({ progressHash: "changed" }))
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: cfg,
             store,
             deps: makeDeps({
                 buildPayload: buildSpy,
@@ -2771,10 +2783,181 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                 isWorkingTreeClean: treeCleanSpy,
             }),
         })
-        expect(r.body.status).toBe("NO_CHANGES")
-        // Tree probe is NOT called when the setting is off.
+        expect(treeCleanSpy).toHaveBeenCalledTimes(1)
+        expect(buildSpy).toHaveBeenCalled()
+    })
+
+    test("a dirty signal skips the git probes and goes straight to payload build + review", async () => {
+        seed({ dirtySinceLastReview: true })
+        const headSpy = jest.fn(() => "abc")
+        const treeCleanSpy = jest.fn(() => true)
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw: { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" },
+        }))
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () => makePayload({ progressHash: "changed" }),
+                runAndParse: runSpy,
+                currentHeadSha: headSpy,
+                isWorkingTreeClean: treeCleanSpy,
+            }),
+        })
+        expect(headSpy).not.toHaveBeenCalled()
         expect(treeCleanSpy).not.toHaveBeenCalled()
-        expect(buildSpy).not.toHaveBeenCalled()
+        expect(runSpy).toHaveBeenCalledTimes(1)
+        expect(r.body.status).toBe("GOOD_TO_GO")
+    })
+
+    describe("with payload.fallbackToHead on and a clean tree", () => {
+        const fallbackConfig = () => {
+            const cfg = { ...minimalConfig() }
+            cfg.payload = { ...(cfg.payload ?? {}), fallbackToHead: true }
+            return cfg
+        }
+        const seedSource = (source, baseSha = null) => {
+            const cfg = fallbackConfig()
+            seed({
+                lastBaseline: {
+                    headSha: "abc",
+                    progressHash: "p",
+                    reviewConfigHash: computeReviewConfigHash(cfg),
+                    source,
+                    baseSha,
+                    files: {
+                        modified: [],
+                        untracked: [],
+                        deleted: [],
+                        renamed: [],
+                        priorFindingContext: [],
+                    },
+                    totalBytes: 0,
+                    truncated: false,
+                },
+            })
+            return cfg
+        }
+
+        test("builds the payload when the cached baseline is a working-tree review", async () => {
+            // Reviewed uncommitted edits were since discarded: buildPayload
+            // would now review the commit range, which the cached
+            // working-tree verdict never covered.
+            const cfg = seedSource("working-tree")
+            const buildSpy = jest.fn(() =>
+                makePayload({ source: "head-fallback", progressHash: "range" })
+            )
+            const runSpy = jest.fn(async () => ({
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }))
+            const r = await handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook" },
+                config: cfg,
+                store,
+                deps: makeDeps({
+                    buildPayload: buildSpy,
+                    runAndParse: runSpy,
+                    currentHeadSha: () => "abc",
+                    isWorkingTreeClean: () => true,
+                }),
+            })
+            expect(buildSpy).toHaveBeenCalled()
+            expect(runSpy).toHaveBeenCalledTimes(1)
+            expect(r.body.status).toBe("GOOD_TO_GO")
+        })
+
+        test("fast-paths NO_CHANGES when the cached baseline is the same head-fallback range", async () => {
+            const cfg = seedSource("head-fallback", "base1")
+            const buildSpy = jest.fn()
+            const r = await handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook" },
+                config: cfg,
+                store,
+                deps: makeDeps({
+                    buildPayload: buildSpy,
+                    runAndParse: jest.fn(),
+                    currentHeadSha: () => "abc",
+                    isWorkingTreeClean: () => true,
+                    resolveFallbackBase: () => "base1",
+                }),
+            })
+            expect(r.body.status).toBe("NO_CHANGES")
+            expect(buildSpy).not.toHaveBeenCalled()
+        })
+
+        test("builds the payload when the upstream merge-base moved without HEAD moving", async () => {
+            const cfg = seedSource("head-fallback", "base1")
+            const buildSpy = jest.fn(() =>
+                makePayload({
+                    source: "head-fallback",
+                    baseSha: "base2",
+                    progressHash: "range2",
+                })
+            )
+            const runSpy = jest.fn(async () => ({
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }))
+            const r = await handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook" },
+                config: cfg,
+                store,
+                deps: makeDeps({
+                    buildPayload: buildSpy,
+                    runAndParse: runSpy,
+                    currentHeadSha: () => "abc",
+                    isWorkingTreeClean: () => true,
+                    resolveFallbackBase: () => "base2",
+                }),
+            })
+            expect(buildSpy).toHaveBeenCalled()
+            expect(runSpy).toHaveBeenCalledTimes(1)
+            expect(r.body.status).toBe("GOOD_TO_GO")
+        })
+
+        test("does not resolve the fallback base for a working-tree baseline", async () => {
+            const cfg = seedSource("working-tree")
+            const baseSpy = jest.fn(() => "base1")
+            await handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook" },
+                config: cfg,
+                store,
+                deps: makeDeps({
+                    buildPayload: () =>
+                        makePayload({ source: "head-fallback" }),
+                    runAndParse: async () => ({
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                        raw: {
+                            exitCode: 0,
+                            durationMs: 1,
+                            rawStdout: "{}",
+                            rawStderr: "",
+                        },
+                    }),
+                    currentHeadSha: () => "abc",
+                    isWorkingTreeClean: () => true,
+                    resolveFallbackBase: baseSpy,
+                }),
+            })
+            expect(baseSpy).not.toHaveBeenCalled()
+        })
     })
 
     test("falls through when HEAD has moved (commit/pull/rebase outside Claude)", async () => {
@@ -3145,7 +3328,7 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
             lastResultStatus: "ESCALATE",
             lastEscalateReason: "old fail",
             lastBaseline: {
-                headSha: "abc",
+                headSha: "abc1234",
                 progressHash: "p",
                 reviewConfigHash: computeReviewConfigHash(minimalConfig()),
                 files: {
@@ -3197,7 +3380,7 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
             lastResultStatus: "ESCALATE",
             lastEscalateReason: "old fail",
             lastBaseline: {
-                headSha: "abc",
+                headSha: "abc1234",
                 progressHash: "p",
                 reviewConfigHash: computeReviewConfigHash(minimalConfig()),
                 files: {
@@ -4004,7 +4187,7 @@ describe("handleReview — NO_PROGRESS fall-through when priorFindings empty (v0
                 },
             ],
             lastBaseline: {
-                headSha: "abc",
+                headSha: "abc1234",
                 progressHash: "p",
                 reviewConfigHash: computeReviewConfigHash(minimalConfig()),
                 files: {
@@ -4977,5 +5160,535 @@ describe("handleReview — remove-mid-run preserves priorFindings cache (v1.1.4)
         // Defense-in-depth: the next Stop event won't trigger an
         // empty-cache NO_PROGRESS_WITH_OPEN_ISSUES loop because the
         // cache has the blocker the response showed.
+    })
+})
+
+describe("handleReview — baseline after a passing review clears prior findings", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const priorFinding = {
+        file: "a.js",
+        line: 1,
+        severity: "major",
+        category: "bug",
+        message: "fixed since",
+    }
+    const raw = { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" }
+    // Like the real buildPayload, the hash depends on the prior set.
+    const payloadForPriors = ({ priorFindings }) =>
+        priorFindings.length > 0
+            ? makePayload({
+                  progressHash: "with-priors",
+                  priorFindingPaths: ["a.js"],
+              })
+            : makePayload({ progressHash: "prior-free" })
+    const seedIssues = () =>
+        store.save(happyContext.key, {
+            ...happyContext,
+            lastResultStatus: "ISSUES",
+            priorFindings: [priorFinding],
+            lastBaseline: seededBaseline("old"),
+            dirtySinceLastReview: true,
+        })
+    const savedBaseline = () => store.get(happyContext).lastBaseline
+
+    test("a forced GOOD_TO_GO over open priors lets the next Stop hook short-circuit NO_CHANGES", async () => {
+        seedIssues()
+        const build = jest.fn(payloadForPriors)
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw,
+        }))
+        const deps = makeDeps({
+            buildPayload: build,
+            runAndParse: runSpy,
+            currentHeadSha: () => "abc1234",
+            // Reviewed edits are still uncommitted.
+            isWorkingTreeClean: () => false,
+        })
+        const forced = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", force: true },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        expect(forced.body.status).toBe("GOOD_TO_GO")
+        expect(savedBaseline().progressHash).toBe("prior-free")
+        expect(build).toHaveBeenCalledTimes(2)
+        expect(build.mock.calls[1][0].priorFindings).toEqual([])
+
+        const stop = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        expect(stop.body.status).toBe("NO_CHANGES")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("an ISSUES result keeps the reviewed baseline, still fast-path eligible", async () => {
+        seedIssues()
+        const build = jest.fn(payloadForPriors)
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: build,
+                runAndParse: async () => ({
+                    status: "ISSUES",
+                    findings: [priorFinding],
+                    raw,
+                }),
+            }),
+        })
+        expect(r.body.status).toBe("ISSUES")
+        expect(savedBaseline().progressHash).toBe("with-priors")
+        expect(savedBaseline().fastPathEligible).toBeUndefined()
+    })
+
+    test("a cached NO_PROGRESS_WITH_OPEN_ISSUES skips the prior-free build", async () => {
+        store.save(happyContext.key, {
+            ...happyContext,
+            lastResultStatus: "ISSUES",
+            priorFindings: [priorFinding],
+            lastBaseline: seededBaseline("with-priors"),
+            dirtySinceLastReview: true,
+        })
+        const build = jest.fn(payloadForPriors)
+        const runSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: build, runAndParse: runSpy }),
+        })
+        expect(r.body.status).toBe("NO_PROGRESS_WITH_OPEN_ISSUES")
+        expect(build).toHaveBeenCalledTimes(1)
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+
+    test("builds the prior-free payload before the reviewer runs", async () => {
+        seedIssues()
+        const order = []
+        const build = jest.fn((args) => {
+            order.push(
+                args.priorFindings.length > 0 ? "reviewed" : "prior-free"
+            )
+            return payloadForPriors(args)
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: build,
+                runAndParse: async () => {
+                    order.push("reviewer")
+                    return { status: "GOOD_TO_GO", findings: [], raw }
+                },
+            }),
+        })
+        expect(order).toEqual(["reviewed", "prior-free", "reviewer"])
+        expect(savedBaseline().fastPathEligible).toBeUndefined()
+    })
+
+    test("a rejected prior-free baseline can't be served by the clean-tree fast path", async () => {
+        // fallbackToHead with a clean tree at the same HEAD and base would
+        // otherwise return NO_CHANGES from the with-priors baseline and
+        // never review the file that dropping the priors exposed.
+        const cfg = minimalConfig()
+        cfg.payload = { ...(cfg.payload ?? {}), fallbackToHead: true }
+        store.save(happyContext.key, {
+            ...happyContext,
+            lastResultStatus: "ISSUES",
+            priorFindings: [priorFinding],
+            lastBaseline: seededBaseline("old", cfg),
+            dirtySinceLastReview: true,
+        })
+        const range = { source: "head-fallback", baseSha: "base1" }
+        const build = jest.fn(({ priorFindings }) =>
+            priorFindings.length > 0
+                ? makePayload({
+                      ...range,
+                      progressHash: "with-priors",
+                      priorFindingPaths: ["ignored.lock"],
+                      blockHashes: ["block-ignored.lock"],
+                  })
+                : makePayload({
+                      ...range,
+                      progressHash: "prior-free",
+                      blockHashes: ["block-a.js"],
+                  })
+        )
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw,
+        }))
+        const deps = makeDeps({
+            buildPayload: build,
+            runAndParse: runSpy,
+            currentHeadSha: () => "abc1234",
+            isWorkingTreeClean: () => true,
+            resolveFallbackBase: () => "base1",
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: cfg,
+            store,
+            deps,
+        })
+        expect(savedBaseline()).toMatchObject({
+            progressHash: "with-priors",
+            fastPathEligible: false,
+        })
+
+        const stop = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: cfg,
+            store,
+            deps,
+        })
+        expect(stop.body.status).toBe("GOOD_TO_GO")
+        expect(runSpy).toHaveBeenCalledTimes(2)
+        // The fresh review was prior-free, so its baseline is eligible again.
+        expect(savedBaseline().fastPathEligible).toBeUndefined()
+    })
+
+    test("a GOOD_TO_GO with no priors fed in does not rebuild", async () => {
+        const build = jest.fn(payloadForPriors)
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: build }),
+        })
+        expect(build).toHaveBeenCalledTimes(1)
+        expect(savedBaseline().progressHash).toBe("prior-free")
+    })
+
+    test("keeps the reviewed baseline when the prior-free build shows a block the reviewer never saw", async () => {
+        // Dropping an ignored flagged file freed payload budget, so the
+        // prior-free prompt now carries a file the reviewed one omitted.
+        seedIssues()
+        const build = jest.fn(({ priorFindings }) =>
+            priorFindings.length > 0
+                ? makePayload({
+                      progressHash: "with-priors",
+                      priorFindingPaths: ["ignored.lock"],
+                      blockHashes: ["block-ignored.lock", "block-a.js"],
+                  })
+                : makePayload({
+                      progressHash: "prior-free",
+                      blockHashes: ["block-a.js", "block-b.js"],
+                  })
+        )
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: build }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(build).toHaveBeenCalledTimes(2)
+        expect(savedBaseline().progressHash).toBe("with-priors")
+    })
+
+    test("keeps the reviewed baseline when the prior-free build has a fingerprint the reviewer never saw", async () => {
+        // A file changed between the two builds beyond what the prompt
+        // shows: same blocks, different content fingerprint.
+        seedIssues()
+        const build = jest.fn(({ priorFindings }) =>
+            priorFindings.length > 0
+                ? makePayload({
+                      progressHash: "with-priors",
+                      priorFindingPaths: ["a.js"],
+                  })
+                : makePayload({
+                      progressHash: "prior-free",
+                      contentHashes: ["content-a.js-edited"],
+                  })
+        )
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: build }),
+        })
+        expect(savedBaseline()).toMatchObject({
+            progressHash: "with-priors",
+            fastPathEligible: false,
+        })
+    })
+
+    test("keeps the reviewed baseline when HEAD moved between the two builds", async () => {
+        seedIssues()
+        const build = jest.fn(({ priorFindings }) =>
+            priorFindings.length > 0
+                ? makePayload({
+                      progressHash: "with-priors",
+                      priorFindingPaths: ["a.js"],
+                  })
+                : makePayload({ progressHash: "prior-free", headSha: "moved" })
+        )
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: build }),
+        })
+        expect(savedBaseline().progressHash).toBe("with-priors")
+    })
+
+    test("keeps the reviewed baseline when block lists are missing", async () => {
+        seedIssues()
+        const build = jest.fn(({ priorFindings }) =>
+            priorFindings.length > 0
+                ? makePayload({
+                      progressHash: "with-priors",
+                      priorFindingPaths: ["a.js"],
+                  })
+                : makePayload({
+                      progressHash: "prior-free",
+                      blockHashes: undefined,
+                  })
+        )
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: build }),
+        })
+        expect(savedBaseline().progressHash).toBe("with-priors")
+    })
+
+    test("a failed re-baseline keeps the reviewed baseline and still reports GOOD_TO_GO", async () => {
+        seedIssues()
+        const build = jest
+            .fn(payloadForPriors)
+            .mockImplementationOnce(payloadForPriors)
+            .mockImplementationOnce(() => {
+                throw new Error("git vanished")
+            })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: build }),
+        })
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(savedBaseline().progressHash).toBe("with-priors")
+    })
+})
+
+describe("handleReview — cache hits require the same commit range", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const raw = { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" }
+    const fallbackConfig = () => {
+        const cfg = minimalConfig()
+        cfg.payload = { ...(cfg.payload ?? {}), fallbackToHead: true }
+        return cfg
+    }
+    const seed = (cfg, baseline) =>
+        store.save(happyContext.key, {
+            ...happyContext,
+            lastResultStatus: "GOOD_TO_GO",
+            // Dirty, so the fast path stays out of it: this is the
+            // post-build cache check.
+            dirtySinceLastReview: true,
+            lastBaseline: { ...seededBaseline("same", cfg), ...baseline },
+        })
+    const review = (cfg, payload) => {
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw,
+        }))
+        return handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: cfg,
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({ progressHash: "same", ...payload }),
+                runAndParse: runSpy,
+            }),
+        }).then((r) => ({ r, runSpy }))
+    }
+
+    test("reviews when the fallback merge-base moved under an identical progressHash", async () => {
+        const cfg = fallbackConfig()
+        seed(cfg, { source: "head-fallback", baseSha: "base1" })
+        const { r, runSpy } = await review(cfg, {
+            source: "head-fallback",
+            baseSha: "base2",
+        })
+        expect(runSpy).toHaveBeenCalledTimes(1)
+        expect(r.body.status).toBe("GOOD_TO_GO")
+    })
+
+    test("still hits NO_CHANGES for the same fallback range", async () => {
+        const cfg = fallbackConfig()
+        seed(cfg, { source: "head-fallback", baseSha: "base1" })
+        const { r, runSpy } = await review(cfg, {
+            source: "head-fallback",
+            baseSha: "base1",
+        })
+        expect(r.body.status).toBe("NO_CHANGES")
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+
+    test("reviews when HEAD differs under an identical progressHash", async () => {
+        seed(minimalConfig(), {})
+        const { runSpy } = await review(minimalConfig(), { headSha: "other" })
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("reviews when the payload's fingerprint is incomplete, even with a matching hash", async () => {
+        seed(minimalConfig(), {})
+        const { runSpy } = await review(minimalConfig(), {
+            fingerprintComplete: false,
+        })
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("treats a baseline without source as working-tree", async () => {
+        seed(minimalConfig(), { source: null })
+        const { r, runSpy } = await review(minimalConfig(), {
+            source: "working-tree",
+        })
+        expect(r.body.status).toBe("NO_CHANGES")
+        expect(runSpy).not.toHaveBeenCalled()
+    })
+})
+
+describe("handleReview — attempts since the last pass", () => {
+    let store
+    let archive
+    beforeEach(() => {
+        store = makeStoreInMemory()
+        archive = { write: jest.fn() }
+    })
+    afterEach(() => cleanupStore(store))
+
+    const raw = { exitCode: 0, durationMs: 1, rawStdout: "{}", rawStderr: "" }
+    const finding = {
+        file: "a.js",
+        line: 1,
+        severity: "major",
+        category: "bug",
+        message: "still broken",
+    }
+    let n = 0
+    const reviewWith = (status) =>
+        handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                // A fresh progressHash per call so no cache short-circuit.
+                buildPayload: () => makePayload({ progressHash: `p${++n}` }),
+                runAndParse: async () => ({
+                    status,
+                    findings: status === "ISSUES" ? [finding] : [],
+                    raw,
+                }),
+            }),
+        })
+    const lastArchived = () => archive.write.mock.calls.at(-1)[0]
+    const state = () => store.get(happyContext)
+
+    test("counts every review until a pass, across an idle reset of the round", async () => {
+        await reviewWith("ISSUES")
+        await reviewWith("ISSUES")
+        expect(state().attemptsSincePass).toBe(2)
+        // What the idle reset does: loop counters go, the attempt count stays.
+        store.save(happyContext.key, { ...state(), codexRounds: 0 })
+        await reviewWith("GOOD_TO_GO")
+        expect(lastArchived()).toMatchObject({ round: 1, attempt: 3 })
+        expect(state().attemptsSincePass).toBe(0)
+        await reviewWith("GOOD_TO_GO")
+        expect(lastArchived().attempt).toBe(1)
+    })
+
+    test("a pass with notes also clears the count", async () => {
+        await reviewWith("ISSUES")
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                buildPayload: () => makePayload({ progressHash: "notes" }),
+                runAndParse: async () => ({
+                    status: "GOOD_TO_GO",
+                    findings: [{ ...finding, severity: "minor" }],
+                    raw,
+                }),
+            }),
+        })
+        expect(lastArchived().attempt).toBe(2)
+        expect(state().attemptsSincePass).toBe(0)
+    })
+
+    test("a reviewer failure counts as an attempt", async () => {
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            archive,
+            deps: makeDeps({
+                runAndParse: async () => ({
+                    status: "ESCALATE",
+                    reason: "reviewer crashed",
+                    findings: [],
+                    raw,
+                }),
+            }),
+        })
+        expect(lastArchived().attempt).toBe(1)
+        expect(state().attemptsSincePass).toBe(1)
+    })
+
+    test("a context saved before the counter existed continues from its round", async () => {
+        // Only a state file written by an older build lacks the field;
+        // contexts the store creates start from blankContext.
+        writeFileSync(
+            path.join(store.__dir, "state.json"),
+            JSON.stringify({
+                version: 1,
+                contexts: {
+                    [happyContext.key]: {
+                        ...happyContext,
+                        codexRounds: 2,
+                        blockCount: 0,
+                        lastReviewedAt: 0,
+                        lastResultStatus: "ISSUES",
+                    },
+                },
+            })
+        )
+        // Reopen the same temp dir so cleanupStore still removes it.
+        const dir = store.__dir
+        store = createStateStore({
+            filePath: path.join(dir, "state.json"),
+            now: () => 0,
+        })
+        store.__dir = dir
+        await reviewWith("GOOD_TO_GO")
+        expect(lastArchived().attempt).toBe(3)
     })
 })

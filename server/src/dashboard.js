@@ -501,9 +501,11 @@ export const renderDurationPie = (records = []) => {
 
 // Good-to-go attempts pie (v1.1.14): of the reviews that reached
 // GOOD_TO_GO, how many got there on the 1st / 2nd / 3rd / 4th-or-later
-// round. `round` is the reviewer round stamped on each archived
-// review. The long tail is folded into "4+" so one slow convergence
-// doesn't shatter the chart. GOOD_TO_GO_WITH_NOTES is a separate
+// attempt. `attempt` counts reviewer runs since the last pass and,
+// unlike `round`, isn't reset by the idle timeout, so a slow fix still
+// counts every review it took; records archived before it existed fall
+// back to `round`. The long tail is folded into "4+" so one slow
+// convergence doesn't shatter the chart. GOOD_TO_GO_WITH_NOTES is a separate
 // terminal state and is intentionally excluded — this slice answers
 // "how often did we land a clean pass, and how fast".
 const ATTEMPT_BUCKETS = ["1", "2", "3", "4+"]
@@ -526,13 +528,33 @@ export const sumGoodToGoByAttempt = (records = []) => {
     const totals = { 1: 0, 2: 0, 3: 0, "4+": 0 }
     for (const r of records ?? []) {
         if (!r || r.status !== "GOOD_TO_GO") continue
-        const round = Number(r.round)
-        if (!Number.isFinite(round) || round < 1) continue
-        const key = round >= 4 ? "4+" : String(round)
+        const attempt = Number(r.attempt ?? r.round)
+        if (!Number.isFinite(attempt) || attempt < 1) continue
+        const key = attempt >= 4 ? "4+" : String(attempt)
         totals[key] += 1
     }
     const total = ATTEMPT_BUCKETS.reduce((s, k) => s + totals[k], 0)
     return { totals, total }
+}
+
+// The pie only covers clean passes, so the caption says what share of
+// the reviews that is and what the rest were.
+const OTHER_OUTCOMES = [
+    ["ISSUES", "with issues"],
+    ["GOOD_TO_GO_WITH_NOTES", "with notes"],
+    ["ESCALATE", "failed"],
+]
+export const attemptsChartCaption = (records = [], gtgTotal = 0) => {
+    const list = records ?? []
+    const counts = {}
+    for (const r of list) counts[r?.status] = (counts[r?.status] ?? 0) + 1
+    const rest = OTHER_OUTCOMES.filter(([status]) => counts[status] > 0).map(
+        ([status, label]) => `${counts[status]} ${label}`
+    )
+    const head =
+        `good-to-go attempts · ${gtgTotal} clean pass${gtgTotal === 1 ? "" : "es"}` +
+        ` of ${list.length} review${list.length === 1 ? "" : "s"}`
+    return rest.length > 0 ? `${head} · ${rest.join(" · ")}` : head
 }
 
 export const renderAttemptsPie = (records = []) => {
@@ -1453,6 +1475,7 @@ export const renderDashboard = ({
     const startedAtStr = startedAt ? fmtTs(startedAt) : "—"
     const totalDurationMs = sumDurationByStatus(records).total
     const gtgTotal = sumGoodToGoByAttempt(records).total
+    const attemptsCaption = attemptsChartCaption(records, gtgTotal)
     return `<!doctype html>
 <html lang="en">
 <head>
@@ -1492,7 +1515,7 @@ export const renderDashboard = ({
     </div>
     <div class="pie-wrap">
       ${renderAttemptsPie(records)}
-      <div class="label">good-to-go attempts · ${gtgTotal} clean pass${gtgTotal === 1 ? "" : "es"}</div>
+      <div class="label">${escapeHtml(attemptsCaption)}</div>
     </div>
   </div>
 </section>
@@ -2078,6 +2101,7 @@ export const __test__ = {
     renderDurationPie,
     sumDurationByStatus,
     renderAttemptsPie,
+    attemptsChartCaption,
     sumGoodToGoByAttempt,
     renderInFlight,
     renderControls,

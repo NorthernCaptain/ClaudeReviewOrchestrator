@@ -169,6 +169,7 @@ const buildRecord = ({
     priorFindingsFedIn,
     timestampMs,
     round,
+    attempt,
     blockCount,
 }) => ({
     timestamp: new Date(timestampMs).toISOString(),
@@ -182,6 +183,8 @@ const buildRecord = ({
     // the caller has zeroed the live counters for a terminal status but
     // wants the archive to reflect this round's actual count.
     round: round ?? state?.codexRounds ?? null,
+    // Reviewer runs since the last pass; unlike round, not reset by idle.
+    attempt: attempt ?? state?.attemptsSincePass ?? null,
     blockCount: blockCount ?? state?.blockCount ?? null,
     trigger,
     baseline: {
@@ -269,6 +272,7 @@ export const createArchive = ({
         trigger,
         priorFindingsFedIn = [],
         round,
+        attempt,
         blockCount,
     }) => {
         const ts = now()
@@ -296,6 +300,7 @@ export const createArchive = ({
             priorFindingsFedIn,
             timestampMs: ts,
             round,
+            attempt,
             blockCount,
         })
 
@@ -428,6 +433,7 @@ export const createArchive = ({
                 provider: codex.provider ?? null,
                 model: codex.model ?? null,
                 round: record.round ?? null,
+                attempt: record.attempt ?? null,
                 blockCount: record.blockCount ?? null,
                 trigger: record.trigger ?? null,
                 findings,

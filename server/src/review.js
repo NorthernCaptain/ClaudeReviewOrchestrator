@@ -9,6 +9,7 @@ import {
     buildPayload,
     currentHeadSha,
     isWorkingTreeClean,
+    resolveFallbackBase,
     sanitizeFindingPath,
 } from "./diff.js"
 import { pickReviewer, providerCfg, wrapPrompt } from "./reviewer.js"
@@ -66,11 +67,6 @@ export const computeReviewConfigHash = (config, providerOverride = null) => {
         // comparable. Including it here invalidates the cache on
         // flip, forcing a fresh review.
         fallbackToHead: config.payload?.fallbackToHead === true,
-        // Toggling verifyCleanTree changes whether the fast path is
-        // willing to short-circuit on the dirty flag alone. Bust the
-        // cache on flip so the operator sees the new behavior take
-        // effect on the very next review.
-        verifyCleanTree: config.payload?.verifyCleanTree === true,
         // Effective reviewer + model. A provider switch (server-wide or
         // per-call) invalidates the cached baseline so the newly
         // selected reviewer actually runs.
@@ -79,6 +75,56 @@ export const computeReviewConfigHash = (config, providerOverride = null) => {
     }
     return createHash("sha256").update(JSON.stringify(policy)).digest("hex")
 }
+
+// When prior findings shaped `payload`, builds the prior-free payload —
+// what the next request builds once a passing review clears them. Called
+// only once a reviewer run is certain (after the cache short-circuits and
+// round cap), right before it starts. It is an independent build, so an
+// edit landing between the two is caught by showsNothingUnreviewed.
+const buildPriorFreePayload = ({ build, repoRoot, config, payload, log }) => {
+    if ((payload.priorFindingPaths?.length ?? 0) === 0) return null
+    try {
+        return build({ repoRoot, config, priorFindings: [] })
+    } catch (err) {
+        log.warn(
+            { err: err?.message },
+            "prior-free payload build failed; next review will not short-circuit"
+        )
+        return null
+    }
+}
+
+// Reviewer runs since the last pass, counting this one. Contexts saved
+// before attemptsSincePass existed start from their current round.
+const nextAttempt = (state) =>
+    (state.attemptsSincePass ?? state.codexRounds ?? 0) + 1
+
+// Same HEAD and the same diff reference. With head-fallback the diff is
+// against a merge-base that can move while HEAD stays put, and a file
+// omitted by maxFiles can then diff differently with unchanged bytes,
+// modes and header. Baselines predating `source` were working-tree.
+const sameCommitRange = (a, b) =>
+    typeof a.headSha === "string" &&
+    a.headSha === b.headSha &&
+    (a.source ?? "working-tree") === (b.source ?? "working-tree") &&
+    (a.baseSha ?? null) === (b.baseSha ?? null)
+
+const allSeenIn = (candidate, reviewed) => {
+    if (!Array.isArray(candidate) || !Array.isArray(reviewed)) return false
+    const seen = new Set(reviewed)
+    return candidate.every((h) => seen.has(h))
+}
+
+// True when the reviewer already saw everything `candidate` captures:
+// same commit and range, and every prompt block and per-path fingerprint
+// (content, mode, rename source) also in `reviewed`. Dropping prior
+// findings only removes paths, so anything new means either freed budget
+// exposed an omitted file or the tree changed between the two builds.
+// Missing lists can't prove it, so they count as unreviewed.
+const showsNothingUnreviewed = (candidate, reviewed) =>
+    sameCommitRange(candidate, reviewed) &&
+    allSeenIn(candidate.blockHashes, reviewed.blockHashes) &&
+    allSeenIn(candidate.contentHashes, reviewed.contentHashes)
 
 // Concatenate the project-config static directive and the per-call
 // extra_instructions, in that order. Project guidance comes first so the
@@ -600,11 +646,14 @@ export const handleReview = async ({
             "state loaded"
         )
 
-        // Change-notification fast path (v0.1.11). When the PostToolUse
-        // hook hasn't pinged /notify-change since the last terminal
-        // success AND a shallow git probe confirms the working tree is
-        // actually clean (catches IDE / out-of-Claude edits), return
-        // NO_CHANGES immediately — no payload build, no hashing.
+        // Change-notification fast path. A /notify-change ping (dirty
+        // flag) goes straight to payload build + review. Without one we
+        // can't trust that nothing changed — Bash-run scripts, IDEs and
+        // terminals edit files without firing the PostToolUse hook — so
+        // only short-circuit NO_CHANGES when git confirms HEAD hasn't
+        // moved AND the working tree is clean. Anything else falls
+        // through to buildPayload, whose progressHash comparison
+        // returns NO_CHANGES only if the reviewable diff is unchanged.
         //
         // We only fast-path off of terminal-success states. ISSUES /
         // ESCALATE / NO_PROGRESS land in the existing post-buildPayload
@@ -619,6 +668,10 @@ export const handleReview = async ({
             !force &&
             state.dirtySinceLastReview === false &&
             state.lastBaseline &&
+            // Set when a passing review cleared prior findings but the
+            // prior-free baseline couldn't be cached: the saved one isn't
+            // what a fresh build produces, so only that build may decide.
+            state.lastBaseline.fastPathEligible !== false &&
             // The cached baseline must have been produced under the same
             // review policy (provider, model, blockingSeverities, …).
             // Without this, switching provider on an otherwise-unchanged
@@ -628,12 +681,8 @@ export const handleReview = async ({
             (state.lastResultStatus === "GOOD_TO_GO" ||
                 state.lastResultStatus === "GOOD_TO_GO_WITH_NOTES")
         if (fastPathEligible) {
-            // Shallow probe #1 (correctness-critical, always on):
-            // HEAD hasn't moved since the cached baseline was captured.
-            // Catches commit/pull/rebase done outside Claude (or via
-            // Claude's Bash tool, which doesn't fire PostToolUse:
-            // Write|Edit|MultiEdit) — those leave the working tree
-            // clean but invalidate the cached review.
+            // Commit/pull/rebase leave the tree clean but invalidate the
+            // cached review, so HEAD must match the cached baseline.
             const headSha = (deps.currentHeadSha ?? currentHeadSha)(
                 context.repoRoot,
                 deps.git
@@ -643,29 +692,32 @@ export const handleReview = async ({
                 typeof headSha === "string" &&
                 typeof cachedHead === "string" &&
                 headSha === cachedHead
-
-            // Shallow probe #2 (optional, off by default):
-            // `git status --porcelain -z` confirms the working tree
-            // really has no uncommitted edits. Belt-and-braces against
-            // edits that bypass the PostToolUse hook (IDE auto-save,
-            // file-watcher tools, terminal edits). Toggle on via
-            // `payload.verifyCleanTree` when you also edit outside
-            // Claude. Default off — trust the dirty flag.
-            const verifyTree = config.payload?.verifyCleanTree === true
             const treeClean =
-                headMatches && verifyTree
-                    ? (deps.isWorkingTreeClean ?? isWorkingTreeClean)(
-                          context.repoRoot,
-                          deps.git
-                      )
-                    : true
-            if (headMatches && treeClean) {
+                headMatches &&
+                (deps.isWorkingTreeClean ?? isWorkingTreeClean)(
+                    context.repoRoot,
+                    deps.git
+                )
+            // With head-fallback on, a clean tree makes buildPayload review
+            // the commit range, so the cached verdict must be for that same
+            // range: a working-tree baseline (edits since discarded) or a
+            // range whose upstream merge-base has since moved doesn't count.
+            const baselineMatchesCleanTree =
+                headMatches &&
+                treeClean &&
+                (config.payload?.fallbackToHead !== true ||
+                    (state.lastBaseline.source === "head-fallback" &&
+                        typeof state.lastBaseline.baseSha === "string" &&
+                        (deps.resolveFallbackBase ?? resolveFallbackBase)(
+                            context.repoRoot,
+                            deps.git
+                        ) === state.lastBaseline.baseSha))
+            if (baselineMatchesCleanTree) {
                 log.info(
                     {
                         lastResultStatus: state.lastResultStatus,
                         lastChangeAt: state.lastChangeAt ?? 0,
                         headSha: short(headSha, 12),
-                        verifyCleanTree: verifyTree,
                     },
                     "fast-path: no changes since last terminal success"
                 )
@@ -695,11 +747,11 @@ export const handleReview = async ({
                     lastResultStatus: state.lastResultStatus,
                     headMatches,
                     treeClean,
+                    baselineMatchesCleanTree,
                     headSha: short(headSha, 12),
                     cachedHead: short(cachedHead, 12),
-                    verifyCleanTree: verifyTree,
                 },
-                "fast-path: deferred — HEAD moved or tree dirty"
+                "fast-path: deferred — HEAD moved, tree dirty, or baseline source differs"
             )
         }
 
@@ -810,12 +862,19 @@ export const handleReview = async ({
         // circuits before we spawn codex. The check requires BOTH the disk-
         // state hash AND the review-policy hash to match — a project edit to
         // blockingSeverities or extraReviewerInstructions invalidates the
-        // cache even when the file bytes have not changed.
+        // cache even when the file bytes have not changed. The commit range
+        // must match too: a moved fallback base changes the reviewed diff
+        // even where the hashed bytes and modes don't.
         const unchanged =
             !force &&
             state.lastBaseline &&
             state.lastBaseline.progressHash === payload.progressHash &&
-            state.lastBaseline.reviewConfigHash === reviewConfigHash
+            state.lastBaseline.reviewConfigHash === reviewConfigHash &&
+            sameCommitRange(state.lastBaseline, payload) &&
+            // Part of the tree (a submodule past the nesting limit, or one
+            // git couldn't read) wasn't fingerprinted, so a matching hash
+            // can't prove nothing changed there.
+            payload.fingerprintComplete !== false
 
         log.info(
             {
@@ -975,6 +1034,14 @@ export const handleReview = async ({
                 }),
             }
         }
+
+        const priorFreePayload = buildPriorFreePayload({
+            build: deps.buildPayload ?? buildPayload,
+            repoRoot: context.repoRoot,
+            config,
+            payload,
+            log,
+        })
 
         // Build the wrapped prompt (system preamble + delimiters + payload +
         // optional prior findings + optional extras). All of Codex's view of
@@ -1153,6 +1220,7 @@ export const handleReview = async ({
                 ? {
                       ...state,
                       codexRounds: state.codexRounds + 1,
+                      attemptsSincePass: nextAttempt(state),
                       lastReviewedAt: now(),
                       escalateNotified:
                           notifyUser || state.escalateNotified === true,
@@ -1164,6 +1232,7 @@ export const handleReview = async ({
                 : {
                       ...state,
                       codexRounds: state.codexRounds + 1,
+                      attemptsSincePass: nextAttempt(state),
                       lastBaseline: baselineSummary(payload, reviewConfigHash),
                       lastReviewedAt: now(),
                       lastResultStatus: "ESCALATE",
@@ -1199,6 +1268,7 @@ export const handleReview = async ({
                 },
                 state: nextState,
                 round: nextState.codexRounds,
+                attempt: nextState.attemptsSincePass,
                 blockCount: nextState.blockCount,
                 trigger,
                 priorFindingsFedIn: state.priorFindings,
@@ -1255,10 +1325,43 @@ export const handleReview = async ({
         const isTerminal =
             status === "GOOD_TO_GO" || status === "GOOD_TO_GO_WITH_NOTES"
 
+        // Prior findings shape the payload (forced context blocks,
+        // ignorePaths/maxFiles bypass, progressHash), and a terminal
+        // success clears them — so the next request builds WITHOUT them
+        // and could never match a baseline hashed WITH them, re-reviewing
+        // an unchanged tree. Cache the prior-free build instead — but only
+        // if it shows nothing the reviewer didn't see. Dropping the priors
+        // frees payload budget (an ignored flagged file no longer forced
+        // in), which can expose a file the reviewed prompt omitted, and the
+        // tree may have changed between the two builds; caching either
+        // would mark unseen changes reviewed.
+        // The reviewed baseline is kept instead, flagged so the clean-tree
+        // fast path can't serve it either: it isn't what the next request
+        // builds, so only a fresh payload build may decide.
+        const priorsCleared =
+            isTerminal && (payload.priorFindingPaths?.length ?? 0) > 0
+        const cachePriorFree =
+            priorsCleared &&
+            priorFreePayload !== null &&
+            showsNothingUnreviewed(priorFreePayload, payload)
+        if (priorsCleared && !cachePriorFree) {
+            log.info(
+                { priorFreeBuilt: priorFreePayload !== null },
+                "prior-free baseline unusable; keeping the reviewed baseline"
+            )
+        }
+        const lastBaseline = cachePriorFree
+            ? baselineSummary(priorFreePayload, reviewConfigHash)
+            : {
+                  ...baselineSummary(payload, reviewConfigHash),
+                  ...(priorsCleared ? { fastPathEligible: false } : {}),
+              }
+
         const nextState = {
             ...state,
             codexRounds: state.codexRounds + 1,
-            lastBaseline: baselineSummary(payload, reviewConfigHash),
+            attemptsSincePass: nextAttempt(state),
+            lastBaseline,
             lastReviewedAt: now(),
             lastEscalateReason: null,
             lastResultStatus: status,
@@ -1301,12 +1404,14 @@ export const handleReview = async ({
         // so the archive records "round N / blockCount M" of the actual work
         // even when the loop just ended.
         const archivedRound = nextState.codexRounds
+        const archivedAttempt = nextState.attemptsSincePass
         const archivedBlockCount = nextState.blockCount
 
         if (isTerminal) {
             // Both terminal statuses end the loop — counters go to zero, the
             // prior-findings cache is dropped.
             nextState.codexRounds = 0
+            nextState.attemptsSincePass = 0
             nextState.blockCount = 0
             nextState.priorFindings = []
         }
@@ -1342,6 +1447,7 @@ export const handleReview = async ({
             },
             state: saved,
             round: archivedRound,
+            attempt: archivedAttempt,
             blockCount: archivedBlockCount,
             trigger,
             priorFindingsFedIn: state.priorFindings,

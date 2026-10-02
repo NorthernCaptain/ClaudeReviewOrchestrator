@@ -175,7 +175,7 @@ describe("renderDashboard", () => {
             ],
         })
         expect(html).toContain("good-to-go attempts")
-        expect(html).toContain("2 clean passes")
+        expect(html).toContain("2 clean passes of 3 reviews · 1 with issues")
         expect(html).toContain("1st attempt")
         expect(html).toContain("2nd attempt")
     })
@@ -1058,6 +1058,41 @@ describe("sumGoodToGoByAttempt (v1.1.14)", () => {
     test("defaults and null input are safe", () => {
         expect(sumGoodToGoByAttempt().total).toBe(0)
         expect(sumGoodToGoByAttempt(null).total).toBe(0)
+    })
+
+    test("prefers the attempt stamp over round, which the idle reset lowers", () => {
+        const out = sumGoodToGoByAttempt([
+            { status: "GOOD_TO_GO", round: 2, attempt: 37 },
+            { status: "GOOD_TO_GO", round: 1, attempt: 1 },
+            { status: "GOOD_TO_GO", round: 3 },
+        ])
+        expect(out.totals).toEqual({ 1: 1, 2: 0, 3: 1, "4+": 1 })
+    })
+})
+
+describe("attemptsChartCaption", () => {
+    const { attemptsChartCaption } = __test__
+
+    test("puts the clean passes in context of every review and lists the rest", () => {
+        const records = [
+            { status: "GOOD_TO_GO" },
+            { status: "ISSUES" },
+            { status: "ISSUES" },
+            { status: "GOOD_TO_GO_WITH_NOTES" },
+            { status: "ESCALATE" },
+        ]
+        expect(attemptsChartCaption(records, 1)).toBe(
+            "good-to-go attempts · 1 clean pass of 5 reviews · 2 with issues · 1 with notes · 1 failed"
+        )
+    })
+
+    test("omits outcome kinds that did not occur", () => {
+        expect(attemptsChartCaption([{ status: "GOOD_TO_GO" }], 1)).toBe(
+            "good-to-go attempts · 1 clean pass of 1 review"
+        )
+        expect(attemptsChartCaption(null, 0)).toBe(
+            "good-to-go attempts · 0 clean passes of 0 reviews"
+        )
     })
 })
 

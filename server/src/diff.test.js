@@ -7,8 +7,11 @@ import { jest } from "@jest/globals"
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import {
+    chmodSync,
+    readFileSync,
     mkdtempSync,
     rmSync,
+    symlinkSync,
     writeFileSync,
     mkdirSync,
     realpathSync,
@@ -19,6 +22,7 @@ import {
     buildPayload,
     currentHeadSha,
     isWorkingTreeClean,
+    resolveFallbackBase,
     __test__,
 } from "./diff.js"
 
@@ -61,6 +65,226 @@ describe("matchesAny / filterIgnored", () => {
             ["**/node_modules/**", "**/*.lock"]
         )
         expect(out).toEqual(["src/a.js"])
+    })
+})
+
+describe("readRegularFile", () => {
+    const { readRegularFile } = __test__
+    let dir
+    beforeEach(() => {
+        dir = realpathSync(mkdtempSync(path.join(tmpdir(), "read-")))
+    })
+    afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+    })
+
+    test("reads a regular file directly and through a symlink", () => {
+        writeFileSync(path.join(dir, "f.txt"), "hello\n")
+        symlinkSync("f.txt", path.join(dir, "l"))
+        expect(readRegularFile(path.join(dir, "f.txt")).toString()).toBe(
+            "hello\n"
+        )
+        expect(readRegularFile(path.join(dir, "l")).toString()).toBe("hello\n")
+    })
+
+    test("refuses a FIFO, directly or behind a symlink, without blocking", () => {
+        const fifo = path.join(dir, "pipe")
+        execFileSync("mkfifo", [fifo])
+        symlinkSync("pipe", path.join(dir, "l"))
+        expect(() => readRegularFile(fifo)).toThrow(/not a regular file/)
+        expect(() => readRegularFile(path.join(dir, "l"))).toThrow(
+            /not a regular file/
+        )
+    })
+
+    test("refuses an endless device and a directory", () => {
+        expect(() => readRegularFile("/dev/zero")).toThrow(/not a regular file/)
+        expect(() => readRegularFile(dir)).toThrow(/not a regular file/)
+    })
+
+    test("propagates a missing path", () => {
+        expect(() => readRegularFile(path.join(dir, "gone"))).toThrow(/ENOENT/)
+    })
+})
+
+describe("hashRegularFile", () => {
+    const { hashRegularFile } = __test__
+    let dir
+    beforeEach(() => {
+        dir = realpathSync(mkdtempSync(path.join(tmpdir(), "hash-")))
+    })
+    afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+    })
+
+    test("streams a multi-chunk file to the same digest as hashing it whole", () => {
+        const content = Buffer.alloc(200 * 1024 + 7, "xyz")
+        writeFileSync(path.join(dir, "big.bin"), content)
+        expect(hashRegularFile(path.join(dir, "big.bin"))).toBe(
+            createHash("sha256").update(content).digest("hex")
+        )
+    })
+
+    test("hashes an empty file", () => {
+        writeFileSync(path.join(dir, "empty"), "")
+        expect(hashRegularFile(path.join(dir, "empty"))).toBe(
+            createHash("sha256").update("").digest("hex")
+        )
+    })
+
+    test("refuses a FIFO without blocking", () => {
+        const fifo = path.join(dir, "pipe")
+        execFileSync("mkfifo", [fifo])
+        expect(() => hashRegularFile(fifo)).toThrow(/not a regular file/)
+    })
+})
+
+describe("defaultFileMeta", () => {
+    const { defaultFileMeta } = __test__
+    let dir
+    beforeEach(() => {
+        dir = realpathSync(mkdtempSync(path.join(tmpdir(), "meta-")))
+    })
+    afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+    })
+
+    test("reports regular and executable files in git mode terms", () => {
+        const f = path.join(dir, "f.sh")
+        writeFileSync(f, "x\n")
+        chmodSync(f, 0o644)
+        expect(defaultFileMeta(f)).toBe("100644")
+        chmodSync(f, 0o755)
+        expect(defaultFileMeta(f)).toBe("100755")
+    })
+
+    test("reports a symlink with its target, even when dangling", () => {
+        const l = path.join(dir, "l")
+        symlinkSync("nowhere.txt", l)
+        expect(defaultFileMeta(l)).toBe("120000 nowhere.txt")
+    })
+
+    test("reports directories and missing paths", () => {
+        expect(defaultFileMeta(dir)).toBe("040000")
+        expect(defaultFileMeta(path.join(dir, "gone"))).toBe("MISSING")
+    })
+})
+
+describe("submoduleRecords", () => {
+    const { submoduleRecords } = __test__
+    const zero = "0".repeat(40)
+    const io = (over = {}) => ({
+        fileMeta: () => "100644",
+        hashFile: (abs) => `h(${abs})`,
+        git: () => "",
+        markIncomplete: jest.fn(),
+        ...over,
+    })
+    // One changed nested gitlink "deep" at every level.
+    const nestedGit =
+        (patch = "Subproject commit aaa") =>
+        (_cwd, args) => {
+            if (args[0] !== "diff") return ""
+            if (args.includes("--raw")) {
+                return `:160000 160000 ${zero} ${zero} M\0deep\0`
+            }
+            return patch
+        }
+
+    test("skips a gitlink directory that is not an initialized repo", () => {
+        const git = jest.fn()
+        const out = submoduleRecords(
+            "/r/sub",
+            io({
+                git,
+                fileMeta: (abs) =>
+                    abs === "/r/sub/.git" ? "MISSING" : "040000",
+            })
+        )
+        expect(out).toBeNull()
+        expect(git).not.toHaveBeenCalled()
+    })
+
+    test("records a git failure and marks the fingerprint incomplete", () => {
+        const deps = io({
+            git: () => {
+                throw new Error("corrupt")
+            },
+        })
+        expect(submoduleRecords("/r/sub", deps)).toEqual([
+            ["git-error", "corrupt"],
+        ])
+        expect(deps.markIncomplete).toHaveBeenCalled()
+    })
+
+    test("hashes a nested gitlink's patch, which names its checked-out commit", () => {
+        const a = submoduleRecords(
+            "/r/sub",
+            io({ git: nestedGit("Subproject commit aaa") })
+        )
+        const b = submoduleRecords(
+            "/r/sub",
+            io({ git: nestedGit("Subproject commit bbb") })
+        )
+        expect(a[0][5]).toMatch(/^[0-9a-f]{64}$/)
+        expect(a[0][5]).not.toBe(b[0][5])
+    })
+
+    test("recurses into nested submodules and marks incomplete past the depth limit", () => {
+        const deps = io({ git: nestedGit() })
+        const out = submoduleRecords("/r/sub", deps)
+        let depth = 0
+        for (let level = out; level; level = level[0][6]) depth++
+        expect(depth).toBe(4)
+        expect(deps.markIncomplete).toHaveBeenCalledTimes(1)
+    })
+
+    test("leaves the fingerprint complete for an ordinary dirty submodule", () => {
+        const deps = io({
+            git: (_cwd, args) =>
+                args.includes("--raw")
+                    ? `:100644 100644 ${zero} ${zero} M\0s.txt\0`
+                    : "",
+        })
+        submoduleRecords("/r/sub", deps)
+        expect(deps.markIncomplete).not.toHaveBeenCalled()
+    })
+})
+
+describe("parseRawZ", () => {
+    const { parseRawZ } = __test__
+    const zero = "0".repeat(40)
+    const sha = "a".repeat(40)
+
+    test("keys entries by path with modes and status, dropping object ids", () => {
+        const out = parseRawZ(
+            `:100644 100755 ${sha} ${zero} M\0run.sh\0` +
+                `:000000 100644 ${zero} ${sha} A\0new.js\0`
+        )
+        expect(out.get("run.sh")).toEqual({
+            srcMode: "100644",
+            dstMode: "100755",
+            status: "M",
+            from: null,
+        })
+        expect(out.get("new.js").status).toBe("A")
+    })
+
+    test("keys rename and copy records by the destination path", () => {
+        const out = parseRawZ(
+            `:100644 100644 ${sha} ${sha} R087\0old.js\0new.js\0` +
+                `:100644 100644 ${sha} ${sha} C100\0a.js\0b.js\0`
+        )
+        expect(out.has("old.js")).toBe(false)
+        expect(out.get("new.js")).toMatchObject({
+            status: "R087",
+            from: "old.js",
+        })
+        expect(out.get("b.js").status).toBe("C100")
+    })
+
+    test("returns an empty map for empty output", () => {
+        expect(parseRawZ("").size).toBe(0)
     })
 })
 
@@ -372,13 +596,424 @@ describe("buildPayload (integration)", () => {
         expect(out.promptHash).toBe(expected)
     })
 
-    test("progressHash equals sha256(promptHash + '|') when there are no prior findings", () => {
+    test("progressHash covers promptHash plus each changed file's full content", () => {
         writeFileSync(path.join(dir, "x.txt"), "hello\n")
         const out = buildPayload({ repoRoot: dir, config: baseConfig() })
-        const expected = createHash("sha256")
-            .update(`${out.promptHash}|`)
-            .digest("hex")
-        expect(out.progressHash).toBe(expected)
+        const sha = (v) => createHash("sha256").update(v).digest("hex")
+        expect(out.progressHash).toBe(
+            sha(
+                JSON.stringify([
+                    out.promptHash,
+                    [["x.txt", sha("hello\n"), "100644"]],
+                ])
+            )
+        )
+    })
+
+    test("progressHash flips for a non-prior untracked file edited PAST maxFileBytes truncation", () => {
+        // Untracked content has no git `index` header line to flip the
+        // prompt, so only the full-content part can see this edit.
+        const big = path.join(dir, "big.txt")
+        const cfg = baseConfig()
+        cfg.limits.maxFileBytes = 200
+        writeFileSync(big, "a".repeat(2000) + "X\n")
+        const before = buildPayload({ repoRoot: dir, config: cfg })
+        writeFileSync(big, "a".repeat(2000) + "Y\n")
+        const after = buildPayload({ repoRoot: dir, config: cfg })
+        expect(before.truncated).toBe(true)
+        expect(after.promptHash).toBe(before.promptHash)
+        expect(after.progressHash).not.toBe(before.progressHash)
+    })
+
+    test("progressHash flips for an edit to a file omitted by maxFiles", () => {
+        const cfg = baseConfig()
+        cfg.limits.maxFiles = 1
+        writeFileSync(path.join(dir, "a.txt"), "a\n")
+        writeFileSync(path.join(dir, "b.txt"), "b\n")
+        const before = buildPayload({ repoRoot: dir, config: cfg })
+        writeFileSync(path.join(dir, "b.txt"), "b2\n")
+        const after = buildPayload({ repoRoot: dir, config: cfg })
+        expect(after.promptHash).toBe(before.promptHash)
+        expect(after.progressHash).not.toBe(before.progressHash)
+    })
+
+    describe("git metadata on a file omitted by maxFiles", () => {
+        // README.md sorts first and takes the only file slot, so the
+        // path under test is emitted as a bare "omitted" header.
+        const omittedConfig = () => {
+            const cfg = baseConfig()
+            cfg.limits.maxFiles = 1
+            return cfg
+        }
+        const commitAll = (msg) => {
+            execFileSync("git", ["-C", dir, "add", "."])
+            execFileSync("git", ["-C", dir, "commit", "-qm", msg])
+        }
+
+        test("progressHash flips when only the executable bit changes", () => {
+            writeFileSync(path.join(dir, "run.sh"), "echo hi\n")
+            commitAll("script")
+            writeFileSync(path.join(dir, "README.md"), "edited\n")
+            writeFileSync(path.join(dir, "run.sh"), "echo hi there\n")
+            const before = buildPayload({
+                repoRoot: dir,
+                config: omittedConfig(),
+            })
+            chmodSync(path.join(dir, "run.sh"), 0o755)
+            const after = buildPayload({
+                repoRoot: dir,
+                config: omittedConfig(),
+            })
+            expect(after.promptText).toMatch(/run\.sh \(modified, omitted/)
+            expect(after.promptHash).toBe(before.promptHash)
+            expect(after.progressHash).not.toBe(before.progressHash)
+        })
+
+        test("progressHash flips when a symlink is retargeted to an identical file", () => {
+            for (const t of ["t1.txt", "t2.txt", "t3.txt"]) {
+                writeFileSync(path.join(dir, t), "same\n")
+            }
+            symlinkSync("t1.txt", path.join(dir, "lnk"))
+            commitAll("link")
+            const retarget = (t) => {
+                rmSync(path.join(dir, "lnk"))
+                symlinkSync(t, path.join(dir, "lnk"))
+            }
+            writeFileSync(path.join(dir, "README.md"), "edited\n")
+            retarget("t2.txt")
+            const before = buildPayload({
+                repoRoot: dir,
+                config: omittedConfig(),
+            })
+            retarget("t3.txt")
+            const after = buildPayload({
+                repoRoot: dir,
+                config: omittedConfig(),
+            })
+            // Same bytes behind the link, same mode, same omitted header:
+            // only the hashed patch can tell the targets apart.
+            expect(after.promptText).toMatch(/lnk \(modified, omitted/)
+            expect(after.promptHash).toBe(before.promptHash)
+            expect(after.progressHash).not.toBe(before.progressHash)
+        })
+
+        // Adds a submodule at sub/ (committed), runs fn with helpers for
+        // committing inside it, and removes its source repo afterwards.
+        const withSubmodule = (fn) => {
+            const sub = realpathSync(mkdtempSync(path.join(tmpdir(), "sub-")))
+            try {
+                execFileSync("git", ["init", "-q", "-b", "main", sub])
+                execFileSync("git", ["-C", sub, "config", "user.email", "t@t"])
+                execFileSync("git", ["-C", sub, "config", "user.name", "t"])
+                writeFileSync(path.join(sub, "s.txt"), "s1\n")
+                execFileSync("git", ["-C", sub, "add", "."])
+                execFileSync("git", ["-C", sub, "commit", "-qm", "s1"])
+                execFileSync(
+                    "git",
+                    [
+                        "-C",
+                        dir,
+                        "-c",
+                        "protocol.file.allow=always",
+                        "submodule",
+                        "add",
+                        "-q",
+                        sub,
+                        "sub",
+                    ],
+                    { stdio: "ignore" }
+                )
+                commitAll("add sub")
+                const inner = path.join(dir, "sub")
+                for (const [k, v] of [
+                    ["user.email", "t@t"],
+                    ["user.name", "t"],
+                ]) {
+                    execFileSync("git", ["-C", inner, "config", k, v])
+                }
+                const innerCommit = (text) => {
+                    writeFileSync(path.join(inner, "s.txt"), text)
+                    execFileSync("git", ["-C", inner, "commit", "-qam", text])
+                }
+                writeFileSync(path.join(dir, "README.md"), "edited\n")
+                fn({ inner, innerCommit })
+            } finally {
+                rmSync(sub, { recursive: true, force: true })
+            }
+        }
+        const build = () =>
+            buildPayload({ repoRoot: dir, config: omittedConfig() })
+
+        test("progressHash flips when a submodule moves to another commit", () => {
+            withSubmodule(({ innerCommit }) => {
+                innerCommit("s2\n")
+                const before = build()
+                innerCommit("s3\n")
+                const after = build()
+                expect(after.promptText).toMatch(/sub \(modified, omitted/)
+                expect(after.promptHash).toBe(before.promptHash)
+                expect(after.progressHash).not.toBe(before.progressHash)
+            })
+        })
+
+        test("progressHash flips when a nested submodule moves while its parent submodule stays dirty", () => {
+            const env = {
+                ...process.env,
+                GIT_AUTHOR_NAME: "t",
+                GIT_AUTHOR_EMAIL: "t@t",
+                GIT_COMMITTER_NAME: "t",
+                GIT_COMMITTER_EMAIL: "t@t",
+            }
+            const g = (cwd, ...args) =>
+                execFileSync(
+                    "git",
+                    ["-C", cwd, "-c", "protocol.file.allow=always", ...args],
+                    { env, stdio: "pipe" }
+                )
+            const srcs = realpathSync(mkdtempSync(path.join(tmpdir(), "nest-")))
+            try {
+                const nestedSrc = path.join(srcs, "nested")
+                const subSrc = path.join(srcs, "sub")
+                for (const repo of [nestedSrc, subSrc]) {
+                    execFileSync("git", ["init", "-q", "-b", "main", repo])
+                    writeFileSync(path.join(repo, "f.txt"), "1\n")
+                    g(repo, "add", ".")
+                    g(repo, "commit", "-qm", "init")
+                }
+                g(subSrc, "submodule", "add", "-q", nestedSrc, "nested")
+                g(subSrc, "commit", "-qm", "nested")
+                g(dir, "submodule", "add", "-q", subSrc, "sub")
+                g(dir, "submodule", "update", "-q", "--init", "--recursive")
+                commitAll("add sub")
+                const sub = path.join(dir, "sub")
+                const nested = path.join(sub, "nested")
+                const nestedCommit = (text) => {
+                    writeFileSync(path.join(nested, "f.txt"), text)
+                    g(nested, "commit", "-qam", text)
+                }
+                writeFileSync(path.join(dir, "README.md"), "edited\n")
+                // Keep the parent submodule dirty throughout.
+                writeFileSync(path.join(sub, "f.txt"), "dirty\n")
+                nestedCommit("2\n")
+                const before = build()
+                nestedCommit("3\n")
+                const after = build()
+                expect(after.promptHash).toBe(before.promptHash)
+                expect(after.progressHash).not.toBe(before.progressHash)
+                expect(after.fingerprintComplete).toBe(true)
+            } finally {
+                rmSync(srcs, { recursive: true, force: true })
+            }
+        })
+
+        test("progressHash flips for further edits inside an already dirty submodule", () => {
+            withSubmodule(({ inner, innerCommit }) => {
+                innerCommit("s2\n")
+                writeFileSync(path.join(inner, "s.txt"), "dirty 1\n")
+                const dirty1 = build()
+                writeFileSync(path.join(inner, "s.txt"), "dirty 2\n")
+                const dirty2 = build()
+                writeFileSync(path.join(inner, "extra.txt"), "new\n")
+                const withUntracked = build()
+                // The gitlink patch reads "<sha>-dirty" every time.
+                expect(dirty2.promptHash).toBe(dirty1.promptHash)
+                expect(dirty2.progressHash).not.toBe(dirty1.progressHash)
+                expect(withUntracked.progressHash).not.toBe(dirty2.progressHash)
+            })
+        })
+    })
+
+    test("progressHash flips when only an untracked file's executable bit changes", () => {
+        const script = path.join(dir, "new.sh")
+        writeFileSync(script, "echo hi\n")
+        const before = buildPayload({ repoRoot: dir, config: baseConfig() })
+        chmodSync(script, 0o755)
+        const after = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(after.promptHash).toBe(before.promptHash)
+        expect(after.progressHash).not.toBe(before.progressHash)
+    })
+
+    test("progressHash flips when an untracked symlink is retargeted to an identical file", () => {
+        writeFileSync(path.join(dir, "t1.txt"), "same\n")
+        writeFileSync(path.join(dir, "t2.txt"), "same\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "targets"])
+        const lnk = path.join(dir, "lnk")
+        symlinkSync("t1.txt", lnk)
+        const before = buildPayload({ repoRoot: dir, config: baseConfig() })
+        rmSync(lnk)
+        symlinkSync("t2.txt", lnk)
+        const after = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(after.files.untracked.map((u) => u.path)).toContain("lnk")
+        expect(after.promptHash).toBe(before.promptHash)
+        expect(after.progressHash).not.toBe(before.progressHash)
+    })
+
+    describe("paths whose headers the payload limit dropped", () => {
+        const commitAll = (msg) => {
+            execFileSync("git", ["-C", dir, "add", "-A"])
+            execFileSync("git", ["-C", dir, "commit", "-qm", msg])
+        }
+        // README.md's block is emitted first; sizing maxPayloadBytes to
+        // exactly that block leaves no room for any later header.
+        const tightConfig = () => {
+            writeFileSync(path.join(dir, "README.md"), "edited\n")
+            const probe = buildPayload({ repoRoot: dir, config: baseConfig() })
+            const cfg = baseConfig()
+            cfg.limits.maxPayloadBytes = probe.totalBytes
+            return cfg
+        }
+        const git = (...args) => execFileSync("git", ["-C", dir, ...args])
+
+        test("progressHash flips when a different tracked file is deleted", () => {
+            writeFileSync(path.join(dir, "a.txt"), "a\n")
+            writeFileSync(path.join(dir, "b.txt"), "b\n")
+            commitAll("files")
+            const cfg = tightConfig()
+            rmSync(path.join(dir, "a.txt"))
+            const before = buildPayload({ repoRoot: dir, config: cfg })
+            git("checkout", "--", "a.txt")
+            rmSync(path.join(dir, "b.txt"))
+            const after = buildPayload({ repoRoot: dir, config: cfg })
+            expect(before.files.deleted).toEqual(["a.txt"])
+            expect(after.files.deleted).toEqual(["b.txt"])
+            expect(after.promptText).not.toMatch(/deleted/)
+            expect(after.promptHash).toBe(before.promptHash)
+            expect(after.progressHash).not.toBe(before.progressHash)
+        })
+
+        test("a symlink target can't forge another path's record", () => {
+            // Under newline-joined "path:hash:mode" records, a dangling
+            // link whose target spells out m.txt's record hashed the same
+            // as the link plus a real m.txt.
+            const cfg = tightConfig()
+            const sha = (v) => createHash("sha256").update(v).digest("hex")
+            const lnk = path.join(dir, "lnk")
+            symlinkSync("x", lnk)
+            writeFileSync(path.join(dir, "m.txt"), "c\n")
+            const before = buildPayload({ repoRoot: dir, config: cfg })
+            rmSync(path.join(dir, "m.txt"))
+            rmSync(lnk)
+            symlinkSync(`x\nm.txt:${sha("c\n")}:100644`, lnk)
+            const after = buildPayload({ repoRoot: dir, config: cfg })
+            expect(before.files.untracked.map((u) => u.path)).toContain("m.txt")
+            expect(after.promptHash).toBe(before.promptHash)
+            expect(after.progressHash).not.toBe(before.progressHash)
+        })
+
+        test("progressHash flips when a different source is renamed into an identical file", () => {
+            writeFileSync(path.join(dir, "x.txt"), "same content\n")
+            writeFileSync(path.join(dir, "z.txt"), "same content\n")
+            commitAll("sources")
+            const cfg = tightConfig()
+            git("mv", "x.txt", "y.txt")
+            const before = buildPayload({ repoRoot: dir, config: cfg })
+            git("mv", "y.txt", "x.txt")
+            git("mv", "z.txt", "y.txt")
+            const after = buildPayload({ repoRoot: dir, config: cfg })
+            expect(before.files.renamed.map((r) => r.from)).toEqual(["x.txt"])
+            expect(after.files.renamed.map((r) => r.from)).toEqual(["z.txt"])
+            expect(after.promptHash).toBe(before.promptHash)
+            expect(after.progressHash).not.toBe(before.progressHash)
+        })
+    })
+
+    test("completes when changed symlinks point at a FIFO or an endless device", () => {
+        writeFileSync(path.join(dir, "t.txt"), "t\n")
+        symlinkSync("t.txt", path.join(dir, "tracked-link"))
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "link"])
+        execFileSync("mkfifo", [path.join(dir, "pipe")])
+        rmSync(path.join(dir, "tracked-link"))
+        symlinkSync("pipe", path.join(dir, "tracked-link"))
+        symlinkSync("/dev/zero", path.join(dir, "untracked-link"))
+        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(out.files.modified.map((f) => f.path)).toContain("tracked-link")
+        expect(typeof out.progressHash).toBe("string")
+    })
+
+    describe("blockHashes", () => {
+        const commitAll = (msg) => {
+            execFileSync("git", ["-C", dir, "add", "-A"])
+            execFileSync("git", ["-C", dir, "commit", "-qm", msg])
+        }
+
+        test("a prior-free build of the same tree shows a subset when the prior file is in the diff", () => {
+            writeFileSync(path.join(dir, "a.js"), "one\n")
+            commitAll("a")
+            writeFileSync(path.join(dir, "a.js"), "two\n")
+            writeFileSync(path.join(dir, "README.md"), "edited\n")
+            const priorFindings = [{ file: "a.js", severity: "major" }]
+            const reviewed = buildPayload({
+                repoRoot: dir,
+                config: baseConfig(),
+                priorFindings,
+            })
+            const priorFree = buildPayload({
+                repoRoot: dir,
+                config: baseConfig(),
+            })
+            expect(priorFree.blockHashes.length).toBeGreaterThan(0)
+            expect(
+                priorFree.blockHashes.every((h) =>
+                    reviewed.blockHashes.includes(h)
+                )
+            ).toBe(true)
+        })
+
+        test("a prior-free build exposes a block the reviewed one omitted when an ignored flagged file used the budget", () => {
+            writeFileSync(path.join(dir, "deps.lock"), "v1\n")
+            writeFileSync(path.join(dir, "z.txt"), "z1\n")
+            commitAll("files")
+            writeFileSync(path.join(dir, "deps.lock"), "v2 ".repeat(300) + "\n")
+            const priorFindings = [{ file: "deps.lock", severity: "major" }]
+            const cfg = baseConfig()
+            // Budget fits the flagged lock file's block and nothing more.
+            cfg.limits.maxPayloadBytes =
+                buildPayload({ repoRoot: dir, config: cfg, priorFindings })
+                    .totalBytes + 10
+            writeFileSync(path.join(dir, "z.txt"), "z2\n")
+            const reviewed = buildPayload({
+                repoRoot: dir,
+                config: cfg,
+                priorFindings,
+            })
+            const priorFree = buildPayload({ repoRoot: dir, config: cfg })
+            expect(reviewed.promptText).not.toMatch(/z\.txt/)
+            expect(priorFree.promptText).toMatch(/z\.txt \(modified\)/)
+            expect(
+                priorFree.blockHashes.every((h) =>
+                    reviewed.blockHashes.includes(h)
+                )
+            ).toBe(false)
+        })
+    })
+
+    test("hashes tracked modified files without reading them whole", () => {
+        writeFileSync(path.join(dir, "asset.bin"), Buffer.from([0, 1, 2]))
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "asset"])
+        writeFileSync(path.join(dir, "asset.bin"), Buffer.from([0, 1, 3]))
+        const readFile = jest.fn(readFileSync)
+        const hashFile = jest.fn(() => "digest")
+        buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            readFile,
+            hashFile,
+        })
+        const abs = path.join(dir, "asset.bin")
+        expect(hashFile).toHaveBeenCalledWith(abs)
+        expect(readFile).not.toHaveBeenCalledWith(abs)
+    })
+
+    test("progressHash ignores edits to ignorePaths files", () => {
+        writeFileSync(path.join(dir, "x.txt"), "hello\n")
+        writeFileSync(path.join(dir, "deps.lock"), "v1\n")
+        const before = buildPayload({ repoRoot: dir, config: baseConfig() })
+        writeFileSync(path.join(dir, "deps.lock"), "v2\n")
+        const after = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(after.progressHash).toBe(before.progressHash)
     })
 
     test("progressHash changes when a prior-finding file is edited", () => {
@@ -601,6 +1236,37 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
         expect(out.baseSha).toBeNull()
     })
 
+    test("an edit to only an ignored file still falls back to the commit range", () => {
+        const clean = buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+        })
+        writeFileSync(path.join(dir, "deps.lock"), "v2\n")
+        const out = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+        expect(out.source).toBe("head-fallback")
+        expect(out.empty).toBe(false)
+        // Same range, same fingerprint: a repeat Stop hook hits NO_CHANGES.
+        expect(out.progressHash).toBe(clean.progressHash)
+    })
+
+    test("an ignored file a prior finding flagged is reviewable, so no fallback", () => {
+        writeFileSync(path.join(dir, "deps.lock"), "v2\n")
+        const out = buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+            priorFindings: [{ file: "deps.lock", severity: "major" }],
+        })
+        expect(out.source).toBe("working-tree")
+        expect(out.files.untracked.map((u) => u.path)).toContain("deps.lock")
+    })
+
+    test("an ignored-only edit with fallback off leaves an empty working-tree payload", () => {
+        writeFileSync(path.join(dir, "deps.lock"), "v2\n")
+        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(out.source).toBe("working-tree")
+        expect(out.empty).toBe(true)
+    })
+
     test("clean tree + fallback ON → emits the HEAD~1..HEAD diff with source tag", () => {
         const out = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
         expect(out.empty).toBe(false)
@@ -679,6 +1345,60 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
     })
 })
 
+describe("prior-free builds of the same tree", () => {
+    let dir
+    beforeEach(() => {
+        dir = realpathSync(mkdtempSync(path.join(tmpdir(), "pf-")))
+        execFileSync("git", ["init", "-q", "-b", "main", dir])
+        execFileSync("git", ["-C", dir, "config", "user.email", "t@t"])
+        execFileSync("git", ["-C", dir, "config", "user.name", "t"])
+        writeFileSync(path.join(dir, "a.js"), "one\n")
+        writeFileSync(path.join(dir, "b.js"), "stable\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "init"])
+        writeFileSync(path.join(dir, "a.js"), "two\n")
+        writeFileSync(path.join(dir, "new.js"), "fresh\n")
+    })
+    afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+    })
+    // b.js is unchanged vs HEAD, so the prior forces a context block
+    // into the payload that a prior-free build doesn't have.
+    const priors = [{ file: "b.js", severity: "major" }]
+    const subset = (a, b) => a.every((h) => b.includes(h))
+
+    test("on an unchanged tree shows only blocks and fingerprints the reviewed build had", () => {
+        const reviewed = buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+            priorFindings: priors,
+        })
+        const priorFree = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(reviewed.progressHash).not.toBe(priorFree.progressHash)
+        expect(subset(priorFree.blockHashes, reviewed.blockHashes)).toBe(true)
+        expect(subset(priorFree.contentHashes, reviewed.contentHashes)).toBe(
+            true
+        )
+    })
+
+    test("an edit between the two builds hidden from the prompt surfaces as an unseen fingerprint", () => {
+        const cfg = baseConfig()
+        cfg.limits.maxFileBytes = 200
+        writeFileSync(path.join(dir, "new.js"), "a".repeat(2000) + "X\n")
+        const reviewed = buildPayload({
+            repoRoot: dir,
+            config: cfg,
+            priorFindings: priors,
+        })
+        writeFileSync(path.join(dir, "new.js"), "a".repeat(2000) + "Y\n")
+        const priorFree = buildPayload({ repoRoot: dir, config: cfg })
+        expect(subset(priorFree.blockHashes, reviewed.blockHashes)).toBe(true)
+        expect(subset(priorFree.contentHashes, reviewed.contentHashes)).toBe(
+            false
+        )
+    })
+})
+
 describe("isWorkingTreeClean", () => {
     let dir
     beforeEach(() => {
@@ -708,6 +1428,18 @@ describe("isWorkingTreeClean", () => {
         expect(isWorkingTreeClean(dir)).toBe(false)
     })
 
+    test("returns false for an untracked file even with status.showUntrackedFiles=no", () => {
+        execFileSync("git", [
+            "-C",
+            dir,
+            "config",
+            "status.showUntrackedFiles",
+            "no",
+        ])
+        writeFileSync(path.join(dir, "scratch.txt"), "wip\n")
+        expect(isWorkingTreeClean(dir)).toBe(false)
+    })
+
     test("returns false when git fails (defer to slow path)", () => {
         const bogus = path.join(dir, "not-a-repo")
         // No .git dir → git exits non-zero.
@@ -721,9 +1453,40 @@ describe("isWorkingTreeClean", () => {
             "status",
             "--porcelain",
             "-z",
+            "--untracked-files=normal",
         ])
         const dirtyGit = jest.fn(() => " M file.txt\0?? scratch.txt\0")
         expect(isWorkingTreeClean("/anywhere", dirtyGit)).toBe(false)
+    })
+})
+
+describe("resolveFallbackBase", () => {
+    test("prefers the merge-base with the upstream branch", () => {
+        const git = jest.fn((_root, args) => {
+            if (args[0] === "merge-base") return "upbase\n"
+            return "parent\n"
+        })
+        expect(resolveFallbackBase("/repo", git)).toBe("upbase")
+        expect(git).toHaveBeenCalledWith("/repo", [
+            "merge-base",
+            "HEAD",
+            "@{upstream}",
+        ])
+    })
+
+    test("falls back to HEAD~1 when there is no upstream", () => {
+        const git = jest.fn((_root, args) => {
+            if (args[0] === "merge-base") throw new Error("no upstream")
+            return "parent\n"
+        })
+        expect(resolveFallbackBase("/repo", git)).toBe("parent")
+    })
+
+    test("returns null when neither resolves", () => {
+        const git = jest.fn(() => {
+            throw new Error("initial commit")
+        })
+        expect(resolveFallbackBase("/repo", git)).toBeNull()
     })
 })
 

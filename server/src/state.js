@@ -22,6 +22,11 @@ const blankContext = ({ key, repoRoot, branch }) => ({
     branch,
     codexRounds: 0,
     blockCount: 0,
+    // Reviewer runs since the last pass (GOOD_TO_GO / WITH_NOTES), for the
+    // dashboard's attempts chart. Unlike codexRounds it survives the idle
+    // reset — a slow fix is still the same attempt sequence — and only a
+    // pass or an explicit reset clears it.
+    attemptsSincePass: 0,
     lastBaseline: null,
     priorFindings: [],
     // User-curated exclusion list (v1.1). Each entry is
@@ -76,6 +81,9 @@ const idleResetContext = ({ key, repoRoot, branch }, existing) => ({
     branch,
     codexRounds: 0,
     blockCount: 0,
+    // Contexts saved before the field existed carry their round over.
+    attemptsSincePass:
+        existing?.attemptsSincePass ?? existing?.codexRounds ?? 0,
     priorFindings: existing?.priorFindings ?? [],
     // User exclusions persist across idle reset (they reflect ongoing
     // policy, not transient loop state).

@@ -290,6 +290,39 @@ describe("renderMarkdown", () => {
     })
 })
 
+describe("buildRecord — attempt", () => {
+    const base = {
+        context: happyContext,
+        payload: happyPayload,
+        codexRaw: happyCodexRaw,
+        result: {
+            status: "GOOD_TO_GO",
+            findings: [],
+            blockingFindings: [],
+            droppedFindings: [],
+        },
+        trigger: "stop_hook",
+        priorFindingsFedIn: [],
+        timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+    }
+
+    test("an explicit attempt wins over the state snapshot", () => {
+        const rec = buildRecord({
+            ...base,
+            state: { attemptsSincePass: 0 },
+            attempt: 9,
+        })
+        expect(rec.attempt).toBe(9)
+    })
+
+    test("falls back to state.attemptsSincePass, else null", () => {
+        expect(
+            buildRecord({ ...base, state: { attemptsSincePass: 4 } }).attempt
+        ).toBe(4)
+        expect(buildRecord({ ...base, state: {} }).attempt).toBeNull()
+    })
+})
+
 describe("buildRecord — round/blockCount override", () => {
     test("explicit round/blockCount win over the state snapshot", () => {
         const rec = buildRecord({
@@ -793,6 +826,7 @@ describe("createArchive.readRecent", () => {
             },
             state: { codexRounds: 1, blockCount: 0 },
             round: 1,
+            attempt: 7,
             blockCount: 0,
             trigger: "stop_hook",
             priorFindingsFedIn: [],
@@ -819,6 +853,15 @@ describe("createArchive.readRecent", () => {
         expect(recent[2].status).toBe("GOOD_TO_GO")
         // Cross-context order honored by mtime, not directory traversal.
         expect(recent[1].context).toBe("b:feature")
+    })
+
+    test("reads back the attempt stamp", () => {
+        const archive = tickArchive()
+        writeOne(archive, 0, "r", "main", "GOOD_TO_GO")
+        expect(archive.readRecent({ limit: 1 })[0]).toMatchObject({
+            round: 1,
+            attempt: 7,
+        })
     })
 
     test("respects the limit", () => {

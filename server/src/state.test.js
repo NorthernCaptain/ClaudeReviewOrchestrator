@@ -69,6 +69,7 @@ describe("createStateStore — basics", () => {
             repoRoot: ctxKey.repoRoot,
             branch: ctxKey.branch,
             codexRounds: 4,
+            attemptsSincePass: 6,
             blockCount: 3,
             lastReviewedAt: 1,
             lastResultStatus: "ISSUES",
@@ -77,6 +78,7 @@ describe("createStateStore — basics", () => {
         })
         const fresh = store.reset(ctxKey)
         expect(fresh.codexRounds).toBe(0)
+        expect(fresh.attemptsSincePass).toBe(0)
         expect(fresh.blockCount).toBe(0)
         expect(fresh.priorFindings).toEqual([])
         expect(fresh.lastBaseline).toBeNull()
@@ -125,6 +127,7 @@ describe("createStateStore — idle reset", () => {
             repoRoot: ctxKey.repoRoot,
             branch: ctxKey.branch,
             codexRounds: 3,
+            attemptsSincePass: 5,
             blockCount: 2,
             lastReviewedAt: 1000,
             lastResultStatus: "ISSUES",
@@ -138,6 +141,9 @@ describe("createStateStore — idle reset", () => {
         // Loop counters cleared.
         expect(s.codexRounds).toBe(0)
         expect(s.blockCount).toBe(0)
+        // The attempts-since-pass count is not loop state: a slow fix is
+        // still part of the same sequence of tries.
+        expect(s.attemptsSincePass).toBe(5)
         // Cache fields PRESERVED so the next /review can short-circuit
         // on a matching progressHash + reviewConfigHash. priorFindings
         // belongs with the cache (it IS the cached ISSUES result that
@@ -150,6 +156,34 @@ describe("createStateStore — idle reset", () => {
         // lastReviewedAt zeroed so a follow-up get() doesn't trigger
         // a second idle reset until a real review writes a new value.
         expect(s.lastReviewedAt).toBe(0)
+    })
+
+    test("idle reset carries a pre-counter context's round into attemptsSincePass", () => {
+        // A state file from an older build has no attemptsSincePass.
+        writeFileSync(
+            filePath,
+            JSON.stringify({
+                version: 1,
+                contexts: {
+                    [ctxKey.key]: {
+                        key: ctxKey.key,
+                        repoRoot: ctxKey.repoRoot,
+                        branch: ctxKey.branch,
+                        codexRounds: 3,
+                        blockCount: 1,
+                        lastReviewedAt: 1000,
+                    },
+                },
+            })
+        )
+        const store = createStateStore({
+            filePath,
+            now: () => 2000,
+            idleResetMs: 500,
+        })
+        const s = store.get(ctxKey)
+        expect(s.codexRounds).toBe(0)
+        expect(s.attemptsSincePass).toBe(3)
     })
 
     test("idle reset is one-shot: a follow-up get() does not re-reset", () => {

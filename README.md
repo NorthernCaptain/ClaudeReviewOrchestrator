@@ -280,9 +280,15 @@ Two hashes serve two different purposes:
   delimiters, prior findings block, extras). Two reviews with identical
   `promptHash` are guaranteed to have identical *prompt* input.
 - **`progressHash`** — sha256 of `promptHash` concatenated with the
-  sha256 of every **full** (un-truncated) prior-finding file's current
-  on-disk content. This is the change-detection key used for the
-  no-progress check.
+  sha256 of every **full** (un-truncated) changed (non-ignored) and
+  prior-finding file's current on-disk content (deleted paths hash as
+  missing), plus each changed path's git modes, status and rename
+  source from `git diff --raw` (and, for
+  gitlinks and symlinks, its full patch). Untracked paths have no raw
+  entry, so they get their filesystem mode instead (executable bit, or
+  `120000 <target>` for a symlink). This is the
+  change-detection key used for both the `NO_CHANGES` and the
+  no-progress checks.
 
 Why two hashes: prior-finding files are force-included in the next
 prompt, but `maxFileBytes` may still truncate them. If a finding lives
@@ -290,7 +296,34 @@ at line 9000 of a 100KB file and `maxFileBytes` is 64KB, a fix to
 line 9000 would not change the truncated prompt bytes — so `promptHash`
 alone is not sufficient to detect progress on that fix. `progressHash`
 covers the **full** content of any file that has an open prior finding,
-so any edit to a flagged file changes it.
+so any edit to a flagged file changes it. It covers every changed file
+the same way, so an edit the prompt can't show (past `maxFileBytes` in
+an untracked file, in a file omitted by `maxFiles`, or cut by
+`maxPayloadBytes`) still counts as a change after a `GOOD_TO_GO` has
+cleared the prior findings. Bytes alone miss changes git still diffs,
+so the raw modes and status cover an executable-bit flip or type change,
+and the hashed patch covers a submodule moving to another commit (or
+going `-dirty`) and a symlink retargeted at identical content. Once a
+submodule is `-dirty`, further edits inside it leave that patch
+unchanged, so for working-tree reviews each changed, initialized
+submodule's own changed and untracked paths are fingerprinted too
+(content hash and `lstat` metadata, plus the patch of any nested gitlink
+or symlink, so a nested submodule moving between clean commits counts),
+recursing up to 4 levels. A submodule that can't be fully fingerprinted
+(nested deeper than that, or git failed inside it) marks the payload
+`fingerprintComplete: false`, and such a payload never counts as
+unchanged. Raw
+object ids are left out: for working-tree entries git reports zeros or
+the index blob depending on its stat cache. Untracked paths take their
+mode from `lstat` instead, so an executable-bit flip or a retargeted
+untracked symlink also counts. Tracked paths stay on git's modes, which
+respect `core.fileMode=false`. Deleted paths and rename sources are in
+the fingerprint too, so deleting a different file or renaming a different
+source into identical content still counts when `maxPayloadBytes` left
+no room for that header. Each path's fingerprint is a structured
+record (path, content hash, metadata) and the set is hashed as JSON,
+since git paths and symlink targets can contain newlines or colons that
+an interpolated string would let one record use to forge another.
 
 Neither hash bounds everything Codex looks at. Because we invoke
 `codex exec --cd <repoRoot> --sandbox read-only`, the reviewer is a
@@ -1002,6 +1035,15 @@ panels:
   (`ESCALATE` is red). Findings count labels above the bar when there's room.
   Each bar is wrapped in `<a href="#review-N">`; a ~15-line inline JS opens
   the matching `<details>` row on `hashchange` and `scrollIntoView`s it.
+- **Good-to-go attempts pie:** of the `GOOD_TO_GO` reviews among the
+  last 200, how many passed on the 1st / 2nd / 3rd / 4th-or-later attempt.
+  The caption puts that in context: clean passes out of all reviews, then
+  the counts with issues, with notes and failed. The attempt is the
+  archived `attempt` stamp: reviewer runs (including failures) since the
+  last pass (`GOOD_TO_GO` / `GOOD_TO_GO_WITH_NOTES`) or explicit reset.
+  Unlike `round` it is not cleared by the `limits.idleResetMinutes` idle
+  reset, so a fix that takes a while still counts every review it took.
+  Records archived before the stamp existed fall back to `round`.
 - **Reviews + Failed:** every archived attempt appears in **Reviews** (incl.
   ESCALATEs, which render an inline reason); the **Failed** quick-view duplicates
   just the failures with full stderr/argv/schema-error detail. Section
@@ -1033,8 +1075,9 @@ operator should know about:
 - **In-flight dedup** — concurrent `/review` calls for the same
   `<repoRoot>|<branch>` attach to one in-flight Promise, one spawn.
 - **Head-fallback** — `payload.fallbackToHead: true` (opt-in) reviews
-  the last commit range when the working tree is clean, catching the
-  "I committed before the Stop hook fired" case.
+  the last commit range when the working tree has no reviewable change
+  (clean, or only `ignorePaths` files changed), catching the "I committed
+  before the Stop hook fired" case.
 - **Hook fetch timeout** — auto-derived from the reviewer timeout + 60s
   when `hook.fetchTimeoutSeconds` is null. One knob (the reviewer
   timeout) controls the whole chain.
@@ -1065,15 +1108,14 @@ operator should know about:
 - **Change-notification fast path** — a PostToolUse hook
   (`hooks/notify-change.mjs`) pings `POST /notify-change` whenever
   Claude uses Write/Edit/MultiEdit. The server tracks a
-  `dirtySinceLastReview` flag per context. When the Stop hook fires
-  and the flag is `false` AND the last status was terminal-success
-  AND `git rev-parse HEAD` matches the cached baseline (always
-  checked, catches outside-Claude commits/pulls/rebases), the server
-  returns `NO_CHANGES` immediately — no payload build, no hashing, no
-  reviewer spawn. Saves ~50–200ms per Stop hook on unchanged trees.
-  Opt-in `payload.verifyCleanTree` adds a `git status --porcelain -z`
-  probe for IDE-edit safety; off by default. See
-  *Change-notification fast path* below.
+  `dirtySinceLastReview` flag per context. A dirty flag goes straight
+  to payload build + review. Without one, the server can't assume
+  nothing changed (Bash-run scripts, IDEs and terminals bypass the
+  hook), so it checks git: when `git rev-parse HEAD` matches the
+  cached baseline AND `git status --porcelain -z` is empty it returns
+  `NO_CHANGES` immediately; otherwise it builds the payload and
+  returns `NO_CHANGES` only if the `progressHash` matches the last
+  review. See *Change-notification fast path* below.
 
 ### Multi-round loop
 
@@ -1121,17 +1163,48 @@ Trade-offs of this choice (vs honoring `stop_hook_active`):
 Three hashes drive the no-spawn short-circuit:
 
 - **`promptHash`** — sha256 of the full prompt text the reviewer would see.
-- **`progressHash`** — sha256 of `promptHash` plus per-file content hashes of
-  every prior-finding file (so an edit past `maxFileBytes` still flips the
-  hash and the no-progress check sees forward motion).
+- **`progressHash`** — sha256 of `promptHash` plus full-content hashes of
+  every changed (non-ignored) and prior-finding file, plus git modes /
+  status (and gitlink / symlink patches) for changed paths — so an edit the
+  prompt truncated or omitted still flips the hash.
 - **`reviewConfigHash`** — sha256 of the review-policy slice of config:
   `blockingSeverities`, `ignorePaths`, `extraReviewerInstructions`,
-  `limits.maxPayloadBytes/maxFileBytes/maxFiles`, `payload.fallbackToHead`,
-  AND `payload.verifyCleanTree`.
+  `limits.maxPayloadBytes/maxFileBytes/maxFiles`, AND `payload.fallbackToHead`.
   Flipping any of these invalidates cached baselines automatically.
+
+Prior findings shape the payload (forced context blocks, the
+`ignorePaths` / `maxFiles` bypass, the `progressHash` content part),
+and a `GOOD_TO_GO` / `GOOD_TO_GO_WITH_NOTES` clears them. Otherwise
+the next request, built without priors, could never match and would
+re-review an unchanged tree. So when a review is fed prior findings, the
+server also builds the prior-free payload once a reviewer run is
+certain: after the cache short-circuits and the round cap, right before
+the reviewer starts. The two are independent builds, so nothing is
+cached between them. A passing review caches that
+prior-free baseline only if the reviewer already saw everything it
+captures: same HEAD, source and base, and every prompt block
+(`blockHashes`) and per-path fingerprint (`contentHashes`: content,
+mode, rename source) also in the reviewed payload. Dropping priors only
+removes paths, so anything new means either freed payload budget exposed
+a file the reviewer never saw (an ignored flagged file is no longer
+forced in), or the tree changed between the two builds. In that case
+the reviewed baseline is kept, at the cost of one extra review, and
+flagged `fastPathEligible: false` so the clean-tree fast path can't
+serve it either; only a fresh payload build decides.
+
+File contents are read only from regular files: each path is opened
+non-blocking and checked with `fstat` before reading, so a FIFO or
+device, directly or behind a symlink, can't hang or exhaust the
+payload build. Symlink targets are fingerprinted through git's patch
+(tracked) or `lstat` (untracked) instead. Content hashes are streamed
+in 64KB chunks, so a large changed asset the prompt never includes is
+never held in memory.
 
 A cache hit fires when the new `progressHash` matches `state.lastBaseline.progressHash`
 AND `reviewConfigHash` matches `state.lastBaseline.reviewConfigHash` AND
+the commit range matches (`headSha`, `source`, and `baseSha`: with
+`fallbackToHead` the merge-base can move while HEAD stays put, changing
+the diff of a file the prompt omitted without changing its bytes) AND
 `state.lastResultStatus` is a terminal status. Outcomes:
 
 | Last status | Cache decision |
@@ -1197,33 +1270,44 @@ and before `buildPayload`:
 state.dirtySinceLastReview === false
 AND state.lastBaseline
 AND state.lastResultStatus is GOOD_TO_GO or GOOD_TO_GO_WITH_NOTES
-AND currentHeadSha(repoRoot) === state.lastBaseline.headSha   ← always
-AND (payload.verifyCleanTree is false  OR  isWorkingTreeClean(repoRoot))
+AND currentHeadSha(repoRoot) === state.lastBaseline.headSha
+AND isWorkingTreeClean(repoRoot)
+AND (payload.fallbackToHead is false
+     OR (state.lastBaseline.source === "head-fallback"
+         AND resolveFallbackBase(repoRoot) === state.lastBaseline.baseSha))
 ```
 
 All true → returns `NO_CHANGES` with the cached `baseline`. No
 payload built, no reviewer spawn.
 
-Two shallow git probes are involved:
+Both git probes are always on whenever the dirty flag is `false`:
 
-- **HEAD probe (always on, correctness-critical).** `git rev-parse
-  HEAD` confirms the cached baseline still matches the current commit.
-  Catches commit / pull / rebase done outside Claude (in a terminal,
-  another CLI, or via Claude's Bash tool — which doesn't fire
-  PostToolUse:Write|Edit|MultiEdit). Cost ~3ms.
-- **Tree probe (optional, `payload.verifyCleanTree`, default `false`).**
-  `git status --porcelain -z` confirms the working tree has no
-  uncommitted edits. Belt-and-braces for IDE edits / file-watcher
-  tools / terminal edits that bypass the PostToolUse hook. Default
-  off — trust the dirty flag set by the hook. Turn ON if you also
-  edit outside Claude. Cost ~5ms.
+- **HEAD probe.** `git rev-parse HEAD` confirms the cached baseline
+  still matches the current commit. Catches commit / pull / rebase
+  done outside Claude. Cost ~3ms.
+- **Tree probe.** `git status --porcelain -z --untracked-files=normal`
+  confirms the working tree has no uncommitted edits. The explicit
+  `--untracked-files` overrides a `status.showUntrackedFiles=no`
+  setting, which would otherwise hide new files. Cost ~5ms.
 
-Either probe failing (when both are active) falls the request through
-to the existing slow path. Combined cost on the slow path is ~100ms
-for the full `buildPayload` sweep, which the fast path replaces.
+With `payload.fallbackToHead` on, a clean tree makes `buildPayload`
+review the commit range, so the fast path also requires the cached
+baseline to be a `head-fallback` one for the same base — a
+working-tree verdict on since-discarded edits doesn't cover that
+range, and the upstream merge-base can move (upstream changed or
+force-pushed) while HEAD stays put.
 
-The flag is part of `reviewConfigHash`, so flipping `verifyCleanTree`
-busts the cache automatically.
+The dirty flag only proves an edit happened; its absence doesn't
+prove nothing changed — scripts run through Claude's Bash tool, IDE
+auto-save and terminal edits all bypass the PostToolUse hook. So
+either probe failing falls the request through to the slow path:
+`buildPayload` (~100ms) and the `progressHash` comparison, which
+returns `NO_CHANGES` only when the reviewable diff matches the last
+review. That is the common case after a `GOOD_TO_GO` on uncommitted
+edits, since the tree probe sees those edits as dirty.
+
+`payload.verifyCleanTree` is deprecated and ignored; it is still
+accepted so config files written by older installers keep loading.
 
 **dirty flag lifecycle**:
 
@@ -1252,7 +1336,10 @@ reject so a failed run doesn't poison the slot.
 ### Head-fallback (opt-in)
 
 `payload.fallbackToHead: true` lets `buildPayload` review the most recent
-commit range when the working tree is clean. Range:
+commit range when the working tree has no reviewable change: clean, or
+changed only in files matched by `ignorePaths` (a lockfile rewritten by an
+install leaves nothing to review in the tree and mustn't hide the range;
+a prior finding on such a file makes it reviewable again). Range:
 `merge-base(HEAD, @{upstream})..HEAD` when an upstream exists, else
 `HEAD~1..HEAD`. Catches the "I committed before the Stop hook fired" case.
 
@@ -1374,8 +1461,8 @@ example below shows every supported key and the current default):
 | `reviewer.claude.permissionMode` | `"bypassPermissions"` | Only mode that returns a clean assistant response in non-interactive `-p` mode; `disallowedTools` is the real safety boundary. |
 | `reviewer.gemini.model` | `"auto"` | Router alias = the CLI's interactive "Auto (Gemini 3)" mode. Pin to e.g. `"gemini-2.5-pro"` for reproducibility. |
 | `reviewer.gemini.approvalMode` | `"plan"` | Read-only non-interactive mode. |
-| `payload.fallbackToHead` | `false` | Opt-in: when working tree is clean, review the last commit range instead of returning `EMPTY_PAYLOAD`. |
-| `payload.verifyCleanTree` | `false` | Opt-in: when the change-notification fast path is otherwise eligible, also run `git status --porcelain -z` to confirm the tree really is clean. Off by default — trust the dirty flag set by the PostToolUse hook. Turn ON if you also edit files outside Claude. |
+| `payload.fallbackToHead` | `false` | Opt-in: when the working tree has no reviewable change (only files matched by `ignorePaths`, or nothing), review the last commit range instead of returning `EMPTY_PAYLOAD`. |
+| `payload.verifyCleanTree` | `false` | Deprecated, ignored. The fast path always runs the tree probe when no change notification arrived. |
 | `hook.fetchTimeoutSeconds` | `null` (auto) | When null, the hook auto-derives from `max(reviewer.{provider}.timeoutSeconds, limits.codexTimeoutSeconds) + 60s`. Override to pin. |
 | `limits.idleResetMinutes` | `10` | Loop-counter idle reset interval. **Cache fields are preserved** across the reset and across server restarts (see "State persistence" above). |
 

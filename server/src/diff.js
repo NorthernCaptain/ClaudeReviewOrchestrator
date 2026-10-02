@@ -5,7 +5,16 @@
 
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { readFileSync } from "node:fs"
+import {
+    closeSync,
+    constants,
+    fstatSync,
+    lstatSync,
+    openSync,
+    readFileSync,
+    readSync,
+    readlinkSync,
+} from "node:fs"
 import path from "node:path"
 import { minimatch } from "minimatch"
 
@@ -15,6 +24,91 @@ const defaultGit = (cwd, args) =>
         maxBuffer: 64 * 1024 * 1024,
         stdio: ["ignore", "pipe", "pipe"],
     })
+
+// Parses `git diff --raw -z` into path → { srcMode, dstMode, status,
+// from }. Rename/copy records carry two paths; they are keyed by the
+// destination, with the source kept as `from` (null otherwise).
+// Object ids are dropped: for working-tree entries git reports either
+// zeros or the index blob depending on its stat cache, so they would
+// flip the hash without any real change.
+const parseRawZ = (output) => {
+    const meta = new Map()
+    const parts = output.split("\0")
+    let i = 0
+    while (i < parts.length) {
+        const head = parts[i++]
+        if (!head?.startsWith(":")) continue
+        const [srcMode, dstMode, , , status = ""] = head.slice(1).split(" ")
+        const twoPaths = status[0] === "R" || status[0] === "C"
+        const from = twoPaths ? parts[i++] : null
+        const file = parts[i++]
+        if (file) meta.set(file, { srcMode, dstMode, status, from })
+    }
+    return meta
+}
+
+// Gitlinks and symlinks diff as metadata, not file bytes: a submodule
+// reads as a directory and a symlink reads as its target's content.
+const METADATA_MODES = new Set(["160000", "120000"])
+
+const hashOrMissing = (hashFile, abs) => {
+    try {
+        return hashFile(abs)
+    } catch {
+        return "MISSING"
+    }
+}
+
+// Once a submodule is "-dirty", further edits inside it leave its gitlink
+// mode, status and patch unchanged, so fingerprint its working tree the
+// way the top level is: each changed or untracked path with its content
+// hash and lstat metadata, plus the full patch for nested gitlinks and
+// symlinks (a nested submodule's checked-out commit isn't in any bytes),
+// recursing into nested submodules. Only an initialized submodule (its
+// own .git) is entered — git run in an empty gitlink directory would
+// resolve to the superproject. Where a working tree can't be scanned (git
+// failed, or nesting passed MAX_SUBMODULE_DEPTH) io.markIncomplete() is
+// called so the caller refuses a cache hit instead of trusting a gap.
+const MAX_SUBMODULE_DEPTH = 4
+const submoduleRecords = (subAbs, io, depth = 1) => {
+    if (io.fileMeta(path.join(subAbs, ".git")) === "MISSING") return null
+    try {
+        const raw = parseRawZ(
+            io.git(subAbs, ["diff", "HEAD", "--raw", "-z", "--no-abbrev"])
+        )
+        const untracked = io
+            .git(subAbs, ["ls-files", "--others", "--exclude-standard", "-z"])
+            .split("\0")
+            .filter(Boolean)
+        return [...new Set([...raw.keys(), ...untracked])].sort().map((p) => {
+            const abs = path.join(subAbs, p)
+            const m = raw.get(p)
+            const patch = METADATA_MODES.has(m?.dstMode)
+                ? sha256Hex(io.git(subAbs, ["diff", "HEAD", "--", p]))
+                : null
+            let nested = null
+            if (m?.dstMode === "160000") {
+                if (depth < MAX_SUBMODULE_DEPTH) {
+                    nested = submoduleRecords(abs, io, depth + 1)
+                } else {
+                    io.markIncomplete()
+                }
+            }
+            return [
+                p,
+                hashOrMissing(io.hashFile, abs),
+                io.fileMeta(abs),
+                m?.status ?? "untracked",
+                m?.from ?? null,
+                patch,
+                nested,
+            ]
+        })
+    } catch (err) {
+        io.markIncomplete()
+        return [["git-error", String(err?.message ?? err)]]
+    }
+}
 
 const parseNameStatusZ = (output) => {
     const parts = output.split("\0")
@@ -123,6 +217,66 @@ const collectPriorFindingPaths = (priorFindings, repoRoot) => {
     return set
 }
 
+// Opens a regular file, following symlinks, and refuses anything else.
+// The fd is opened non-blocking and checked with fstat before any read,
+// so a FIFO or device — directly or behind a symlink — can neither block
+// forever nor stream without end, and the path can't be swapped between
+// the check and the read.
+const openRegularFile = (abs) => {
+    const fd = openSync(abs, constants.O_RDONLY | constants.O_NONBLOCK)
+    try {
+        if (fstatSync(fd).isFile()) return fd
+    } catch (err) {
+        closeSync(fd)
+        throw err
+    }
+    closeSync(fd)
+    throw Object.assign(new Error(`not a regular file: ${abs}`), {
+        code: "ENOTREG",
+    })
+}
+
+const readRegularFile = (abs) => {
+    const fd = openRegularFile(abs)
+    try {
+        return readFileSync(fd)
+    } finally {
+        closeSync(fd)
+    }
+}
+
+// sha256 of a regular file, streamed in fixed-size chunks so a large
+// asset that never reaches the prompt is never held in memory either.
+const HASH_CHUNK_BYTES = 64 * 1024
+const hashRegularFile = (abs) => {
+    const fd = openRegularFile(abs)
+    try {
+        const h = createHash("sha256")
+        const chunk = Buffer.allocUnsafe(HASH_CHUNK_BYTES)
+        let n
+        while ((n = readSync(fd, chunk, 0, chunk.length, null)) > 0) {
+            h.update(chunk.subarray(0, n))
+        }
+        return h.digest("hex")
+    } finally {
+        closeSync(fd)
+    }
+}
+
+// Filesystem mode for untracked paths, which have no `git diff --raw`
+// entry: the executable bit or a symlink's target, neither of which shows
+// in the bytes read through the path. Uses git's mode vocabulary.
+const defaultFileMeta = (abs) => {
+    try {
+        const st = lstatSync(abs)
+        if (st.isSymbolicLink()) return `120000 ${readlinkSync(abs)}`
+        if (st.isDirectory()) return "040000"
+        return st.mode & 0o111 ? "100755" : "100644"
+    } catch {
+        return "MISSING"
+    }
+}
+
 // Reads a file as raw bytes for hashing. Returns null on missing.
 const readBytesOrNull = (readFile, abs) => {
     try {
@@ -136,13 +290,20 @@ const readBytesOrNull = (readFile, abs) => {
 // notification fast path. ONE `git status --porcelain -z` call —
 // reports modifications, additions, deletions, renames, and untracked
 // (non-ignored) files all in a single command. Empty output = clean.
+// --untracked-files overrides a user's status.showUntrackedFiles=no,
+// which would otherwise hide files buildPayload's ls-files picks up.
 // Returns true only when stdout is empty. Any error is treated as "not
 // clean" so the fast path defers to the slow path when in doubt.
 //
 // ~5ms in practice — much cheaper than buildPayload's full sweep.
 export const isWorkingTreeClean = (repoRoot, git = defaultGit) => {
     try {
-        const out = git(repoRoot, ["status", "--porcelain", "-z"])
+        const out = git(repoRoot, [
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=normal",
+        ])
         return out.length === 0
     } catch {
         return false
@@ -166,8 +327,11 @@ export const currentHeadSha = (repoRoot, git = defaultGit) => {
 // with the upstream branch (so a feature branch with N unreviewed
 // commits is reviewed as one range), fall back to HEAD~1 for branches
 // without an upstream. Returns null when neither resolves (e.g. an
-// initial commit with no parent).
-const resolveFallbackBase = (git, repoRoot) => {
+// initial commit with no parent). Also used by the review fast path:
+// the merge-base can move (upstream changed or force-pushed) while HEAD
+// stays put, so a cached head-fallback verdict is only valid for the
+// same base.
+export const resolveFallbackBase = (repoRoot, git = defaultGit) => {
     const tryGit = (args) => {
         try {
             return git(repoRoot, args).trim()
@@ -186,64 +350,70 @@ export const buildPayload = ({
     config,
     priorFindings = [],
     git = defaultGit,
-    readFile = readFileSync,
+    readFile = readRegularFile,
+    fileMeta = defaultFileMeta,
+    hashFile = hashRegularFile,
 }) => {
     const headSha = git(repoRoot, ["rev-parse", "HEAD"]).trim()
     const priorFindingPaths = collectPriorFindingPaths(priorFindings, repoRoot)
     const isPrior = (p) => priorFindingPaths.has(p)
 
-    let nameStatusOut = git(repoRoot, ["diff", "HEAD", "--name-status", "-z"])
-    let untrackedOut = git(repoRoot, [
+    const nameStatusOut = git(repoRoot, ["diff", "HEAD", "--name-status", "-z"])
+    const untrackedOut = git(repoRoot, [
         "ls-files",
         "--others",
         "--exclude-standard",
         "-z",
     ])
-    let untrackedAll = untrackedOut.split("\0").filter(Boolean)
+    const untrackedAll = untrackedOut.split("\0").filter(Boolean)
 
-    // Working tree clean + opt-in head-fallback → switch the diff
-    // reference to the commit range so a Stop hook firing AFTER the
-    // commit still has something to review. The rest of the function
-    // is reused unchanged; only the `diffRef` argument to `git diff`
-    // changes.
+    const ignorePaths = config.ignorePaths
+    const keepOrPrior = (p) => isPrior(p) || !matchesAny(p, ignorePaths)
+    // The reviewable subset of a change set: ignorePaths filtered out,
+    // except where a prior finding forces a path back in.
+    const selectReviewable = (changed, untracked) => ({
+        modifiedSet: [
+            ...changed.modified,
+            ...changed.added,
+            ...changed.typeChanged,
+        ].filter(keepOrPrior),
+        deletedSet: changed.deleted.filter(keepOrPrior),
+        renamedSet: changed.renamed.filter(
+            (r) =>
+                isPrior(r.to) ||
+                isPrior(r.from) ||
+                !matchesAny(r.to, ignorePaths)
+        ),
+        untrackedSet: untracked.filter(keepOrPrior),
+    })
+    let sets = selectReviewable(parseNameStatusZ(nameStatusOut), untrackedAll)
+
+    // No reviewable working-tree change + opt-in head-fallback → switch
+    // the diff reference to the commit range so a Stop hook firing AFTER
+    // the commit still has something to review. "Clean" is judged after
+    // ignorePaths: an edit to an ignored file (a lockfile from an install)
+    // leaves nothing to review in the tree, and must not hide the range.
     const fallbackEnabled = config?.payload?.fallbackToHead === true
-    const workingTreeClean =
-        nameStatusOut.length === 0 && untrackedAll.length === 0
+    const workingTreeClean = Object.values(sets).every((v) => v.length === 0)
     let diffRef = "HEAD"
     let source = "working-tree"
     let baseSha = null
     if (workingTreeClean && fallbackEnabled) {
-        baseSha = resolveFallbackBase(git, repoRoot)
+        baseSha = resolveFallbackBase(repoRoot, git)
         if (baseSha && baseSha !== headSha) {
             diffRef = `${baseSha}..HEAD`
             // Re-fetch name-status for the commit range. Untracked is
             // irrelevant — every change in the range is committed.
-            nameStatusOut = git(repoRoot, [
-                "diff",
-                diffRef,
-                "--name-status",
-                "-z",
-            ])
-            untrackedAll = []
+            sets = selectReviewable(
+                parseNameStatusZ(
+                    git(repoRoot, ["diff", diffRef, "--name-status", "-z"])
+                ),
+                []
+            )
             source = "head-fallback"
         }
     }
-    const changed = parseNameStatusZ(nameStatusOut)
-
-    const ignorePaths = config.ignorePaths
-    const keepOrPrior = (p) => isPrior(p) || !matchesAny(p, ignorePaths)
-
-    const modifiedSet = [
-        ...changed.modified,
-        ...changed.added,
-        ...changed.typeChanged,
-    ].filter(keepOrPrior)
-    const deletedSet = changed.deleted.filter(keepOrPrior)
-    const renamedSet = changed.renamed.filter(
-        (r) =>
-            isPrior(r.to) || isPrior(r.from) || !matchesAny(r.to, ignorePaths)
-    )
-    const untrackedSet = untrackedAll.filter(keepOrPrior)
+    const { modifiedSet, deletedSet, renamedSet, untrackedSet } = sets
 
     const { limits } = config
     let totalBytes = 0
@@ -433,21 +603,77 @@ export const buildPayload = ({
     // totalBytes is computed from those exact emitted bytes, so the invariant
     // Buffer.byteLength(promptText) === totalBytes holds.
     const promptText = blocks.join("")
+    // Per-block identity, so a caller can tell whether another build of the
+    // same tree shows the reviewer anything this one didn't.
+    const blockHashes = blocks.map(sha256Hex)
 
     const promptHash = sha256Hex(promptText)
 
-    // progressHash: incorporates the FULL on-disk content of every prior-
-    // finding file (regardless of any prompt truncation), so an edit past
-    // maxFileBytes still flips the hash and the no-progress check sees
-    // forward motion. Sort by path for stability.
+    // progressHash: promptHash plus the FULL on-disk content of every
+    // changed and prior-finding file, so an edit hidden from the prompt by
+    // maxFileBytes / maxPayloadBytes / maxFiles still flips the hash. The
+    // cache must not depend on prior findings to see such edits: a
+    // GOOD_TO_GO clears them, and the next request is built without them.
+    // Sort by path for stability.
     const sortedPriorPaths = [...priorFindingPaths].sort()
-    const priorContentParts = sortedPriorPaths.map((p) => {
-        const buf = readBytesOrNull(readFile, path.join(repoRoot, p))
-        const h = buf === null ? "MISSING" : sha256Hex(buf)
-        return `${p}:${h}`
+    const contentPaths = [
+        ...new Set([
+            ...modifiedSet,
+            ...untrackedSet,
+            // Hashed as MISSING plus their raw "D" record, so a deletion
+            // whose header the payload limit dropped still counts.
+            ...deletedSet,
+            ...renamedSet.map((r) => r.to),
+            ...priorFindingPaths,
+        ]),
+    ].sort()
+    // Raw diff metadata catches what file bytes can't: an executable-bit
+    // flip or type change on a file the prompt omitted. For gitlinks and
+    // symlinks also hash the full patch, which names the checked-out
+    // submodule commit (and any -dirty state) or the link target.
+    const rawMeta = parseRawZ(
+        git(repoRoot, ["diff", diffRef, "--raw", "-z", "--no-abbrev"])
+    )
+    const untrackedPaths = new Set(untrackedSet)
+    // Structured per-path records, hashed as JSON: paths and symlink
+    // targets may contain any byte git allows (newlines, colons), so
+    // interpolated strings could let one record forge another.
+    // False when part of the tree couldn't be fingerprinted (see
+    // submoduleRecords); the cache must not treat such a payload as
+    // unchanged.
+    let fingerprintComplete = true
+    const contentRecords = contentPaths.map((p) => {
+        const abs = path.join(repoRoot, p)
+        const h = hashOrMissing(hashFile, abs)
+        const m = rawMeta.get(p)
+        if (!m) {
+            return untrackedPaths.has(p) ? [p, h, fileMeta(abs)] : [p, h]
+        }
+        const patch = METADATA_MODES.has(m.dstMode)
+            ? sha256Hex(git(repoRoot, ["diff", diffRef, "--", p]))
+            : null
+        const record = [p, h, m.srcMode, m.dstMode, m.status, m.from, patch]
+        // A head-fallback range is committed, so a submodule's working
+        // tree isn't part of what is reviewed.
+        if (m.dstMode === "160000" && source === "working-tree") {
+            record.push(
+                submoduleRecords(abs, {
+                    git,
+                    hashFile,
+                    fileMeta,
+                    markIncomplete: () => {
+                        fingerprintComplete = false
+                    },
+                })
+            )
+        }
+        return record
     })
-    const progressHash = sha256Hex(
-        `${promptHash}|${priorContentParts.join("\n")}`
+    const progressHash = sha256Hex(JSON.stringify([promptHash, contentRecords]))
+    // Per-path fingerprint identity, the companion to blockHashes: a caller
+    // can check another build saw no content, mode or path this one didn't.
+    const contentHashes = contentRecords.map((r) =>
+        sha256Hex(JSON.stringify(r))
     )
 
     return {
@@ -465,6 +691,9 @@ export const buildPayload = ({
         promptText,
         promptHash,
         progressHash,
+        blockHashes,
+        contentHashes,
+        fingerprintComplete,
         priorFindingPaths: sortedPriorPaths,
         empty: blocks.length === 0,
         nonBinaryFileCount:
@@ -479,6 +708,11 @@ export const buildPayload = ({
 
 export const __defaults__ = { defaultGit }
 export const __test__ = {
+    defaultFileMeta,
+    submoduleRecords,
+    hashRegularFile,
+    readRegularFile,
+    parseRawZ,
     parseNameStatusZ,
     matchesAny,
     filterIgnored,
