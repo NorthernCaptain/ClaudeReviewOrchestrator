@@ -74,7 +74,7 @@ const LIB_PATH = (env) =>
 const MUTATING_TOOLS = new Set(["write", "edit", "patch", "bash"])
 
 const NOTIFY_TIMEOUT_MS = 2000
-const DEFAULT_REVIEW_TIMEOUT_MS = 280 * 1000
+const DEFAULT_REVIEW_TIMEOUT_MS = 660 * 1000
 
 const notifyUrlFrom = (reviewUrl) =>
     reviewUrl.replace(/\/review$/, "/notify-change")

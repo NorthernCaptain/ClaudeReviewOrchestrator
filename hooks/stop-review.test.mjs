@@ -82,7 +82,7 @@ describe("readToken", () => {
             token: "abc123",
             url: "http://127.0.0.1:7777/review",
             // No reviewer/codex timeout configured → fallback default.
-            fetchTimeoutMs: 280_000,
+            fetchTimeoutMs: 660_000,
         })
     })
 
@@ -132,13 +132,13 @@ describe("resolveFetchTimeoutMs", () => {
     test("ignores hook.fetchTimeoutSeconds when not a positive integer", () => {
         expect(
             resolveFetchTimeoutMs({ hook: { fetchTimeoutSeconds: 0 } })
-        ).toBe(280_000) // fallback default
+        ).toBe(660_000) // fallback default
         expect(
             resolveFetchTimeoutMs({ hook: { fetchTimeoutSeconds: "60" } })
-        ).toBe(280_000)
+        ).toBe(660_000)
         expect(
             resolveFetchTimeoutMs({ hook: { fetchTimeoutSeconds: null } })
-        ).toBe(280_000)
+        ).toBe(660_000)
     })
 
     test("auto-derives from reviewer.claude.timeoutSeconds + 60s buffer", () => {
@@ -199,9 +199,9 @@ describe("resolveFetchTimeoutMs", () => {
         ).toBe(30_000)
     })
 
-    test("falls back to the 280s default when nothing is configured", () => {
-        expect(resolveFetchTimeoutMs(null)).toBe(280_000)
-        expect(resolveFetchTimeoutMs({})).toBe(280_000)
+    test("falls back to the 660s default when nothing is configured", () => {
+        expect(resolveFetchTimeoutMs(null)).toBe(660_000)
+        expect(resolveFetchTimeoutMs({})).toBe(660_000)
     })
 
     test("hard-clamps to MAX_FETCH_TIMEOUT_MS for over-cap config", () => {

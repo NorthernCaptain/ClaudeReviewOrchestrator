@@ -109,7 +109,7 @@ const ConfigSchema = z
                             .int()
                             .min(1)
                             .max(MAX_REVIEWER_TIMEOUT_SECONDS)
-                            .default(240),
+                            .default(600),
                         extraArgs: z.array(z.string()).default([]),
                     })
                     .default({}),
@@ -139,7 +139,7 @@ const ConfigSchema = z
                             .int()
                             .min(1)
                             .max(MAX_REVIEWER_TIMEOUT_SECONDS)
-                            .default(240),
+                            .default(600),
                         extraArgs: z.array(z.string()).default([]),
                     })
                     .default({}),
@@ -155,7 +155,7 @@ const ConfigSchema = z
                     .int()
                     .min(1)
                     .max(MAX_REVIEWER_TIMEOUT_SECONDS)
-                    .default(240),
+                    .default(600),
                 maxCodexOutputBytes: z
                     .number()
                     .int()

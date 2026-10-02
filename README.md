@@ -817,7 +817,8 @@ Hook responsibilities (kept minimal):
    has no token → log, exit 0 (fail open). The hook does **not** depend on
    the env var being inherited from Claude Code's launching shell.
 3. POST `http://127.0.0.1:7777/review` with header `X-Review-Token: <token>`
-   and body `{ cwd, session_id, trigger: "stop_hook" }`. Timeout 280s.
+   and body `{ cwd, session_id, trigger: "stop_hook" }`. Timeout is the
+   configured reviewer timeout + 60s (660s by default), capped at 1740s.
 4. On HTTP error / connection refused → log to
    `~/.claude/logs/review-hook.log` and exit 0 (fail open).
 5. Map the response. Decision is driven by `result.status` (which the
@@ -1403,14 +1404,14 @@ example below shows every supported key and the current default):
       "effort": "high",
       "permissionMode": "bypassPermissions",
       "disallowedTools": ["Bash","Edit","Write","NotebookEdit","WebFetch","WebSearch","Task"],
-      "timeoutSeconds": 240,
+      "timeoutSeconds": 600,
       "extraArgs": []
     },
     "gemini": {
       "binary": "gemini",
       "model": "auto",
       "approvalMode": "plan",
-      "timeoutSeconds": 240,
+      "timeoutSeconds": 600,
       "extraArgs": []
     }
   },
@@ -1419,7 +1420,7 @@ example below shows every supported key and the current default):
     "maxCodexRounds": 5,
     "maxBlocks": 6,
     "idleResetMinutes": 10,
-    "codexTimeoutSeconds": 240,
+    "codexTimeoutSeconds": 600,
     "maxCodexOutputBytes": 1048576,
     "maxPayloadBytes": 262144,
     "maxFileBytes": 65536,

@@ -60,7 +60,7 @@ const DEFAULTS = {
                 "WebSearch",
                 "Task",
             ],
-            timeoutSeconds: 240,
+            timeoutSeconds: 600,
             extraArgs: [],
         },
         gemini: {
@@ -72,7 +72,7 @@ const DEFAULTS = {
             // behavior across machines.
             model: "auto",
             approvalMode: "plan",
-            timeoutSeconds: 240,
+            timeoutSeconds: 600,
             extraArgs: [],
         },
     },
@@ -80,7 +80,7 @@ const DEFAULTS = {
         maxCodexRounds: 5,
         maxBlocks: 6,
         idleResetMinutes: 10,
-        codexTimeoutSeconds: 240,
+        codexTimeoutSeconds: 600,
         maxCodexOutputBytes: 1048576,
         maxPayloadBytes: 262144,
         maxFileBytes: 65536,

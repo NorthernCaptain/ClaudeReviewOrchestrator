@@ -116,9 +116,9 @@ const CALLS_RETAIN = 50
 const DEFAULT_PORT = 7777
 const DEFAULT_BIND = "127.0.0.1"
 // Fallback when no config value and no reviewer timeout can be read.
-// Slightly larger than the orchestrator's historical 240s reviewer cap
+// Slightly larger than the orchestrator's default 600s reviewer timeout
 // to preserve the prior behavior for callers that don't pass either.
-const DEFAULT_TIMEOUT_MS = 280 * 1000
+const DEFAULT_TIMEOUT_MS = 660 * 1000
 // Buffer added to the reviewer's own timeout when auto-deriving the
 // hook's fetch timeout. Gives the server enough time to kill the
 // subprocess and write the ESCALATE response before the hook gives up.
