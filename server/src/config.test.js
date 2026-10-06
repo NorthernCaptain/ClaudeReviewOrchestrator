@@ -38,7 +38,7 @@ describe("ConfigSchema", () => {
         const result = ConfigSchema.parse({ authToken: "abc" })
         expect(result.port).toBe(7777)
         expect(result.bind).toBe("127.0.0.1")
-        expect(result.codex.model).toBe("gpt-5.6-sol")
+        expect(result.codex.model).toBe("gpt-6.1-sol")
         expect(result.codex.reasoningEffort).toBe("high")
         expect(result.limits.maxCodexRounds).toBe(5)
         expect(result.blockingSeverities).toEqual(["blocker", "major"])

@@ -42,7 +42,7 @@ describe("ensureToken", () => {
         expect(cfg.authToken).toBe("GENERATED-TOKEN-AAA")
         // Defaults landed.
         expect(cfg.port).toBe(7777)
-        expect(cfg.codex.model).toBe("gpt-5.6-sol")
+        expect(cfg.codex.model).toBe("gpt-6.1-sol")
         expect(cfg.codex.reasoningEffort).toBe("high")
         // Reviewer block ships with provider=codex (existing behavior) and
         // Claude sub-config preloaded so flipping the provider needs no

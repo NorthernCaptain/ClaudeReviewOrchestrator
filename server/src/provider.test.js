@@ -170,19 +170,19 @@ describe("handleSetProvider — persistence", () => {
 describe("handleSetReviewerPreset", () => {
     test("changes codex model and reasoning effort live and on disk", () => {
         const config = {
-            codex: { model: "gpt-5.5", reasoningEffort: "high" },
+            codex: { model: "gpt-6.1-sol", reasoningEffort: "high" },
             reviewer: { provider: "codex" },
         }
         const fs = makeFs(JSON.stringify(config))
         const r = handleSetReviewerPreset({
-            body: { preset: "gpt-5.6-terra:medium" },
+            body: { preset: "gpt-6-astra:medium" },
             config,
             configPath: "/cfg.json",
             deps: { fs },
         })
         expect(r.httpStatus).toBe(200)
         expect(config.codex).toMatchObject({
-            model: "gpt-5.6-terra",
+            model: "gpt-6-astra",
             reasoningEffort: "medium",
         })
         expect(JSON.parse(fs.__store.content).codex.reasoningEffort).toBe(
@@ -221,10 +221,10 @@ describe("handleSetReviewerPreset", () => {
 
     test("catalog exposes model and effort choices for every provider", () => {
         expect(REVIEWER_PRESETS.codex).toContainEqual(
-            expect.objectContaining({ id: "gpt-5.6-sol:high" })
+            expect.objectContaining({ id: "gpt-6.1-sol:high" })
         )
         expect(REVIEWER_PRESETS.codex).toContainEqual(
-            expect.objectContaining({ id: "gpt-5.6-sol:xhigh" })
+            expect.objectContaining({ id: "gpt-6.1-sol:xhigh" })
         )
         expect(REVIEWER_PRESETS.claude).toContainEqual(
             expect.objectContaining({ id: "claude-sonnet-5:high" })
@@ -241,8 +241,9 @@ describe("handleSetReviewerPreset", () => {
         const models = (provider) => [
             ...new Set(REVIEWER_PRESETS[provider].map((p) => p.model)),
         ]
-        expect(models("codex").slice(0, 3)).toEqual([
-            "gpt-6-sol",
+        // Codex offers only the GPT-6 generation: 6.1 Sol plus 6 Astra / Luna.
+        expect(models("codex")).toEqual([
+            "gpt-6.1-sol",
             "gpt-6-astra",
             "gpt-6-luna",
         ])
@@ -252,7 +253,7 @@ describe("handleSetReviewerPreset", () => {
             "claude-sonnet-5-5",
         ])
         for (const model of [
-            "gpt-6-sol",
+            "gpt-6.1-sol",
             "gpt-6-astra",
             "gpt-6-luna",
             "claude-opus-5-5",
@@ -287,7 +288,7 @@ describe("handleSetReviewerPreset", () => {
     test("orders effort variants from xhigh through medium for each model", () => {
         expect(
             REVIEWER_PRESETS.codex
-                .filter((p) => p.model === "gpt-5.6-sol")
+                .filter((p) => p.model === "gpt-6.1-sol")
                 .map((p) => p.effortOrMode)
         ).toEqual(["xhigh", "high", "medium"])
         expect(

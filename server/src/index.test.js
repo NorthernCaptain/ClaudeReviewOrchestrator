@@ -237,7 +237,7 @@ describe("createApp wiring", () => {
         const fakeFs = {
             readFileSync: () =>
                 JSON.stringify({
-                    codex: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+                    codex: { model: "gpt-6.1-sol", reasoningEffort: "high" },
                     reviewer: { provider: "codex" },
                 }),
             writeFileSync: (_p, data) => {
@@ -250,16 +250,16 @@ describe("createApp wiring", () => {
             const r = await fetch(`${url}/dashboard/reviewer-preset`, {
                 method: "PUT",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ preset: "gpt-5.6-terra:medium" }),
+                body: JSON.stringify({ preset: "gpt-6-astra:medium" }),
             })
             expect(r.status).toBe(200)
             expect(await r.json()).toMatchObject({
                 ok: true,
-                model: "gpt-5.6-terra",
+                model: "gpt-6-astra",
                 effortOrMode: "medium",
             })
             expect(cfg.codex).toMatchObject({
-                model: "gpt-5.6-terra",
+                model: "gpt-6-astra",
                 reasoningEffort: "medium",
             })
             expect(writtenJson).toMatch(/"reasoningEffort": "medium"/)

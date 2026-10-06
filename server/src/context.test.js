@@ -132,6 +132,32 @@ describe("resolveContext", () => {
         expect(ctx.repoRoot).toBe(realpathSync(tmp))
     })
 
+    test("an unborn branch (no commits yet) still resolves its name", () => {
+        execFileSync("git", ["init", "-q", "-b", "feature", tmp])
+        writeFileSync(path.join(tmp, "a.js"), "x\n")
+        execFileSync("git", ["-C", tmp, "add", "."])
+        const ctx = resolveContext({ cwd: tmp, allowedRoots: [tmp] })
+        expect(ctx.branch).toBe("feature")
+        expect(ctx.key).toBe(`${ctx.repoRoot}|feature`)
+    })
+
+    test("rethrows the HEAD error when HEAD is neither a commit nor a branch", () => {
+        const headError = new Error("bad HEAD")
+        const fakeGit = (cwd, args) => {
+            if (args[1] === "--show-toplevel") return tmp
+            if (args[1] === "--abbrev-ref") throw headError
+            throw new Error("not a symbolic ref")
+        }
+        expect(() =>
+            resolveContext({
+                cwd: tmp,
+                allowedRoots: [tmp],
+                git: fakeGit,
+                realpath: (p) => p,
+            })
+        ).toThrow(headError)
+    })
+
     test("detached HEAD produces detached:<sha> branch", () => {
         initRepo(tmp)
         // Detach by checking out the commit SHA.

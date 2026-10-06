@@ -26,18 +26,18 @@ export const VALID_PROVIDERS = ["codex", "claude", "gemini"]
 export const REVIEWER_PRESETS = {
     codex: [
         {
-            id: "gpt-6-sol:xhigh",
-            model: "gpt-6-sol",
+            id: "gpt-6.1-sol:xhigh",
+            model: "gpt-6.1-sol",
             effortOrMode: "xhigh",
         },
         {
-            id: "gpt-6-sol:high",
-            model: "gpt-6-sol",
+            id: "gpt-6.1-sol:high",
+            model: "gpt-6.1-sol",
             effortOrMode: "high",
         },
         {
-            id: "gpt-6-sol:medium",
-            model: "gpt-6-sol",
+            id: "gpt-6.1-sol:medium",
+            model: "gpt-6.1-sol",
             effortOrMode: "medium",
         },
         {
@@ -70,55 +70,6 @@ export const REVIEWER_PRESETS = {
             model: "gpt-6-luna",
             effortOrMode: "medium",
         },
-        {
-            id: "gpt-5.6-sol:xhigh",
-            model: "gpt-5.6-sol",
-            effortOrMode: "xhigh",
-        },
-        { id: "gpt-5.6-sol:high", model: "gpt-5.6-sol", effortOrMode: "high" },
-        {
-            id: "gpt-5.6-sol:medium",
-            model: "gpt-5.6-sol",
-            effortOrMode: "medium",
-        },
-        {
-            id: "gpt-5.6-terra:xhigh",
-            model: "gpt-5.6-terra",
-            effortOrMode: "xhigh",
-        },
-        {
-            id: "gpt-5.6-terra:high",
-            model: "gpt-5.6-terra",
-            effortOrMode: "high",
-        },
-        {
-            id: "gpt-5.6-terra:medium",
-            model: "gpt-5.6-terra",
-            effortOrMode: "medium",
-        },
-        {
-            id: "gpt-5.6-luna:xhigh",
-            model: "gpt-5.6-luna",
-            effortOrMode: "xhigh",
-        },
-        {
-            id: "gpt-5.6-luna:high",
-            model: "gpt-5.6-luna",
-            effortOrMode: "high",
-        },
-        {
-            id: "gpt-5.6-luna:medium",
-            model: "gpt-5.6-luna",
-            effortOrMode: "medium",
-        },
-        { id: "gpt-5.5:xhigh", model: "gpt-5.5", effortOrMode: "xhigh" },
-        { id: "gpt-5.5:high", model: "gpt-5.5", effortOrMode: "high" },
-        {
-            id: "gpt-5.5:medium",
-            model: "gpt-5.5",
-            effortOrMode: "medium",
-        },
-        { id: "gpt-5.5:low", model: "gpt-5.5", effortOrMode: "low" },
     ],
     claude: [
         {

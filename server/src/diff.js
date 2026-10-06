@@ -323,6 +323,42 @@ export const currentHeadSha = (repoRoot, git = defaultGit) => {
     }
 }
 
+// HEAD's commit, or — on an unborn branch (a new repo before its first
+// commit, where files may already be staged) — git's empty tree, so the
+// whole index and working tree diff as additions. The returned sha stands
+// in as headSha: stable until the first commit, which then changes it.
+// "Unborn" requires HEAD to name a branch whose ref does not exist:
+// `show-ref --exists` exits 2 only for a missing ref, so a ref that exists
+// but can't be read (or a git too old for --exists) rethrows the original
+// HEAD error instead of silently reviewing against the empty tree.
+const REF_MISSING_STATUS = 2
+const resolveHead = (repoRoot, git) => {
+    try {
+        return {
+            sha: git(repoRoot, ["rev-parse", "HEAD"]).trim(),
+            unborn: false,
+        }
+    } catch (err) {
+        let missing = false
+        try {
+            const ref = git(repoRoot, ["symbolic-ref", "-q", "HEAD"]).trim()
+            git(repoRoot, ["show-ref", "--exists", ref])
+        } catch (refErr) {
+            missing = refErr?.status === REF_MISSING_STATUS
+        }
+        if (!missing) throw err
+        return {
+            sha: git(repoRoot, [
+                "hash-object",
+                "-t",
+                "tree",
+                "/dev/null",
+            ]).trim(),
+            unborn: true,
+        }
+    }
+}
+
 // Resolve a base commit for the head-fallback. Prefer the merge-base
 // with the upstream branch (so a feature branch with N unreviewed
 // commits is reviewed as one range), fall back to HEAD~1 for branches
@@ -354,11 +390,18 @@ export const buildPayload = ({
     fileMeta = defaultFileMeta,
     hashFile = hashRegularFile,
 }) => {
-    const headSha = git(repoRoot, ["rev-parse", "HEAD"]).trim()
+    const head = resolveHead(repoRoot, git)
+    const headSha = head.sha
+    const workingTreeRef = head.unborn ? head.sha : "HEAD"
     const priorFindingPaths = collectPriorFindingPaths(priorFindings, repoRoot)
     const isPrior = (p) => priorFindingPaths.has(p)
 
-    const nameStatusOut = git(repoRoot, ["diff", "HEAD", "--name-status", "-z"])
+    const nameStatusOut = git(repoRoot, [
+        "diff",
+        workingTreeRef,
+        "--name-status",
+        "-z",
+    ])
     const untrackedOut = git(repoRoot, [
         "ls-files",
         "--others",
@@ -395,7 +438,7 @@ export const buildPayload = ({
     // leaves nothing to review in the tree, and must not hide the range.
     const fallbackEnabled = config?.payload?.fallbackToHead === true
     const workingTreeClean = Object.values(sets).every((v) => v.length === 0)
-    let diffRef = "HEAD"
+    let diffRef = workingTreeRef
     let source = "working-tree"
     let baseSha = null
     if (workingTreeClean && fallbackEnabled) {

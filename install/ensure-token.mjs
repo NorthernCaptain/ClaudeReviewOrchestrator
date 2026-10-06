@@ -34,8 +34,8 @@ const DEFAULTS = {
     allowedRoots: [],
     codex: {
         binary: "codex",
-        // gpt-5.6-sol is Codex CLI's current default frontier coding model.
-        model: "gpt-5.6-sol",
+        // gpt-6.1-sol is Codex CLI's current frontier coding model.
+        model: "gpt-6.1-sol",
         reasoningEffort: "high",
         ignoreProjectRules: true,
         extraArgs: [],

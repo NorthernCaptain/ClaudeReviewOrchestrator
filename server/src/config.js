@@ -48,7 +48,7 @@ const ConfigSchema = z
         codex: z
             .object({
                 binary: z.string().default("codex"),
-                model: z.string().default("gpt-5.6-sol"),
+                model: z.string().default("gpt-6.1-sol"),
                 // Maps to `-c model_reasoning_effort=<value>`. Explicit so
                 // review behavior doesn't drift with the user's interactive
                 // ~/.codex/config.toml. "high" is the orchestrator default

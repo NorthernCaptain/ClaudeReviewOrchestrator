@@ -1210,6 +1210,112 @@ describe("buildPayload (integration)", () => {
     })
 })
 
+describe("buildPayload — unborn branch (no commits yet)", () => {
+    let dir
+    const emptyTree = () =>
+        execFileSync("git", [
+            "-C",
+            dir,
+            "hash-object",
+            "-t",
+            "tree",
+            "/dev/null",
+        ])
+            .toString()
+            .trim()
+    beforeEach(() => {
+        dir = realpathSync(mkdtempSync(path.join(tmpdir(), "unborn-")))
+        execFileSync("git", ["init", "-q", "-b", "main", dir])
+        execFileSync("git", ["-C", dir, "config", "user.email", "t@t"])
+        execFileSync("git", ["-C", dir, "config", "user.name", "t"])
+    })
+    afterEach(() => {
+        rmSync(dir, { recursive: true, force: true })
+    })
+
+    test("diffs staged and untracked files against the empty tree", () => {
+        writeFileSync(path.join(dir, "app.js"), "one\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        // An unstaged edit on top of the staged file is reviewed too.
+        writeFileSync(path.join(dir, "app.js"), "one\ntwo\n")
+        writeFileSync(path.join(dir, "notes.txt"), "loose\n")
+        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(out.headSha).toBe(emptyTree())
+        expect(out.source).toBe("working-tree")
+        expect(out.files.modified.map((f) => f.path)).toEqual(["app.js"])
+        expect(out.files.untracked.map((u) => u.path)).toEqual(["notes.txt"])
+        expect(out.promptText).toMatch(/\+one\n\+two/)
+    })
+
+    test("keeps a stable fingerprint until something changes, then the first commit moves headSha", () => {
+        writeFileSync(path.join(dir, "app.js"), "one\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        const a = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const b = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(b.progressHash).toBe(a.progressHash)
+        writeFileSync(path.join(dir, "app.js"), "changed\n")
+        const c = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(c.progressHash).not.toBe(a.progressHash)
+        execFileSync("git", ["-C", dir, "commit", "-qam", "first"])
+        const d = buildPayload({ repoRoot: dir, config: baseConfig() })
+        expect(d.headSha).not.toBe(emptyTree())
+        expect(d.empty).toBe(true)
+    })
+
+    test("an empty unborn repo with fallbackToHead on builds an empty payload", () => {
+        const out = buildPayload({
+            repoRoot: dir,
+            config: { ...baseConfig(), payload: { fallbackToHead: true } },
+        })
+        expect(out.empty).toBe(true)
+        expect(out.source).toBe("working-tree")
+    })
+
+    test.each([
+        ["exists but can't be read", 1],
+        ["exists, yet HEAD still won't resolve", 0],
+        ["can't be checked by an old git without --exists", 129],
+    ])("rethrows the HEAD error when the branch ref %s", (_label, status) => {
+        const headError = new Error("bad HEAD")
+        const git = (_cwd, args) => {
+            if (args[0] === "rev-parse") throw headError
+            if (args[0] === "symbolic-ref") return "refs/heads/main\n"
+            if (args[0] === "show-ref") {
+                if (status === 0) return ""
+                throw Object.assign(new Error("show-ref"), { status })
+            }
+            throw new Error(`unexpected git ${args.join(" ")}`)
+        }
+        expect(() =>
+            buildPayload({ repoRoot: dir, config: baseConfig(), git })
+        ).toThrow(headError)
+    })
+
+    test("a corrupt branch ref is reported, not reviewed against the empty tree", () => {
+        writeFileSync(path.join(dir, "a.js"), "x\n")
+        execFileSync("git", ["-C", dir, "add", "."])
+        execFileSync("git", ["-C", dir, "commit", "-qm", "a"])
+        writeFileSync(
+            path.join(dir, ".git", "refs", "heads", "main"),
+            "garbage\n"
+        )
+        expect(() =>
+            buildPayload({ repoRoot: dir, config: baseConfig() })
+        ).toThrow()
+    })
+
+    test("rethrows when HEAD is neither a commit nor a branch", () => {
+        const headError = new Error("bad HEAD")
+        const git = (_cwd, args) => {
+            if (args[0] === "rev-parse") throw headError
+            throw new Error("not a symbolic ref")
+        }
+        expect(() =>
+            buildPayload({ repoRoot: dir, config: baseConfig(), git })
+        ).toThrow(headError)
+    })
+})
+
 describe("buildPayload — head-fallback (clean working tree)", () => {
     let dir
     beforeEach(() => {

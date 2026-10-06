@@ -1075,6 +1075,14 @@ operator should know about:
   cache and returns `NO_CHANGES` in milliseconds.
 - **In-flight dedup** — concurrent `/review` calls for the same
   `<repoRoot>|<branch>` attach to one in-flight Promise, one spawn.
+- **New repos (no commits yet)** — on an unborn branch, the context
+  resolves the branch from `git symbolic-ref` and the payload diffs the
+  index and working tree against git's empty tree, so staged and untracked
+  files are reviewed as additions. The empty tree's id stands in as
+  `headSha` until the first commit, which changes it and busts the cache.
+  Unborn means HEAD names a branch whose ref does not exist
+  (`git show-ref --exists` exits 2, git ≥ 2.43); a ref that exists but
+  can't be read reports the HEAD error instead.
 - **Head-fallback** — `payload.fallbackToHead: true` (opt-in) reviews
   the last commit range when the working tree has no reviewable change
   (clean, or only `ignorePaths` files changed), catching the "I committed
@@ -1390,7 +1398,7 @@ example below shows every supported key and the current default):
 
   "codex": {
     "binary": "codex",
-    "model": "gpt-5.6-sol",
+    "model": "gpt-6.1-sol",
     "reasoningEffort": "high",
     "ignoreProjectRules": true,
     "extraArgs": []
@@ -1733,7 +1741,7 @@ These are settled for v1.
 - **Default provider:** `codex` (`config.reviewer.provider`). Alternatives
   are `claude` and `gemini` — see *Reviewer providers* above. Each
   provider's model and effort/mode are configured under its own sub-key
-  (e.g. `reviewer.gemini.model`). The codex default model is `gpt-5.6-sol`;
+  (e.g. `reviewer.gemini.model`). The codex default model is `gpt-6.1-sol`;
   override via `config.codex.model`.
 - **Diff scope:** uncommitted only — tracked modifications + untracked
   non-ignored files. Server builds the payload itself and passes it on

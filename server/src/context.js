@@ -32,7 +32,18 @@ export const isContainedIn = (parent, child) => {
 }
 
 const resolveBranch = (git, repoRoot) => {
-    const head = git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+    let head
+    try {
+        head = git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+    } catch (err) {
+        // An unborn branch (a new repo before its first commit) has no
+        // HEAD commit to resolve, but HEAD still names the branch.
+        try {
+            return git(repoRoot, ["symbolic-ref", "--short", "HEAD"])
+        } catch {
+            throw err
+        }
+    }
     if (head !== "HEAD") return head
     const sha = git(repoRoot, ["rev-parse", "--short", "HEAD"])
     return `detached:${sha}`
