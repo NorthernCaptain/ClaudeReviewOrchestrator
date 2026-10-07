@@ -51,8 +51,12 @@ the phased implementation plan — read it before making non-trivial changes.
 See "Phase 0 — Repo scaffolding" in [README.md](README.md). Briefly:
 
 ```
-server/src/                    // implementation modules
-  codex-output.schema.json     // JSON Schema enforced via codex --output-schema
+server/src/                    // the shell: HTTP, auth, MCP transport,
+                               // state store, archive, tools.js, core-loader.js
+  core/                        // the reloadable core (hot-reload plan §5.1)
+    index.js                   // composition root: CORE_API, createCore
+    review/                    // the review path (no UI imports)
+      codex-output.schema.json // JSON Schema enforced via codex --output-schema
 hooks/stop-review.mjs          // Node 24 Stop hook (not bash — no jq dep)
 hooks/notify-change.mjs        // Node 24 PostToolUse hook (shared Claude + codex)
 codex/skill/SKILL.md           // code-review-loop skill — installed into ~/.codex/skills
@@ -65,6 +69,12 @@ install.sh                     // token, launchd, hook, Claude (+ --codex) confi
 The codex integration (`install.sh --codex`) reuses the same hook scripts
 and wires `~/.codex/config.toml` (MCP), `~/.codex/hooks.json`, and the
 skill via `install/merge-codex-*.mjs` / `remove-codex-*.mjs`.
+
+Core modules import only each other and packages, never the shell, and
+never start processes: git and the reviewers come in through the shell's
+capabilities. The core's top level only defines things (no timers, I/O
+or listeners), and it never reads its own folder at run time; non-JS
+files reach it as bytes the shell read at load.
 
 `reviews/` is generated at runtime — do not commit it. `node_modules/`,
 `coverage/`, and persisted state under `~/.cache/review-orchestrator/` are

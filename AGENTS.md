@@ -30,7 +30,8 @@ and the phased implementation plan — read it before making non-trivial changes
 
 ## Layout
 
-`server/src/` contains implementation modules; `hooks/` contains shared Stop
+`server/src/` is the stable shell and `server/src/core/` the reloadable
+core (review path under `core/review/`); `hooks/` contains shared Stop
 and PostToolUse hooks; `codex/skill/SKILL.md` supplies the installed review
 skill; and `install.sh --codex` wires Codex config, hooks, and the skill.
 

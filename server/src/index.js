@@ -3,29 +3,26 @@
  * Author: Leo Khramov
  */
 
+import { randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import express from "express"
-import { loadConfig, defaultConfigPath } from "./config.js"
 import { VERSION } from "./version.js"
 
 export { VERSION }
 import { authMiddleware } from "./auth.js"
-import { mountReviewRoute, snapshotInFlight } from "./review.js"
-import { mountResetRoute } from "./reset.js"
-import { mountMcpRoute } from "./mcp.js"
-import { mountStatusRoute } from "./status.js"
-import { mountDashboardRoute } from "./dashboard.js"
-import { mountNotifyChangeRoute } from "./notify-change.js"
 import {
-    mountProviderRoute,
-    handleSetProvider,
-    handleSetReviewerPreset,
-} from "./provider.js"
-import { handleExclusionMutation } from "./exclusions.js"
-import { handleSetMaxRounds } from "./maxRounds.js"
-import { handleSetMaxBlocks } from "./maxBlocks.js"
-import { handleSetBlockingSeverities } from "./blockingSeverities.js"
+    codexSchemaPathFor,
+    createCoreHolder,
+    DEFAULT_CACHE_DIR,
+    defaultConfigPath,
+    loadCoreModule,
+    loadDefaultCore,
+    prepareCore,
+    pruneCodexSchemas,
+    readConfigFile,
+} from "./core-loader.js"
+import { mountMcpRoute } from "./mcp.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
 import { createMetrics } from "./metrics.js"
@@ -33,11 +30,6 @@ import { logger } from "./logger.js"
 import { createHttpAccessLog, createHttpErrorHandler } from "./http-log.js"
 import { createGuardedSpawn, createTools } from "./tools.js"
 
-// Build the structured "ready" log line emitted right after the server
-// starts accepting connections. Includes the version and the
-// non-sensitive subset of config the operator needs to verify the
-// daemon picked up the right knobs after a config change. Pure
-// function — exported for unit testing.
 // Inline yin-yang favicon (v0.1.36). Colors match the dashboard's dark
 // slate palette so the tab icon reads as the same UI. Served from
 // /favicon.svg and /favicon.ico (browsers auto-request the latter when
@@ -68,68 +60,60 @@ export const loopbackOnly = (req, res, next) => {
     next()
 }
 
-export const summarizeStartup = (config, version = VERSION) => {
-    const provider = config?.reviewer?.provider ?? "codex"
-    const providerCfg =
-        provider === "claude"
-            ? config?.reviewer?.claude
-            : provider === "gemini"
-              ? config?.reviewer?.gemini
-              : config?.codex
-    const effortOrMode =
-        provider === "claude"
-            ? (providerCfg?.effort ?? null)
-            : provider === "gemini"
-              ? (providerCfg?.approvalMode ?? null)
-              : (providerCfg?.reasoningEffort ?? null)
-    const hookCfg = config?.hook?.fetchTimeoutSeconds
-    return {
-        version,
-        port: config?.port,
-        bind: config?.bind,
-        provider,
-        model: providerCfg?.model ?? null,
-        effortOrMode,
-        reviewerTimeoutSeconds:
-            providerCfg?.timeoutSeconds ??
-            config?.limits?.codexTimeoutSeconds ??
-            null,
-        hookFetchTimeoutSeconds:
-            // null in config → auto-derive in stop-review.mjs; surface
-            // that intent here rather than papering over it with a
-            // recomputed number that may drift if logic changes.
-            hookCfg === undefined ? null : hookCfg,
-        maxCodexRounds: config?.limits?.maxCodexRounds ?? null,
-        maxBlocks: config?.limits?.maxBlocks ?? null,
-        allowedRootsCount: Array.isArray(config?.allowedRoots)
-            ? config.allowedRoots.length
-            : 0,
-        blockingSeverities: config?.blockingSeverities ?? [],
-    }
-}
-
+// Every route below except /healthz and the favicon is a delegate: it
+// runs on the core current at that moment (hot-reload plan §5.1). The
+// shell owns paths, auth and the loopback guard; the core owns behaviour.
 export const createApp = ({
     config,
     store,
     archive = null,
     logger: log = logger,
     deps: callerDeps = {},
-    startedAt = Date.now(),
     metrics = createMetrics(),
     configPath = defaultConfigPath(),
+    core,
 }) => {
     // Shell-owned in-flight registries (hot-reload plan §5.5): duplicate
     // matching, per-context ordering and the dashboard's in-flight view
     // live here, outside any reloadable module, so they survive a swap.
-    // Callers (tests) may still inject their own.
+    // Every git and reviewer process goes through the shell's tools: async
+    // git with the live limits.gitTimeoutSeconds, and a spawn that refuses
+    // Node executables. Callers (tests) may still inject their own.
+    const tools = createTools({
+        getGitTimeoutMs: () => (config.limits?.gitTimeoutSeconds ?? 30) * 1000,
+    })
     const deps = {
         inflight: new Map(),
         contextChains: new Map(),
         inflightMeta: new Map(),
+        git: tools.git,
+        spawn: createGuardedSpawn(),
         ...callerDeps,
     }
+    const live = Object.freeze({
+        config,
+        configPath,
+        store,
+        archive,
+        metrics,
+        logger: log,
+        registries: Object.freeze({
+            inflight: deps.inflight,
+            contextChains: deps.contextChains,
+            inflightMeta: deps.inflightMeta,
+        }),
+        deps,
+    })
+    core.attach(live)
+    const cores = createCoreHolder(core)
+    const route = (pick) => (req, res, next) =>
+        pick(cores.current().routes)(req, res, next)
+    const mutation = (key) => route((r) => r.dashboardMutations[key])
+
     const app = express()
     app.disable("x-powered-by")
+    app.locals.cores = cores
+    app.locals.live = live
 
     // Access log runs before body parsing so we see every incoming
     // request including ones rejected by JSON parsing or auth. It logs
@@ -158,13 +142,10 @@ export const createApp = ({
     // before auth) because the dashboard page polls it without a token,
     // same trust boundary as GET /. Exposes only repo/branch/elapsed,
     // no diff or finding content.
-    app.get("/inflight", (_req, res) => {
-        res.setHeader("Cache-Control", "no-store")
-        res.json({
-            ok: true,
-            inFlight: snapshotInFlight(Date.now, deps.inflightMeta),
-        })
-    })
+    app.get(
+        "/inflight",
+        route((r) => r.inflight)
+    )
 
     // Dashboard control endpoints (v0.1.35). Mounted BEFORE auth so the
     // public dashboard page can use them without embedding the
@@ -174,158 +155,58 @@ export const createApp = ({
     // the operator ever widens the bind, these stay locked down. The
     // canonical authed routes (POST /reset, PUT /provider) remain
     // available for cross-host callers with a valid token.
-    // Dashboard reset: takes `{ contextKey }` (preferred) — the
-    // store key already encodes (repoRoot, branch), so unlike `cwd`
-    // it can't be ambiguous when a repo has multiple branches in the
-    // store. Validates against store.list() before touching state.
-    app.post("/dashboard/reset", loopbackOnly, (req, res) => {
-        const contextKey = req.body?.contextKey
-        if (typeof contextKey !== "string" || contextKey.length === 0) {
-            return res
-                .status(400)
-                .json({ ok: false, error: "contextKey is required" })
-        }
-        const known = (store?.list?.() ?? []).find((c) => c.key === contextKey)
-        if (!known) {
-            return res.status(404).json({
-                ok: false,
-                error: `unknown context: ${contextKey}`,
-            })
-        }
-        const fresh = store.reset({
-            key: known.key,
-            repoRoot: known.repoRoot,
-            branch: known.branch,
-        })
-        res.json({
-            ok: true,
-            context: {
-                repo: known.repo ?? known.repoRoot?.split("/").pop() ?? null,
-                repoRoot: known.repoRoot,
-                branch: known.branch,
-                key: known.key,
-            },
-            state: {
-                codexRounds: fresh.codexRounds,
-                blockCount: fresh.blockCount,
-                lastResultStatus: fresh.lastResultStatus,
-            },
-        })
-    })
-    app.put("/dashboard/provider", loopbackOnly, (req, res) => {
-        const result = handleSetProvider({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-    app.put("/dashboard/reviewer-preset", loopbackOnly, (req, res) => {
-        const result = handleSetReviewerPreset({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // Per-context exclusion mutations (v1.1). Loopback-only; same trust
-    // boundary as the other dashboard mutation routes.
-    app.post("/dashboard/exclusions", loopbackOnly, (req, res) => {
-        const result = handleExclusionMutation({ body: req.body, store })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // Adjust the codex-rounds cap from the dashboard (v1.1.8). Live +
-    // best-effort persisted, same loopback trust boundary as the rest
-    // of the dashboard mutation surface.
-    app.put("/dashboard/max-rounds", loopbackOnly, (req, res) => {
-        const result = handleSetMaxRounds({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // Adjust the block cap from the dashboard (v1.1.19). Live +
-    // best-effort persisted, same loopback trust boundary.
-    app.put("/dashboard/max-blocks", loopbackOnly, (req, res) => {
-        const result = handleSetMaxBlocks({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // Pick which severities count as blocking from the dashboard
-    // (v1.1.13). Live + best-effort persisted, same loopback trust
-    // boundary as the rest of the dashboard mutation surface.
-    app.put("/dashboard/blocking-severities", loopbackOnly, (req, res) => {
-        const result = handleSetBlockingSeverities({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
+    app.post("/dashboard/reset", loopbackOnly, mutation("reset"))
+    app.put("/dashboard/provider", loopbackOnly, mutation("provider"))
+    app.put(
+        "/dashboard/reviewer-preset",
+        loopbackOnly,
+        mutation("reviewerPreset")
+    )
+    app.post("/dashboard/exclusions", loopbackOnly, mutation("exclusions"))
+    app.put("/dashboard/max-rounds", loopbackOnly, mutation("maxRounds"))
+    app.put("/dashboard/max-blocks", loopbackOnly, mutation("maxBlocks"))
+    app.put(
+        "/dashboard/blocking-severities",
+        loopbackOnly,
+        mutation("blockingSeverities")
+    )
 
     // GET / — public dashboard. Mounted BEFORE the auth middleware so
     // it's reachable without the x-review-token. Safe because the
     // server binds 127.0.0.1 by default — the trust boundary is the
     // network bind, not an HTTP secret.
-    mountDashboardRoute(app, {
-        archive,
-        config,
-        store,
-        summarize: summarizeStartup,
-        version: VERSION,
-        startedAt,
-        metrics,
-        inFlight: () => snapshotInFlight(Date.now, deps.inflightMeta),
-    })
+    app.get(
+        "/",
+        route((r) => r.dashboardPage)
+    )
 
     app.use(authMiddleware({ token: config.authToken }))
-    mountReviewRoute(app, {
-        config,
-        store,
-        archive,
-        logger: log,
-        deps,
-        metrics,
-    })
-    mountResetRoute(app, { config, store, deps })
-    mountNotifyChangeRoute(app, { config, store, logger: log, deps })
-    mountProviderRoute(app, { config, configPath, logger: log, deps })
+    app.post(
+        "/review",
+        route((r) => r.review)
+    )
+    app.post(
+        "/reset",
+        route((r) => r.reset)
+    )
+    app.post(
+        "/notify-change",
+        route((r) => r.notifyChange)
+    )
+    app.put(
+        "/provider",
+        route((r) => r.provider)
+    )
     // Capture the MCP route's closeAllSessions so shutdown can drain
     // long-poll GETs (otherwise server.close() never resolves).
-    const mcp = mountMcpRoute(app, {
-        config,
-        store,
-        archive,
+    app.locals.mcp = mountMcpRoute(app, {
+        currentCore: () => cores.current(),
         logger: log,
-        deps,
-        metrics,
     })
-    app.locals.mcp = mcp
-    mountStatusRoute(app, {
-        config,
-        store,
-        archive,
-        startedAt,
-        version: VERSION,
-    })
+    app.get(
+        "/status",
+        route((r) => r.status)
+    )
 
     // Last middleware: catches errors from next(err) / async route
     // handlers. Logs with stack and returns a sanitized 500 to the
@@ -335,7 +216,9 @@ export const createApp = ({
     return app
 }
 
-export const startServer = ({
+// Without a `core`, loads the default one for `config` (with an
+// ephemeral codex schema path; main() passes its own core).
+export const startServer = async ({
     config,
     store,
     archive = null,
@@ -343,16 +226,20 @@ export const startServer = ({
     log = logger,
     startedAt = Date.now(),
     configPath = defaultConfigPath(),
-} = {}) =>
-    new Promise((resolve) => {
+    core = null,
+} = {}) => {
+    const active =
+        core ??
+        (await loadDefaultCore({ config, shellVersion: VERSION, startedAt }))
+    return new Promise((resolve) => {
         const app = createApp({
             config,
             store,
             archive,
             logger: log,
             deps,
-            startedAt,
             configPath,
+            core: active,
         })
         const server = app.listen(config.port, config.bind)
         let settled = false
@@ -409,10 +296,11 @@ export const startServer = ({
             // Followed immediately by a structured config summary so
             // the operator can verify the daemon picked up the right
             // version + provider + timeouts without curling /status.
-            log.info(summarizeStartup(config), "active config")
+            log.info(active.summarizeConfig(config), "active config")
             settle({ ok: true, server, address: addr, sockets, app })
         })
     })
+}
 
 // Shut down the HTTP server cleanly. The contract:
 //   1. Stop accepting new connections (server.close()).
@@ -590,9 +478,22 @@ export const checkReviewerEnv = (
 /* istanbul ignore next -- process entry, exercised by smoke test only */
 const main = async () => {
     const configPath = process.env.REVIEW_ORCH_CONFIG ?? defaultConfigPath()
+    const startedAt = Date.now()
+    // Startup loads core v1 through the same loader a reload uses.
+    let loaded
+    try {
+        loaded = await loadCoreModule({ packageVersion: VERSION })
+    } catch (err) {
+        logger.error(
+            { err: err.message, code: err.code },
+            "failed to load the review core"
+        )
+        process.exitCode = 1
+        return
+    }
     let config
     try {
-        config = loadConfig({ configPath })
+        config = loaded.module.validateConfig(readConfigFile({ configPath }))
     } catch (err) {
         logger.error(
             { err: err.message, code: err.code, configPath },
@@ -632,18 +533,38 @@ const main = async () => {
         )
     }
 
-    // Every git and reviewer process goes through the shell's tools:
-    // async git with the live limits.gitTimeoutSeconds, and a spawn that
-    // refuses Node executables.
-    const tools = createTools({
-        getGitTimeoutMs: () => config.limits.gitTimeoutSeconds * 1000,
+    const codexSchemaPath = codexSchemaPathFor({
+        cacheDir: DEFAULT_CACHE_DIR,
+        version: loaded.version,
+        nonce: randomBytes(6).toString("hex"),
     })
+    pruneCodexSchemas({ keep: codexSchemaPath })
+    let core
+    try {
+        core = prepareCore({
+            loaded,
+            config,
+            shellVersion: VERSION,
+            startedAt,
+            codexSchemaPath,
+        })
+    } catch (err) {
+        logger.error(
+            { err: err.message, code: err.code },
+            "the review core rejected this config"
+        )
+        process.exitCode = 1
+        return
+    }
+    logger.info({ coreVersion: loaded.version }, "review core loaded")
+
     const result = await startServer({
         config,
         store,
         archive,
         configPath,
-        deps: { git: tools.git, spawn: createGuardedSpawn() },
+        startedAt,
+        core,
     })
     if (!result.ok) {
         process.exitCode = 1

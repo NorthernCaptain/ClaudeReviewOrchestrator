@@ -539,8 +539,8 @@ invalidate `promptHash`, ignore globs, truncation, and the
 prompt-injection delimiters. Owning the payload end-to-end is
 non-negotiable across all three providers.
 
-Argv per provider (see [`server/src/codex.js`](./server/src/codex.js),
-[`claude.js`](./server/src/claude.js), [`gemini.js`](./server/src/gemini.js)
+Argv per provider (see [`server/src/core/review/codex.js`](./server/src/core/review/codex.js),
+[`claude.js`](./server/src/core/review/claude.js), [`gemini.js`](./server/src/core/review/gemini.js)
 for the canonical builders):
 
 ```bash
@@ -575,7 +575,7 @@ Common ground:
   available.
 - The reviewer is read-only via per-CLI sandbox/permission flags +
   (for claude) an explicit `--disallowed-tools` block.
-- Output is JSON validated against `server/src/codex-output.schema.json`.
+- Output is JSON validated against `server/src/core/review/codex-output.schema.json`.
   Codex enforces the schema via `--output-schema`; claude via
   `--json-schema` (a sanitized subset — see "Reviewer providers"); gemini
   relies on the prompt directive plus our salvage parser + ajv
@@ -959,7 +959,7 @@ The reviewer is pluggable. `config.reviewer.provider` picks one of:
 
 Each adapter implements the same `runAndParse({repoRoot, prompt, config})`
 contract and returns `{status, findings, raw, salvaged?}`. The schema
-([`server/src/codex-output.schema.json`](./server/src/codex-output.schema.json))
+([`server/src/core/review/codex-output.schema.json`](./server/src/core/review/codex-output.schema.json))
 is shared across providers; it allows exactly two status values — `GOOD_TO_GO`
 and `ISSUES`. Every other public status (`GOOD_TO_GO_WITH_NOTES`, `NO_CHANGES`,
 `NO_PROGRESS_WITH_OPEN_ISSUES`, `ESCALATE`) is **server-derived** from those
@@ -970,8 +970,8 @@ to the schema-valid pair before validation as defense in depth.
 The `claude` adapter cannot pass that schema over `--json-schema` verbatim:
 the CLI compiles it with its own draft-07 ajv (which has no `$schema`
 `2020-12` meta-schema) and then hands it to the API as a strict tool
-`input_schema` (which rejects a top-level `allOf`). `claudeSchemaText()` in
-[`claude.js`](./server/src/claude.js) strips `$schema`, `$id`, and the
+`input_schema` (which rejects a top-level `allOf`). `toClaudeSchema()` in
+[`schema.js`](./server/src/core/review/schema.js) strips `$schema`, `$id`, and the
 top-level `allOf` before inlining; the finding shape (`$defs`/`$ref`, enums,
 `["string","null"]`) survives intact. Since the stripped `allOf` was what
 tied `status` to `findings.length`, the adapter re-derives `status` from the
@@ -1023,7 +1023,7 @@ scripts/reset-review.sh                 # current repo+branch
 scripts/reset-review.sh /path/to/repo   # a specific repo
 ```
 
-### 7. Dashboard (`server/src/dashboard.js`, served at `GET /`)
+### 7. Dashboard (`server/src/core/dashboard.js`, served at `GET /`)
 
 Self-contained HTML page, no external assets, no client-side framework. Three
 panels:

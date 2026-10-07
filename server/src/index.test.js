@@ -4,7 +4,8 @@
  */
 
 import { jest } from "@jest/globals"
-import { mkdtempSync, rmSync } from "node:fs"
+import { execFileSync } from "node:child_process"
+import { mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -12,9 +13,9 @@ import {
     startServer,
     gracefulShutdown,
     checkReviewerEnv,
-    summarizeStartup,
     VERSION,
 } from "./index.js"
+import { loadDefaultCore } from "./core-loader.js"
 import { createStateStore } from "./state.js"
 
 const minimalConfig = (over = {}) => ({
@@ -147,6 +148,45 @@ describe("startServer", () => {
             expect(["EADDRINUSE", "EACCES"]).toContain(result.error.code)
         } finally {
             await first.close()
+        }
+    })
+})
+
+describe("startServer without injected capabilities", () => {
+    test("runs git and reviewers through the shell's own tools", async () => {
+        const repo = realpathSync(
+            mkdtempSync(path.join(tmpdir(), "index-git-"))
+        )
+        execFileSync("git", ["init", "-q", "-b", "main", repo])
+        const store = makeStore()
+        const r = await startServer({
+            config: minimalConfig({ allowedRoots: [repo] }),
+            store,
+            log: silentLog,
+        })
+        const url = `http://127.0.0.1:${r.address.port}`
+        try {
+            const post = (route) =>
+                fetch(`${url}${route}`, {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json",
+                        "x-review-token": "secret",
+                    },
+                    body: JSON.stringify({ cwd: repo }),
+                })
+            const reset = await post("/reset")
+            expect(reset.status).toBe(200)
+            expect((await reset.json()).context.branch).toBe("main")
+            expect((await post("/notify-change")).status).toBe(200)
+            const { spawn } = r.app.locals.live.deps
+            expect(() => spawn(process.execPath, [], {})).toThrow(
+                expect.objectContaining({ code: "TOOL_IS_NODE" })
+            )
+        } finally {
+            await new Promise((done) => r.server.close(done))
+            rmSync(store.__dir, { recursive: true, force: true })
+            rmSync(repo, { recursive: true, force: true })
         }
     })
 })
@@ -803,14 +843,20 @@ describe("gracefulShutdown", () => {
 })
 
 describe("MCP closeAllSessions integration via createApp", () => {
-    test("createApp exposes mcp.closeAllSessions on app.locals", () => {
+    test("createApp exposes mcp.closeAllSessions on app.locals", async () => {
         const store = createStateStore({ filePath: null, now: () => 0 })
+        const config = minimalConfig()
         const app = createApp({
-            config: minimalConfig(),
+            config,
             store,
             archive: null,
             logger: silentLog,
             deps: happyDeps,
+            core: await loadDefaultCore({
+                config,
+                shellVersion: VERSION,
+                startedAt: 0,
+            }),
         })
         expect(typeof app.locals?.mcp?.closeAllSessions).toBe("function")
     })
@@ -928,108 +974,12 @@ describe("checkReviewerEnv", () => {
     })
 })
 
-describe("VERSION + summarizeStartup", () => {
+describe("VERSION", () => {
     test("VERSION is a non-empty semver-ish string read from package.json", () => {
         expect(typeof VERSION).toBe("string")
         expect(VERSION.length).toBeGreaterThan(0)
         // Should match major.minor.patch (allowing pre-release suffix).
         expect(VERSION).toMatch(/^\d+\.\d+\.\d+(-.+)?$/)
-    })
-
-    test("summarizeStartup picks codex sub-config and effort", () => {
-        const cfg = {
-            port: 7777,
-            bind: "127.0.0.1",
-            reviewer: { provider: "codex" },
-            codex: { model: "gpt-5.5", reasoningEffort: "high" },
-            limits: {
-                codexTimeoutSeconds: 240,
-                maxCodexRounds: 5,
-                maxBlocks: 6,
-            },
-            allowedRoots: ["/r"],
-            blockingSeverities: ["blocker", "major"],
-        }
-        const s = summarizeStartup(cfg, "0.1.0")
-        expect(s.version).toBe("0.1.0")
-        expect(s.provider).toBe("codex")
-        expect(s.model).toBe("gpt-5.5")
-        expect(s.effortOrMode).toBe("high")
-        expect(s.reviewerTimeoutSeconds).toBe(240)
-        expect(s.maxCodexRounds).toBe(5)
-        expect(s.allowedRootsCount).toBe(1)
-    })
-
-    test("summarizeStartup picks claude sub-config and effort", () => {
-        const cfg = {
-            port: 7777,
-            reviewer: {
-                provider: "claude",
-                claude: {
-                    model: "claude-opus-4-7",
-                    effort: "medium",
-                    timeoutSeconds: 600,
-                },
-            },
-            limits: { codexTimeoutSeconds: 240 },
-        }
-        const s = summarizeStartup(cfg, "0.1.0")
-        expect(s.provider).toBe("claude")
-        expect(s.model).toBe("claude-opus-4-7")
-        expect(s.effortOrMode).toBe("medium")
-        // claude's timeoutSeconds wins over the codex fallback.
-        expect(s.reviewerTimeoutSeconds).toBe(600)
-    })
-
-    test("summarizeStartup picks gemini sub-config and approvalMode", () => {
-        const cfg = {
-            port: 7777,
-            reviewer: {
-                provider: "gemini",
-                gemini: {
-                    model: "auto",
-                    approvalMode: "plan",
-                    timeoutSeconds: 600,
-                },
-            },
-            limits: { codexTimeoutSeconds: 240 },
-        }
-        const s = summarizeStartup(cfg, "0.1.0")
-        expect(s.provider).toBe("gemini")
-        expect(s.model).toBe("auto")
-        expect(s.effortOrMode).toBe("plan")
-        expect(s.reviewerTimeoutSeconds).toBe(600)
-    })
-
-    test("summarizeStartup surfaces hookFetchTimeoutSeconds=null when auto-derive is in effect", () => {
-        const s = summarizeStartup({
-            reviewer: { provider: "gemini", gemini: { model: "auto" } },
-            hook: { fetchTimeoutSeconds: null },
-            limits: { codexTimeoutSeconds: 240 },
-        })
-        // null is the documented "auto-derive in stop-review.mjs" signal —
-        // we surface it verbatim rather than recomputing the derived
-        // number here (which would drift if the derivation changes).
-        expect(s.hookFetchTimeoutSeconds).toBeNull()
-    })
-
-    test("summarizeStartup surfaces a pinned hookFetchTimeoutSeconds", () => {
-        const s = summarizeStartup({
-            reviewer: { provider: "gemini", gemini: { model: "auto" } },
-            hook: { fetchTimeoutSeconds: 800 },
-            limits: { codexTimeoutSeconds: 240 },
-        })
-        expect(s.hookFetchTimeoutSeconds).toBe(800)
-    })
-
-    test("summarizeStartup defaults provider to codex when reviewer block is absent", () => {
-        const s = summarizeStartup({
-            port: 7777,
-            codex: { model: "gpt-5.5", reasoningEffort: "high" },
-            limits: { codexTimeoutSeconds: 240 },
-        })
-        expect(s.provider).toBe("codex")
-        expect(s.model).toBe("gpt-5.5")
     })
 })
 
