@@ -185,7 +185,7 @@ running server, even if the candidate is then rejected.
   - on every dashboard config transaction's merged result (§5.5).
 - **`attach(live)`** hands over the live capabilities `{ config (holder),
   store, archive, metrics, registries: { inflight, contextChains,
-  inflightMeta }, logger, configTransaction, spawnTool, execToolSync }`. It's called **only at the
+  inflightMeta }, logger, configTransaction, spawnTool, execTool }`. It's called **only at the
   swap**, inside the swap gate (§5.5), after every check has passed.
   **`attach` is a pure reference assignment:** it stores the object it's
   given inside the candidate, and does nothing else. No I/O, no
@@ -276,17 +276,24 @@ from different edits under the earlier hash.
      can't start processes on its own at all.
 
    **Processes go through an allowlisted shell capability.** The core
-   runs external tools only through `spawnTool(name, args, opts)` and
-   `execToolSync(name, args, opts)`, part of the live capabilities
-   (§5.2), never available in staging:
+   runs external tools only through `spawnTool(name, args, opts)`
+   (streaming, for the reviewers) and `execTool(name, args, opts)`
+   (buffered, for `git`). Both are **asynchronous**, part of the live
+   capabilities (§5.2), and never available in staging. There's no
+   synchronous variant (see "No blocking subprocesses" below):
    - `name` is a **tool name**, not a path: `git`, `codex`, `claude` or
      `gemini`. Nothing else can be run;
-   - the caller passes **its pinned config** (`opts.config`), the frozen
-     object admission handed it (§5.5). The shell checks it's one it
-     issued, keeping them in a `WeakSet`, and resolves the binary from it:
-     `git` from `PATH`, the reviewers from that config's `codex.binary` /
-     `reviewer.claude.binary` / `reviewer.gemini.binary`. **Never from the
-     live config.** So a dashboard edit made while a review runs, or while
+   - **`git`** isn't configurable: it's resolved from `PATH`, and any
+     request that has pinned a core may run it. That includes non-review
+     entry points like `/reset`, `/notify-change` and MCP
+     `reset_review_context`, which resolve the repo context with git but
+     never pass review admission;
+   - **the reviewer tools** (`codex`, `claude`, `gemini`) need **the
+     caller's pinned config** (`opts.config`), the frozen object review
+     admission handed it (§5.5). The shell checks it's one it issued,
+     keeping them in a `WeakSet`, and resolves the binary from that
+     config's `codex.binary` / `reviewer.claude.binary` /
+     `reviewer.gemini.binary`. **Never from the live config.** So a dashboard edit made while a review runs, or while
      it waits on the per-context chain, can't change which executable that
      review runs. That executable is the one its pinned config, and so its
      `reviewKey`, describes;
@@ -295,6 +302,25 @@ from different edits under the earlier hash.
      `process.execPath`. That holds even if a config points a reviewer
      binary at one, so a core can't run a JavaScript file from outside
      its snapshot via `node <script>`.
+
+   **No blocking subprocesses.** Today `context.js` and `diff.js` run
+   `git` with `execFileSync`, with no timeout. A stalled git (a hung
+   credential prompt, a slow network filesystem, a locked index) blocks
+   the whole event loop. Deadlines can't fire, admissions can't
+   release, and a reload can't be handled; promise races mean nothing
+   if no other code runs. So:
+   - every request-path git call goes through the async `execTool`,
+     with a per-command timeout of `limits.gitTimeoutSeconds` (new,
+     default 30). On timeout the child is killed (`SIGTERM`, then
+     `SIGKILL` after 2 s);
+   - `resolveContext`, `buildPayload`, `isWorkingTreeClean`,
+     `currentHeadSha` and `resolveFallbackBase` become `async`. That's
+     a Phase 1 refactor of today's synchronous code and its tests;
+   - a git timeout fails just that request, as a transient `ESCALATE`
+     (`GIT_TIMEOUT`, not cached, with no state written). Every other
+     request, deadline and reload proceeds meanwhile;
+   - the containment check keeps `child_process` out of core modules,
+     so no synchronous subprocess can come back in through the core.
 
    The reviewer CLIs (some of them Node programs installed with npm) and
    `git` are external tools, outside the version just like package
@@ -922,11 +948,12 @@ the deadline bounds the **response**, never the review:
     time spent held come out of that one budget, so no sequence of
     `409`s and holds can outlast the harness.
   - **When to stop retrying.** On `HOOK_LIMIT_STALE` the hook resends
-    with the returned limit, unless that's already its third attempt, or
-    the remaining budget can't cover the required limit. In those cases
-    it resends with `finalAttempt: true`, and the server then proceeds on
-    the deadline rules below instead of answering `409` again. So there
-    are at most three attempts, all inside the one budget.
+    with the returned limit. The **third outgoing attempt** (sent after a
+    second `HOOK_LIMIT_STALE`) always carries `finalAttempt: true`, and so
+    does any earlier resend when the remaining budget can't cover the
+    required limit. On a final attempt the server never answers `409`; it
+    proceeds on the deadline rules below. So there are at most three
+    attempts, all inside the one budget.
   - A request therefore starts a review under a config whose reviewer
     timeout fits the limit its hook is using, unless the config kept
     changing across retries or the budget ran short. Then it proceeds on
@@ -1652,7 +1679,9 @@ for the settings they use to *reach* it:
 | A review admitted on the old core while the swap waits for the config lock | The swap gate covers every swap that starts at idle: when the last release reaches zero, and when preparation finishes with the count already zero. Admission closes in that same synchronous step, before the lock wait (§5.4 step 7, §5.5). |
 | A replace or cancel trigger lands while a gated swap waits for the config lock | The gated swap captures and freezes the candidate. Reload triggers wait for the gate to reopen, then act on the resulting state (§5.5). |
 | A core module imports a source-tree file outside the snapshot, so code changes without a new version id | The snapshot builder checks import containment on every file. Only package imports, and relative imports that resolve inside `server/src/core/`, are allowed; absolute paths, `file:`, `#` aliases, self-package and dynamic `import()` fail the reload (§5.3 step 3a). |
-| A core module loads code outside the snapshot through `createRequire`, `vm`, `eval`, `Function`, workers, or running `node` (via `process.execPath`, by name, or by path) | The AST check rejects those loaders and any `child_process` import. Processes run only through the shell's `spawnTool` / `execToolSync`: a tool-name allowlist (`git`, the configured reviewers) that refuses Node executables. The guarantee targets accidental drift (§5.3 step 3a). |
+| A core module loads code outside the snapshot through `createRequire`, `vm`, `eval`, `Function`, workers, or running `node` (via `process.execPath`, by name, or by path) | The AST check rejects those loaders and any `child_process` import. Processes run only through the shell's async `spawnTool` / `execTool`: a tool-name allowlist (`git`, the configured reviewers) that refuses Node executables. The guarantee targets accidental drift (§5.3 step 3a). |
+| A stalled git command blocks the event loop, so deadlines, admission releases and reloads stop | All request-path git is async through `execTool`, with `limits.gitTimeoutSeconds`. A timeout fails only that request, as an uncached `GIT_TIMEOUT` (§5.3 step 3a, Phase 1). |
+| Non-review routes (`/reset`, `/notify-change`, `reset_review_context`) can't run git under the capability check | `git` needs only a pinned core; only the reviewer tools need a review-admission config (§5.3 step 3a). |
 | The shell's idle reset drops a field a newer core persisted, breaking the additive-state rule | `idleResetContext` spreads the existing context and clears only the loop counters. The round-trip test includes an idle reset (§5.5, Phase 1). |
 | A rejected candidate changes the running server during preparation | Two-phase init: `createCore(staging)` gets only frozen, read-only inputs; `attach(live)` happens only at the swap. Imports are side-effect-free (tested), and every rejected candidate is disposed (§5.2). |
 | `attach` fails partway and leaves live state altered | `attach` is a pure reference assignment, done before the current core or config changes. A throw aborts the swap with nothing live altered (§5.2, §5.4 step 8.3). |
@@ -1701,7 +1730,7 @@ for the settings they use to *reach* it:
 | `--revoke-now` leaves a leaked token in grace (a failed second call, or a server that missed an intermediate rotation), or sends the new token to an impostor | Revocation is a durable `"none"` record in `auth.rotations`, written atomically with the new token. A predecessor rotated out by, or before, any `"none"` record gets no grace, whichever rotations the server saw. No HTTP call carries a raw token (§5.7). |
 | The core loads resource bytes that differ from the verified snapshot | Resources are passed into `createCore` as the captured, hashed bytes (`staging.resources`), never read from the folder (§5.3). |
 | A dashboard edit commits a holder state that was never self-checked (the file has unapplied manual edits) | Both the merged file and the live result (holder plus delta) are validated and self-checked. The holder gets exactly the checked live result (§5.5). |
-| Handshake retries and holds outlast the 30 min harness | One overall hook deadline (start + 29 min). Each attempt waits `min(limit, remaining)`, and the hook sends `finalAttempt` after 3 attempts or when the budget is short (§5.5). |
+| Handshake retries and holds outlast the 30 min harness | One overall hook deadline (start + 29 min). Each attempt waits `min(limit, remaining)`, and the hook marks its third outgoing attempt (or an earlier one, when the budget is short) `finalAttempt` (§5.5). |
 | A request outlives the Stop hook while held, queued behind same-context reviews, joined to a slow review, or running its own | Request deadlines race every wait. At the deadline the hook gets a silent, uncached `DEADLINE_EXCEEDED`. Not-yet-started work is abandoned, and started reviews finish in the background and cache their result, with their configured timeout never shortened (§5.5). |
 | Waiting edits overwritten at swap | The swap applies the config read at swap time, not the prepare-time copy, and reports keys where the live value differed (§5.4 step 8). |
 | A core disposed under a still-running non-review request | Per-core pin counts cover every request; disposal and snapshot deletion wait for zero (§5.4 step 8.4). |
@@ -1720,9 +1749,9 @@ for the settings they use to *reach* it:
 | Phase | Work | Size |
 |---|---|---|
 | 0. Spike | On the launchd Node 24: importing from `server/.core-versions/<id>/` gives a fresh graph, and package imports resolve to the repo's `node_modules`. Measure memory over 20 reloads. Record Claude Code's MCP behaviour after a restart (the status quo). | S |
-| 1. Shell-owned maps and state | Move `inflight`, `contextChains` and `inflightMeta` out of `review.js` module scope into a shell `registries` object injected via `deps` (already supported). Fix `idleResetContext` to spread the existing context and clear only the loop counters, so it stops dropping fields it doesn't name. Add `spawnTool` / `execToolSync` as shell capabilities (tool-name allowlist, binaries resolved from the caller's shell-issued pinned config, Node executables refused), and route the adapters' and `diff.js`'s process calls through them. Otherwise no behaviour change. | S–M |
+| 1. Shell-owned maps and state | Move `inflight`, `contextChains` and `inflightMeta` out of `review.js` module scope into a shell `registries` object injected via `deps` (already supported). Fix `idleResetContext` to spread the existing context and clear only the loop counters, so it stops dropping fields it doesn't name. Add async `spawnTool` / `execTool` as shell capabilities (tool-name allowlist; `git` from `PATH` for any pinned request; reviewer binaries from the caller's shell-issued pinned config; Node executables refused). Make every request-path git call async with `limits.gitTimeoutSeconds` (default 30): `resolveContext`, `buildPayload`, `isWorkingTreeClean`, `currentHeadSha` and `resolveFallbackBase` become `async`, and route the adapters' and `diff.js`'s process calls through them. Otherwise no behaviour change. | S–M |
 | 2. Core boundary | Static module exports `CORE_API`, `STATE_FORMAT` and `validateConfig`; `createCore(staging)` takes no config and `selfCheck(config)` gets the validated candidate. Add `STATE_FORMAT` to the core contract (swap and rollback only within a format; changes additive). Create `server/src/core/` and two-phase `createCore(staging)` / `attach(live)`, with side-effect-free module top levels, and `git mv` the core modules (mechanical). A review entry module, `core/review/index.js`, exports the pipeline and the MCP review handler; its import closure defines `reviewVersion`, so UI modules must not be imported by it. Routes in `index.js` and MCP tool callbacks become delegates through `currentCore()`. Non-JS resources are read into the core instance at load: `claude.js` / `codex.js` take schema bytes and paths from the instance instead of reading the source tree per call. Startup loads core v1 through the same loader path a reload uses. | L |
-| 3. Reload controller | Snapshot store (read once, hash, re-check, code containment checked on every file with an `acorn` AST (static imports, plus `require`/`createRequire`, `vm`, `worker_threads`, `eval`, `Function`, `import.meta.resolve`, `process.execPath`), a fresh `<id>-<nonce>` folder per load written atomically and never reused, post-import byte verification, a matching ESLint rule, cleanup, tooling ignores), contract check, self-check. Review admission (`admitReview` at entry of `/review` and MCP `request_review`, before any `await`) with config pinning. Per-core pin counts for every request. Project config loaded before duplicate matching. Duplicate key extended with the effective-config fingerprint (global plus `.review-orchestrator.json`), the caller's `extra_instructions` hash and the pinned core version. `extrasHash` beside `reviewKey` (exact for joining and for requests with extras; Stop hooks also accept a pass reached with extras), `reviewKey` (effective provider including per-call override, effective config, `reviewVersion` from the review entry's import closure plus non-JS files under `core/review/` with the output schema moved there, and `shellVersion`; **no caller extras**) is stored as `lastBaseline.reviewKey` and required by every cache shortcut, replacing `reviewConfigHash` as the cache gate. Limit handshake (remaining budget vs `requiredMs` of the pinned config, at admission and at dispatch from the hold or the swap gate, `409 HOOK_LIMIT_STALE`, retries in the shared hook client code under one overall deadline of start + 29 min, each attempt capped to the remaining budget, `finalAttempt` after 3 attempts or when the budget is short). Request deadlines (`timeoutMs` from the Stop hook, raced against the hold, chain, join and own pipeline; silent uncached `DEADLINE_EXCEEDED`; not-started work abandoned; started reviews finish in the background, admission released at pipeline end). Scheduling: the idle decision on the admission counter, pending/replace/cancel, the starvation guard with its hold-at-entry queue (per-request `maxHoldSeconds` deadline, and release onto the current core when a reload ends without a swap), a swap gate for every swap that starts at idle (admission closed, candidate frozen, config lock taken, swap, waiting requests and deferred reload triggers handled against the resulting state). Dispose only the core that drops out of current and previous, and only once its pin count is zero. The swap applies the config read at swap time, after the restart-only and hook-timeout checks. Codex schema file checked and rewritten before every run. `selfCheck(config)` (pure, synchronous) on every config about to go live: at preparation for every candidate, at the swap on the swap-time config, before a rollback's restore, and in config transactions. Rollback from `previous = { core, before, applied }` with a per-key restore comparing before, applied, live and file, a previous-schema check, and a write-back merging only reverted keys into a fresh file read (with backup). `configTransaction` (serialized deltas merged into a fresh `config.json` read, with both the merged file and the live result validated and self-checked, file-owned keys preserved, same-key conflicts reported, revision counter) used by dashboard mutations, the swap and rollback. Schema bytes held in memory per core for every adapter. Codex strict schema in `~/.cache/review-orchestrator/codex-schemas/<id>-<nonce>.json`, hash-checked before every run and rewritten atomically (with `mkdir -p`) when missing or different. **Apply now** (`reload.sh --now`, dashboard button) through the swap gate and every swap-time check, with running reviews finishing on the old core. `/admin/reload`, `scripts/reload.sh` (`--wait`/`--cancel`/`--rollback`), `/healthz` / `/status` fields, `coreVersion` in the archive. | M–L |
+| 3. Reload controller | Snapshot store (read once, hash, re-check, code containment checked on every file with an `acorn` AST (static imports, plus `require`/`createRequire`, `vm`, `worker_threads`, `eval`, `Function`, `import.meta.resolve`, `process.execPath`), a fresh `<id>-<nonce>` folder per load written atomically and never reused, post-import byte verification, a matching ESLint rule, cleanup, tooling ignores), contract check, self-check. Review admission (`admitReview` at entry of `/review` and MCP `request_review`, before any `await`) with config pinning. Per-core pin counts for every request. Project config loaded before duplicate matching. Duplicate key extended with the effective-config fingerprint (global plus `.review-orchestrator.json`), the caller's `extra_instructions` hash and the pinned core version. `extrasHash` beside `reviewKey` (exact for joining and for requests with extras; Stop hooks also accept a pass reached with extras), `reviewKey` (effective provider including per-call override, effective config, `reviewVersion` from the review entry's import closure plus non-JS files under `core/review/` with the output schema moved there, and `shellVersion`; **no caller extras**) is stored as `lastBaseline.reviewKey` and required by every cache shortcut, replacing `reviewConfigHash` as the cache gate. Limit handshake (remaining budget vs `requiredMs` of the pinned config, at admission and at dispatch from the hold or the swap gate, `409 HOOK_LIMIT_STALE`, retries in the shared hook client code under one overall deadline of start + 29 min, each attempt capped to the remaining budget, `finalAttempt` on the third outgoing attempt, or earlier when the budget is short). Request deadlines (`timeoutMs` from the Stop hook, raced against the hold, chain, join and own pipeline; silent uncached `DEADLINE_EXCEEDED`; not-started work abandoned; started reviews finish in the background, admission released at pipeline end). Scheduling: the idle decision on the admission counter, pending/replace/cancel, the starvation guard with its hold-at-entry queue (per-request `maxHoldSeconds` deadline, and release onto the current core when a reload ends without a swap), a swap gate for every swap that starts at idle (admission closed, candidate frozen, config lock taken, swap, waiting requests and deferred reload triggers handled against the resulting state). Dispose only the core that drops out of current and previous, and only once its pin count is zero. The swap applies the config read at swap time, after the restart-only and hook-timeout checks. Codex schema file checked and rewritten before every run. `selfCheck(config)` (pure, synchronous) on every config about to go live: at preparation for every candidate, at the swap on the swap-time config, before a rollback's restore, and in config transactions. Rollback from `previous = { core, before, applied }` with a per-key restore comparing before, applied, live and file, a previous-schema check, and a write-back merging only reverted keys into a fresh file read (with backup). `configTransaction` (serialized deltas merged into a fresh `config.json` read, with both the merged file and the live result validated and self-checked, file-owned keys preserved, same-key conflicts reported, revision counter) used by dashboard mutations, the swap and rollback. Schema bytes held in memory per core for every adapter. Codex strict schema in `~/.cache/review-orchestrator/codex-schemas/<id>-<nonce>.json`, hash-checked before every run and rewritten atomically (with `mkdir -p`) when missing or different. **Apply now** (`reload.sh --now`, dashboard button) through the swap gate and every swap-time check, with running reviews finishing on the old core. `/admin/reload`, `scripts/reload.sh` (`--wait`/`--cancel`/`--rollback`), `/healthz` / `/status` fields, `coreVersion` in the archive. | M–L |
 | 4. Config reload and hook connection | Config-only reloads (code unchanged). Re-read, validate and apply in place at swap. Config pinned per admitted review. Restart-only comparison against start-up values, at prepare time and again at swap. The auth check reads `authToken` from the file on every authenticated request, with the previous-token grace, plus `scripts/rotate-token.sh` (every rotation appends `{ tokenHash, previousTokenHash, grace, at }` to `auth.rotations` (last 10) atomically with the new token. The server grants a predecessor grace only from the record that rotated it out, expiring at its `at` + the grace length, and only if no later record is `"none"`. No HTTP revocation call). All programmatic `config.json` writes go atomic (temp + rename, 0600), under the shared `config.json.lock` (`install/config-lock.mjs`: an `O_EXLOCK` OS lock released by the kernel on owner exit, no stale recovery, 10 s wait timeout) with a content-hash re-check before the rename. `server.json` gains `instanceId`, and `/healthz?challenge=` answers with HMAC proofs keyed by the current and grace tokens. Hooks use it only to pick an address. All non-MCP requests (hooks, plugin, every script) are HMAC-signed through the shared `install/signed-client.mjs` (`X-Review-Timestamp`, `X-Review-Nonce`, `X-Review-Instance`, `X-Review-Signature` covering the target `instanceId`, server nonce cache) instead of carrying `X-Review-Token`, which the server accepts only on `/mcp`; and responses carry `X-Review-Response-Signature`, which the hooks verify. Every config write keeps a rotating backup. `hook-credentials.json` is written only by config writers (`install.sh`, `rotate-token.sh`, the server), under the config lock, from a read inside it. Hooks only read it. Hooks retry unparseable reads and fall back to `hook-credentials.json`. `server.json` carries the live address and `hookTimeoutMs`, rewritten on swap, pending changes and dashboard edits. The Stop hook, notify-change hook and opencode plugin prefer it over `config.json`. The opencode plugin's own `/review` and `/notify-change` calls read the token (and `server.json`) per request instead of once at load (reinstall via `install.sh`). Logger level from the holder. | M |
 | 5. Dashboard | A Host allowlist on every route (loopback names plus the `bind`-derived client host; `421` otherwise), the same set for `Origin`, anti-framing headers (`X-Frame-Options: DENY`, `frame-ancestors 'none'`) plus a framed-page guard, and the local guard widened to loopback or exactly the socket's listening address (`server.address()`, never DNS; IPv4-mapped normalized), and CSRF protection for every `/dashboard/*` mutation: per-server token header, `Origin` checked against the fixed allowlist whenever present, `Sec-Fetch-Site`, JSON body. This covers the existing actions too. Reload / Roll back buttons and result display, version in the header, stale-tab banner from the poll, version on mutation requests. | S–M |
 | 6. Docs and tests | README section, the state compatibility rule and the "needs a restart" list in `CLAUDE.md` / `AGENTS.md`, the tests in §9, version bump. | M |
@@ -1909,6 +1938,16 @@ their own. Phase 3 is the first one you'd notice.
   `eval`, `new Function`, `import.meta.resolve`, `process.execPath` or a
   `child_process` import fails the reload, naming the file and the
   construct.
+- `/reset`, `/notify-change` and MCP `reset_review_context` run git through
+  `execTool` with only a pinned core, and succeed. A reviewer tool called
+  without a shell-issued config is refused.
+- A stalled git (a fake git that sleeps) in one request's
+  `resolveContext`:
+  - another request reaches its deadline and gets `DEADLINE_EXCEEDED` on
+    time;
+  - a dashboard request and a pending reload's swap proceed;
+  - the stalled request fails with `GIT_TIMEOUT` after
+    `gitTimeoutSeconds`, and its child is killed.
 - `spawnTool` resolves a reviewer binary from the caller's pinned config:
   changing `codex.binary` on the dashboard while a review waits on the
   context chain doesn't change the binary that review runs. The next
@@ -2161,9 +2200,10 @@ their own. Phase 3 is the first one you'd notice.
   gets `HOOK_LIMIT_STALE` before any work. The resend runs within the
   hook's overall deadline.
 - The same check at dispatch from the swap gate.
-- Config changing on every attempt: the third attempt carries
-  `finalAttempt: true`, and the server proceeds on the deadline rules
-  instead of answering `409`.
+- Config changing on every attempt: the first two attempts get
+  `HOOK_LIMIT_STALE`, and the third outgoing attempt carries
+  `finalAttempt: true`. The server proceeds on the deadline rules instead
+  of answering `409`, so there's never a fourth attempt.
 - Two attempts each held for 45 s, then a stale-limit `409`: the final
   attempt's timer is capped to the remaining overall budget. The hook
   answers within start + 29 min, under the 30 min harness, every time.
