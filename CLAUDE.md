@@ -29,8 +29,10 @@ the phased implementation plan — read it before making non-trivial changes.
 ## Tech stack
 
 - **Runtime:** Node.js 24 (ESM, `"type": "module"`).
-- **Server:** Express, binds 127.0.0.1, `X-Review-Token` auth on every
-  endpoint except `/healthz`.
+- **Server:** Express, binds 127.0.0.1. `/mcp` authenticates with
+  `X-Review-Token`; every other authenticated route takes only
+  HMAC-signed requests (`hooks/signed-client.mjs`), and `/healthz`
+  is open.
 - **MCP:** `@modelcontextprotocol/sdk` HTTP transport. Tools require
   explicit `cwd` input.
 - **Schema validation:** `ajv` for Codex output JSON Schema, `zod` for

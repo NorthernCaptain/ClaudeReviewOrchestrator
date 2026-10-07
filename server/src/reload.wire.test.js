@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url"
 import { loadCoreModule, prepareCore } from "./core-loader.js"
 import { createCandidateLoader, startServer } from "./index.js"
 import { createStateStore } from "./state.js"
+import { signedHeaders } from "../../hooks/signed-client.mjs"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const TOKEN = "wire-secret"
@@ -172,15 +173,26 @@ const start = async (cfg) => {
     })
     if (!r.ok) throw r.error
     const url = `http://127.0.0.1:${r.address.port}`
-    const call = (route, { method = "GET", body, token = true } = {}) =>
-        fetch(`${url}${route}`, {
+    // Signed like hooks/signed-client.mjs, for the instance /healthz names.
+    const call = async (route, { method = "GET", body, token = true } = {}) => {
+        const text = body ? JSON.stringify(body) : ""
+        let headers = text ? { "content-type": "application/json" } : {}
+        if (token) {
+            const { instanceId } = await (await fetch(`${url}/healthz`)).json()
+            headers = signedHeaders({
+                token: TOKEN,
+                method,
+                path: route,
+                text,
+                instanceId,
+            })
+        }
+        return fetch(`${url}${route}`, {
             method,
-            headers: {
-                "content-type": "application/json",
-                ...(token ? { "x-review-token": TOKEN } : {}),
-            },
-            body: body ? JSON.stringify(body) : undefined,
+            headers,
+            body: text || undefined,
         })
+    }
     const json = async (...a) => (await call(...a)).json()
     return {
         url,

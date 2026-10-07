@@ -15,6 +15,11 @@
 //   updated:<path>     — existing file was missing/empty authToken; token added
 //
 // Returns exit 0 on success. Any error prints "error:<reason>" and exits 1.
+//
+// The CLI runs under the config lock shared with the server and
+// rotate-token (config-lock.mjs), and refreshes hook-credentials.json from
+// the file inside it. Adding a token to an existing file is a locked
+// update: backup, content-hash re-check, atomic rename.
 
 import { randomBytes } from "node:crypto"
 import {
@@ -27,6 +32,12 @@ import {
     renameSync,
 } from "node:fs"
 import path from "node:path"
+import {
+    defaultCredentialsPath,
+    refreshHookCredentials,
+    updateConfigFile,
+    withConfigLock,
+} from "./config-lock.mjs"
 
 const DEFAULTS = {
     port: 7777,
@@ -150,6 +161,7 @@ export const ensureToken = ({
     chmod = chmodSync,
     stat = statSync,
     defaults = DEFAULTS,
+    update = updateConfigFile,
 }) => {
     const cfgDir = path.dirname(configPath)
     mkdir(cfgDir, { recursive: true })
@@ -198,10 +210,29 @@ export const ensureToken = ({
 
     // File exists but token is missing/empty/wrong-typed — add it, preserve
     // the rest.
-    const updated = { ...parsed, authToken: generate() }
-    writeAtomicFn(configPath, JSON.stringify(updated, null, 2) + "\n", 0o600)
-    return { action: "updated", path: configPath, token: updated.authToken }
+    const { config } = update({
+        configPath,
+        update: (current) => ({ ...current, authToken: generate() }),
+    })
+    return { action: "updated", path: configPath, token: config.authToken }
 }
+
+// What the CLI runs: ensureToken under the config lock, then the hooks'
+// credentials cache, both beneath `home` (the installer's --home).
+export const runEnsureToken = ({
+    configPath,
+    home,
+    lock = withConfigLock,
+    ...rest
+}) =>
+    lock(configPath, () => {
+        const result = ensureToken({ configPath, home, ...rest })
+        refreshHookCredentials({
+            configPath,
+            credentialsPath: defaultCredentialsPath(home),
+        })
+        return result
+    })
 
 /* istanbul ignore next -- CLI guard exercised by smoke test only */
 const isDirectInvocation = () => {
@@ -221,7 +252,7 @@ if (isDirectInvocation()) {
             )
             process.exit(1)
         }
-        const r = ensureToken({ configPath, home })
+        const r = await runEnsureToken({ configPath, home })
         process.stdout.write(`${r.action}:${r.path}\n`)
     } catch (err) {
         process.stderr.write(`error:${err.message}\n`)

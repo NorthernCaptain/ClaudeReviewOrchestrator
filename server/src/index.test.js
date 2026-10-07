@@ -5,17 +5,21 @@
 
 import { jest } from "@jest/globals"
 import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import {
+    existsSync,
     mkdtempSync,
     readFileSync,
     realpathSync,
     rmSync,
+    statSync,
     writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
     createApp,
+    createServerInfo,
     startServer,
     gracefulShutdown,
     checkReviewerEnv,
@@ -24,6 +28,12 @@ import {
 } from "./index.js"
 import { loadDefaultCore } from "./core-loader.js"
 import { createStateStore } from "./state.js"
+import {
+    challengeAt,
+    connect,
+    signedHeaders,
+} from "../../hooks/signed-client.mjs"
+import { rotateToken } from "../../install/rotate-token.mjs"
 
 const minimalConfig = (over = {}) => ({
     port: 0,
@@ -94,6 +104,40 @@ const makeStore = () => {
 
 const silentLog = { info: jest.fn(), error: jest.fn(), warn: jest.fn() }
 
+// A request signed the way hooks/signed-client.mjs signs it, for the
+// instance /healthz names. Resolves to the fetch Response.
+const signedFetch = async (
+    url,
+    route,
+    { method = "GET", body, token = "secret" } = {}
+) => {
+    const { instanceId } = await (await fetch(`${url}/healthz`)).json()
+    const text = body === undefined ? "" : JSON.stringify(body)
+    return fetch(`${url}${route}`, {
+        method,
+        headers: signedHeaders({
+            token,
+            method,
+            path: route,
+            text,
+            instanceId,
+        }),
+        body: text || undefined,
+    })
+}
+
+// A config.json for servers started without the start() helper, so no
+// test ever reads the real one.
+const tempConfig = (config) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "index-config-"))
+    const configPath = path.join(dir, "config.json")
+    writeFileSync(configPath, JSON.stringify(config, null, 2))
+    return {
+        configPath,
+        cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    }
+}
+
 // Every server gets its own temp config.json, so a dashboard edit can
 // never reach the real ~/.config/review-orchestrator/config.json.
 const start = async (config, deps = happyDeps, providedStore = null) => {
@@ -157,12 +201,15 @@ describe("startServer", () => {
                 port: first.port,
                 bind: "127.0.0.1",
             })
+            const temp = tempConfig(cfg)
             const result = await startServer({
                 config: cfg,
                 store: makeStore(),
                 deps: happyDeps,
                 log: silentLog,
+                configPath: temp.configPath,
             })
+            temp.cleanup()
             expect(result.ok).toBe(false)
             expect(result.error).toBeDefined()
             // Common codes: EADDRINUSE on macOS/Linux.
@@ -180,22 +227,18 @@ describe("startServer without injected capabilities", () => {
         )
         execFileSync("git", ["init", "-q", "-b", "main", repo])
         const store = makeStore()
+        const config = minimalConfig({ allowedRoots: [repo] })
+        const temp = tempConfig(config)
         const r = await startServer({
-            config: minimalConfig({ allowedRoots: [repo] }),
+            config,
             store,
             log: silentLog,
+            configPath: temp.configPath,
         })
         const url = `http://127.0.0.1:${r.address.port}`
         try {
             const post = (route) =>
-                fetch(`${url}${route}`, {
-                    method: "POST",
-                    headers: {
-                        "content-type": "application/json",
-                        "x-review-token": "secret",
-                    },
-                    body: JSON.stringify({ cwd: repo }),
-                })
+                signedFetch(url, route, { method: "POST", body: { cwd: repo } })
             const reset = await post("/reset")
             expect(reset.status).toBe(200)
             expect((await reset.json()).context.branch).toBe("main")
@@ -226,6 +269,7 @@ describe("startServer without injected capabilities", () => {
             await new Promise((done) => r.server.close(done))
             rmSync(store.__dir, { recursive: true, force: true })
             rmSync(repo, { recursive: true, force: true })
+            temp.cleanup()
         }
     })
 })
@@ -306,13 +350,9 @@ describe("createApp wiring", () => {
         const a = await start(minimalConfig(), blockingDeps)
         const b = await start(minimalConfig(), happyDeps)
         try {
-            const review = fetch(`${a.url}/review`, {
+            const review = signedFetch(a.url, "/review", {
                 method: "POST",
-                headers: {
-                    "content-type": "application/json",
-                    "x-review-token": minimalConfig().authToken,
-                },
-                body: JSON.stringify({ cwd: "/repo" }),
+                body: { cwd: "/repo" },
             })
             await running
             const inA = await (await fetch(`${a.url}/inflight`)).json()
@@ -615,7 +655,7 @@ describe("createApp wiring", () => {
         }
     })
 
-    test("/review rejects with 401 when token is missing", async () => {
+    test("/review rejects an unsigned request with 401", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
             const r = await fetch(`${url}/review`, {
@@ -625,24 +665,32 @@ describe("createApp wiring", () => {
             })
             expect(r.status).toBe(401)
             const body = await r.json()
-            expect(body.code).toBe("UNAUTHORIZED")
+            expect(body.code).toBe("UNSIGNED_REQUEST")
         } finally {
             await close()
         }
     })
 
-    test("/review rejects with 401 when token is wrong", async () => {
+    test("/review rejects a request signed with the wrong token, or carrying X-Review-Token", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/review`, {
+            const r = await signedFetch(url, "/review", {
+                method: "POST",
+                body: { cwd: "/repo" },
+                token: "nope",
+            })
+            expect(r.status).toBe(401)
+            expect((await r.json()).code).toBe("BAD_SIGNATURE")
+            const raw = await fetch(`${url}/review`, {
                 method: "POST",
                 headers: {
                     "content-type": "application/json",
-                    "x-review-token": "nope",
+                    "x-review-token": "secret",
                 },
                 body: JSON.stringify({ cwd: "/repo" }),
             })
-            expect(r.status).toBe(401)
+            expect(raw.status).toBe(401)
+            expect((await raw.json()).code).toBe("TOKEN_NOT_ACCEPTED")
         } finally {
             await close()
         }
@@ -658,13 +706,9 @@ describe("createApp wiring", () => {
                 codexRounds: 3,
                 lastReviewedAt: 1,
             })
-            const r = await fetch(`${url}/reset`, {
+            const r = await signedFetch(url, "/reset", {
                 method: "POST",
-                headers: {
-                    "content-type": "application/json",
-                    "x-review-token": "secret",
-                },
-                body: JSON.stringify({ cwd: "/repo" }),
+                body: { cwd: "/repo" },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
@@ -678,13 +722,9 @@ describe("createApp wiring", () => {
     test("/review with valid token returns the envelope", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/review`, {
+            const r = await signedFetch(url, "/review", {
                 method: "POST",
-                headers: {
-                    "content-type": "application/json",
-                    "x-review-token": "secret",
-                },
-                body: JSON.stringify({ cwd: "/repo" }),
+                body: { cwd: "/repo" },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
@@ -849,12 +889,14 @@ describe("MCP closeAllSessions integration via createApp", () => {
     test("createApp exposes mcp.closeAllSessions on app.locals", async () => {
         const store = createStateStore({ filePath: null, now: () => 0 })
         const config = minimalConfig()
+        const temp = tempConfig(config)
         const app = createApp({
             config,
             store,
             archive: null,
             logger: silentLog,
             deps: happyDeps,
+            configPath: temp.configPath,
             core: await loadDefaultCore({
                 config,
                 shellVersion: VERSION,
@@ -862,6 +904,7 @@ describe("MCP closeAllSessions integration via createApp", () => {
             }),
         })
         expect(typeof app.locals?.mcp?.closeAllSessions).toBe("function")
+        temp.cleanup()
     })
 })
 
@@ -988,13 +1031,9 @@ describe("VERSION", () => {
 
 describe("/review — the limit handshake and request deadline", () => {
     const post = (url, body) =>
-        fetch(`${url}/review`, {
+        signedFetch(url, "/review", {
             method: "POST",
-            headers: {
-                "content-type": "application/json",
-                "x-review-token": "secret",
-            },
-            body: JSON.stringify({ cwd: "/repo", ...body }),
+            body: { cwd: "/repo", ...body },
         })
     const withSpy = () => {
         const runAndParse = jest.fn(happyDeps.runAndParse)
@@ -1085,9 +1124,7 @@ describe("/status surfaces the version", () => {
     test("/status response body has a top-level version string", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/status`, {
-                headers: { "x-review-token": "secret" },
-            })
+            const r = await signedFetch(url, "/status")
             expect(r.status).toBe(200)
             const body = await r.json()
             expect(typeof body.version).toBe("string")
@@ -1124,6 +1161,294 @@ describe("GET / dashboard route", () => {
             expect(body).not.toContain("secret")
         } finally {
             await close()
+        }
+    })
+})
+
+describe("hook connection: challenge, server.json, credentials, rotation", () => {
+    const startWithFiles = async (config = minimalConfig()) => {
+        const dir = mkdtempSync(path.join(tmpdir(), "index-conn-"))
+        const configPath = path.join(dir, "config.json")
+        const credentialsPath = path.join(dir, "cache", "hook-credentials.json")
+        const serverInfoPath = path.join(dir, "cache", "server.json")
+        writeFileSync(configPath, JSON.stringify(config, null, 2))
+        const store = makeStore()
+        const r = await startServer({
+            config,
+            store,
+            deps: happyDeps,
+            log: silentLog,
+            configPath,
+            credentialsPath,
+            serverInfoPath,
+        })
+        if (!r.ok) throw r.error
+        const paths = { configPath, credentialsPath, serverInfoPath }
+        return {
+            ...paths,
+            app: r.app,
+            url: `http://127.0.0.1:${r.address.port}`,
+            port: r.address.port,
+            connectNow: () =>
+                connect({
+                    ...paths,
+                    sleep: async () => {},
+                }),
+            close: () =>
+                new Promise((done) =>
+                    r.server.close(() => {
+                        rmSync(dir, { recursive: true, force: true })
+                        rmSync(store.__dir, { recursive: true, force: true })
+                        done()
+                    })
+                ),
+        }
+    }
+    const until = async (check) => {
+        for (let i = 0; i < 100 && !check(); i++) {
+            await new Promise((r) => setTimeout(r, 10))
+        }
+        return check()
+    }
+
+    test("/healthz names the service and instance, and proves the token on a challenge", async () => {
+        const s = await startWithFiles()
+        try {
+            const plain = await (await fetch(`${s.url}/healthz`)).json()
+            expect(plain).toMatchObject({
+                ok: true,
+                service: "review-orchestrator",
+                instanceId: s.app.locals.instanceId,
+            })
+            const bad = await fetch(`${s.url}/healthz?challenge=short`)
+            expect(bad.status).toBe(400)
+            await expect(
+                challengeAt({ baseUrl: s.url, token: "secret" })
+            ).resolves.toEqual({
+                ok: true,
+                instanceId: s.app.locals.instanceId,
+            })
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("server.json carries the live address and wait; hook-credentials.json is written at startup", async () => {
+        const s = await startWithFiles()
+        try {
+            const info = JSON.parse(readFileSync(s.serverInfoPath, "utf8"))
+            expect(info).toMatchObject({
+                pid: process.pid,
+                port: s.port,
+                bind: "127.0.0.1",
+                instanceId: s.app.locals.instanceId,
+                // codexTimeoutSeconds 240, claude/gemini defaults 600 → 660 s
+                hookTimeoutMs: 660_000,
+            })
+            expect(statSync(s.serverInfoPath).mode & 0o777).toBe(0o600)
+            expect(await until(() => existsSync(s.credentialsPath))).toBe(true)
+            expect(
+                JSON.parse(readFileSync(s.credentialsPath, "utf8"))
+            ).toMatchObject({ token: "secret", port: 0 })
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("a config transaction (what dashboard edits run) that changes the wait rewrites server.json", async () => {
+        const s = await startWithFiles()
+        try {
+            await s.app.locals.configStore.mutate([
+                [["limits", "codexTimeoutSeconds"], 900],
+            ])
+            const info = JSON.parse(readFileSync(s.serverInfoPath, "utf8"))
+            expect(info.hookTimeoutMs).toBe(960_000)
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("a hook-style client picks server.json's address and gets verified answers; /status reports the auth state", async () => {
+        const s = await startWithFiles()
+        try {
+            const conn = await s.connectNow()
+            expect(conn).toMatchObject({
+                ok: true,
+                credentialsSource: "config",
+            })
+            expect(conn.server).toMatchObject({
+                source: "server.json",
+                hookTimeoutMs: 660_000,
+            })
+            const status = await conn.request({
+                method: "GET",
+                path: "/status",
+                timeoutMs: 5000,
+            })
+            expect(status.httpStatus).toBe(200)
+            expect(status.body.auth).toEqual({
+                currentTokenHash: createHash("sha256")
+                    .update("secret")
+                    .digest("hex"),
+                previousTokenGrace: null,
+            })
+            expect(status.body.instanceId).toBe(s.app.locals.instanceId)
+            const review = await conn.request({
+                method: "POST",
+                path: "/review",
+                body: {
+                    cwd: "/repo",
+                    trigger: "stop_hook",
+                    timeoutMs: 660_000,
+                },
+                timeoutMs: 10_000,
+            })
+            expect(review).toMatchObject({
+                httpStatus: 200,
+                body: { status: "GOOD_TO_GO" },
+            })
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("a rotation: the new token works at once, the old one only in its grace, and --revoke-now ends it", async () => {
+        const s = await startWithFiles()
+        try {
+            const old = await s.connectNow()
+            const rotated = await rotateToken({
+                configPath: s.configPath,
+                credentialsPath: s.credentialsPath,
+            })
+            // The old token, signed: still accepted, in grace.
+            const inGrace = await old.request({
+                method: "GET",
+                path: "/status",
+                timeoutMs: 5000,
+            })
+            expect(inGrace.httpStatus).toBe(200)
+            expect(inGrace.body.auth.previousTokenGrace).toMatchObject({
+                tokenHash: createHash("sha256").update("secret").digest("hex"),
+            })
+            // The new token, through the credentials the rotation wrote.
+            const fresh = await s.connectNow()
+            expect(fresh.creds.token).toBe(rotated.token)
+            expect(
+                (
+                    await fresh.request({
+                        method: "GET",
+                        path: "/status",
+                        timeoutMs: 5000,
+                    })
+                ).httpStatus
+            ).toBe(200)
+            // MCP keeps working on the old token during the grace.
+            const mcp = await fetch(`${s.url}/mcp`, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    accept: "application/json, text/event-stream",
+                    "x-review-token": "secret",
+                },
+                body: "{}",
+            })
+            expect(mcp.status).not.toBe(401)
+            await rotateToken({
+                configPath: s.configPath,
+                credentialsPath: s.credentialsPath,
+                revokeNow: true,
+            })
+            const refused = await fresh.request({
+                method: "GET",
+                path: "/status",
+                timeoutMs: 5000,
+            })
+            expect(refused.fetchError).toMatch(/HTTP 401 BAD_SIGNATURE/)
+        } finally {
+            await s.close()
+        }
+    })
+})
+
+describe("createServerInfo", () => {
+    const make = (over = {}) => {
+        const dir = mkdtempSync(path.join(tmpdir(), "server-info-"))
+        const file = path.join(dir, "server.json")
+        let wait = 1000
+        const info = createServerInfo({
+            path: file,
+            instanceId: "inst-1",
+            startedAt: 0,
+            hookTimeoutMs: () => wait,
+            logger: silentLog,
+            pid: 42,
+            ...over,
+        })
+        return {
+            info,
+            file,
+            setWait: (ms) => {
+                wait = ms
+            },
+            cleanup: () => rmSync(dir, { recursive: true, force: true }),
+        }
+    }
+
+    test("writes once it has an address, again only when something changed, and removes only its own file", () => {
+        const t = make()
+        try {
+            expect(t.info.refresh()).toBe(false)
+            expect(
+                t.info.setAddress({ port: 7777, address: "127.0.0.1" })
+            ).toBe(true)
+            expect(JSON.parse(readFileSync(t.file, "utf8"))).toEqual({
+                pid: 42,
+                port: 7777,
+                bind: "127.0.0.1",
+                startedAt: "1970-01-01T00:00:00.000Z",
+                instanceId: "inst-1",
+                hookTimeoutMs: 1000,
+            })
+            expect(t.info.refresh()).toBe(false)
+            t.setWait(2000)
+            expect(t.info.refresh()).toBe(true)
+            writeFileSync(t.file, JSON.stringify({ instanceId: "newer" }))
+            expect(t.info.remove()).toBe(false)
+            expect(existsSync(t.file)).toBe(true)
+            t.info.setAddress({ port: 7778, address: "127.0.0.1" })
+            expect(t.info.remove()).toBe(true)
+            expect(existsSync(t.file)).toBe(false)
+            expect(t.info.remove()).toBe(false)
+        } finally {
+            t.cleanup()
+        }
+    })
+
+    test("without a path it writes nothing; a failed write is logged", () => {
+        const none = createServerInfo({
+            path: null,
+            instanceId: "i",
+            startedAt: 0,
+            hookTimeoutMs: () => 1,
+        })
+        expect(none.setAddress({ port: 1, address: "x" })).toBe(false)
+        expect(none.remove()).toBe(false)
+        const warn = jest.fn()
+        const t = make({
+            write: () => {
+                throw new Error("EROFS")
+            },
+            logger: { warn },
+        })
+        try {
+            expect(t.info.setAddress({ port: 1, address: "x" })).toBe(false)
+            expect(warn).toHaveBeenCalledWith(
+                { err: "EROFS" },
+                "failed to write server.json"
+            )
+            expect(t.info.remove()).toBe(false)
+        } finally {
+            t.cleanup()
         }
     })
 })

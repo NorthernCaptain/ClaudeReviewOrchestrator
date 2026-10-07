@@ -6,8 +6,7 @@
 // Runtime reviewer-provider switch. PUT /provider { provider } sets
 // reviewer.provider in the live config and in config.json together, so
 // the next admitted review uses the new provider and it survives a
-// restart. Behind the X-Review-Token middleware like every other
-// mutating route.
+// restart. Signed requests only, like every other non-MCP route.
 //
 // The change goes through the shell's config transaction (a delta merged
 // into a fresh read of config.json, checked, then written atomically) —

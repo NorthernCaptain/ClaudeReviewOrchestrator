@@ -14,12 +14,16 @@
 #   scripts/reload.sh --rollback  # undo the last reload (code and config)
 #   scripts/reload.sh --cancel    # drop a pending reload
 #
-# Requires: jq, curl. Reads token + URL from the same config file the
-# server and hooks do. Exits non-zero when the reload fails.
+# Requires: jq, node. Sends the request through hooks/signed-client.mjs,
+# which reads the token from the same config file the server and hooks
+# do and signs the request with it. Exits non-zero when the reload
+# fails.
 
 set -euo pipefail
 
 CONFIG_PATH="${REVIEW_ORCH_CONFIG:-$HOME/.config/review-orchestrator/config.json}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLIENT="$SCRIPT_DIR/../hooks/signed-client.mjs"
 POLL_SECONDS="${REVIEW_ORCH_RELOAD_POLL_SECONDS:-2}"
 
 usage() {
@@ -43,7 +47,7 @@ require() {
 }
 
 require jq
-require curl
+require node
 
 NOW=false
 ROLLBACK=false
@@ -63,25 +67,12 @@ for arg in "$@"; do
     esac
 done
 
-if [[ ! -r "$CONFIG_PATH" ]]; then
-    echo "error: config not readable: $CONFIG_PATH" >&2
-    exit 3
-fi
-
-TOKEN=$(jq -r '.authToken // empty' "$CONFIG_PATH")
-PORT=$(jq -r '.port // 7777' "$CONFIG_PATH")
-BIND=$(jq -r '.bind // "127.0.0.1"' "$CONFIG_PATH")
-case "$BIND" in
-    "0.0.0.0") HOST="127.0.0.1" ;;
-    "::" | "::1") HOST="[::1]" ;;
-    *) HOST="$BIND" ;;
-esac
-URL="http://$HOST:$PORT/admin/reload"
-
-if [[ -z "$TOKEN" ]]; then
-    echo "error: no authToken in $CONFIG_PATH" >&2
-    exit 3
-fi
+# A signed request through the shared client (the token is never sent).
+# Prints the response body; exits 0 on a 2xx, 1 on an error status, 4 when
+# no server proves the token or the response doesn't verify.
+signed() {
+    node "$CLIENT" --config "$CONFIG_PATH" "$@"
+}
 
 BODY=$(jq -n \
     --argjson now "$NOW" \
@@ -92,13 +83,11 @@ BODY=$(jq -n \
 RESPONSE_FILE=$(mktemp)
 trap 'rm -f "$RESPONSE_FILE"' EXIT
 
-STATUS=$(curl -sS -o "$RESPONSE_FILE" -w '%{http_code}' -X POST "$URL" \
-    -H "content-type: application/json" \
-    -H "x-review-token: $TOKEN" \
-    --data "$BODY") || {
-    echo "error: server not reachable at $URL" >&2
+RC=0
+signed POST /admin/reload "$BODY" >"$RESPONSE_FILE" || RC=$?
+if [[ $RC -ne 0 && $RC -ne 1 ]]; then
     exit 4
-}
+fi
 
 report() {
     jq -r '
@@ -124,7 +113,7 @@ report() {
 }
 
 report "$RESPONSE_FILE"
-if [[ "$STATUS" != "200" ]] || [[ "$(jq -r '.ok' "$RESPONSE_FILE")" != "true" ]]; then
+if [[ $RC -ne 0 ]] || [[ "$(jq -r '.ok' "$RESPONSE_FILE")" != "true" ]]; then
     exit 1
 fi
 
@@ -132,10 +121,7 @@ if [[ "$WAIT" == "true" ]] && [[ "$(jq -r '.scheduled // false' "$RESPONSE_FILE"
     echo "waiting for the running reviews to finish…" >&2
     while :; do
         sleep "$POLL_SECONDS"
-        curl -sS -o "$RESPONSE_FILE" "$URL" -H "x-review-token: $TOKEN" || {
-            echo "error: server not reachable at $URL" >&2
-            exit 4
-        }
+        signed GET /admin/reload >"$RESPONSE_FILE" || exit 4
         if [[ "$(jq -r '.reload.pending == null' "$RESPONSE_FILE")" == "true" ]]; then
             jq -r '.reload.history[0] |
                 if .ok then "applied: \(.kind) \(.from) → \(.to)"

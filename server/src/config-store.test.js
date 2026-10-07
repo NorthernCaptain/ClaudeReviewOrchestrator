@@ -21,6 +21,10 @@ import {
     deepFreeze,
     KEEP_BACKUPS,
 } from "./config-store.js"
+import {
+    acquireConfigLock,
+    ConfigLockError,
+} from "../../install/config-lock.mjs"
 
 let dir
 let configPath
@@ -194,7 +198,11 @@ describe("createConfigStore — mutate", () => {
             )
             expect(readConfig()).toEqual(base())
             expect(store.current()).toEqual(base())
-            expect(readdirSync(dir)).toEqual(["config.json"])
+            // The lock file stays in place by design.
+            expect(readdirSync(dir).sort()).toEqual([
+                "config.json",
+                "config.json.lock",
+            ])
         }
     )
 
@@ -424,6 +432,120 @@ describe("createConfigStore — writeFile + commit", () => {
         const { store } = makeStore(base())
         store.commit({ ...base(), reviewer: { provider: "claude" } })
         expect(store.current().reviewer.provider).toBe("claude")
+        expect(store.revision()).toBe(1)
+    })
+})
+
+describe("createConfigStore — the config lock and hook credentials", () => {
+    const credentialsPath = () => path.join(dir, "cache", "creds.json")
+
+    test("a dashboard edit runs under the config lock and refreshes the credentials inside it", async () => {
+        writeConfig(base())
+        const held = []
+        const withFileLock = jest.fn(async (p, fn) => {
+            held.push(p)
+            return fn()
+        })
+        const { store } = makeStore(base(), {
+            withFileLock,
+            credentialsPath: credentialsPath(),
+        })
+        await store.mutate([[["limits", "maxBlocks"], 2]])
+        expect(held).toEqual([configPath])
+        expect(
+            JSON.parse(readFileSync(credentialsPath(), "utf8"))
+        ).toMatchObject({ token: "tok", limits: { maxBlocks: 2 } })
+    })
+
+    test("another writer holding the lock fails the edit with CONFIG_LOCKED, writing nothing", async () => {
+        writeConfig(base())
+        const { store } = makeStore(base(), {
+            withFileLock: async () => {
+                throw new ConfigLockError(
+                    "config.json is locked by another writer — try again"
+                )
+            },
+        })
+        await expect(
+            store.mutate([[["limits", "maxBlocks"], 2]])
+        ).rejects.toMatchObject({
+            code: "CONFIG_LOCKED",
+            httpStatus: 503,
+        })
+        expect(readConfig()).toEqual(base())
+        expect(store.revision()).toBe(0)
+    })
+
+    test("the real OS lock: an edit waits for a holder and proceeds once it lets go", async () => {
+        writeConfig(base())
+        const lock = await acquireConfigLock({ configPath })
+        const { store } = makeStore(base())
+        let done = false
+        const edit = store
+            .mutate([[["limits", "maxBlocks"], 2]])
+            .then(() => (done = true))
+        await new Promise((r) => setTimeout(r, 120))
+        expect(done).toBe(false)
+        lock.release()
+        await edit
+        expect(readConfig().limits.maxBlocks).toBe(2)
+    })
+
+    test("a lock failure other than CONFIG_LOCKED is passed through", async () => {
+        writeConfig(base())
+        const { store } = makeStore(base(), {
+            withFileLock: async () => {
+                throw new Error("EIO")
+            },
+        })
+        await expect(store.underFileLock(() => 1)).rejects.toThrow("EIO")
+    })
+
+    test("a credentials write failure never fails the change", async () => {
+        writeConfig(base())
+        const { store } = makeStore(base(), {
+            // A directory where the file should go.
+            credentialsPath: dir,
+        })
+        await expect(
+            store.mutate([[["limits", "maxBlocks"], 2]])
+        ).resolves.toMatchObject({ revision: 1 })
+    })
+
+    test("syncCredentials writes the cache from the file, and is a no-op without a path", async () => {
+        writeConfig({ ...base(), authToken: "from-file" })
+        const { store } = makeStore(base(), {
+            credentialsPath: credentialsPath(),
+        })
+        await store.syncCredentials()
+        expect(JSON.parse(readFileSync(credentialsPath(), "utf8")).token).toBe(
+            "from-file"
+        )
+        const bare = makeStore(base()).store
+        await expect(bare.syncCredentials()).resolves.toBe(false)
+    })
+
+    test("syncCredentials never rejects", async () => {
+        writeConfig(base())
+        const { store } = makeStore(base(), {
+            credentialsPath: credentialsPath(),
+            withFileLock: async () => {
+                throw new ConfigLockError("locked")
+            },
+        })
+        await expect(store.syncCredentials()).resolves.toBe(false)
+    })
+
+    test("onCommit sees every commit, and its failure doesn't undo one", () => {
+        const seen = []
+        const { store } = makeStore(base(), {
+            onCommit: (config) => {
+                seen.push(config.limits.maxBlocks)
+                throw new Error("listener broke")
+            },
+        })
+        store.commit({ ...base(), limits: { maxCodexRounds: 5, maxBlocks: 9 } })
+        expect(seen).toEqual([9])
         expect(store.revision()).toBe(1)
     })
 })

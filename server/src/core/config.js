@@ -223,6 +223,27 @@ const ConfigSchema = z
                 maxHoldSeconds: z.number().int().min(0).max(600).default(45),
             })
             .default({}),
+        // Token rotation (hot-reload plan §5.7). After authToken changes,
+        // the token it replaced is still accepted for previousTokenGraceHours.
+        // rotate-token.sh appends a record per rotation (hashes only, the
+        // last 10); the server grants a predecessor its grace only from
+        // the record that rotated it out, and never past a later "none".
+        auth: z
+            .object({
+                previousTokenGraceHours: z.number().min(0).max(720).default(24),
+                rotations: z
+                    .array(
+                        z.object({
+                            tokenHash: z.string(),
+                            previousTokenHash: z.string().nullable(),
+                            grace: z.enum(["default", "none"]),
+                            at: z.string(),
+                        })
+                    )
+                    .max(10)
+                    .default([]),
+            })
+            .default({}),
         // Stop-hook configuration. fetchTimeoutSeconds is the cap the
         // hook applies to its POST /review call. When null (default),
         // the hook auto-derives a value from the reviewer timeout plus

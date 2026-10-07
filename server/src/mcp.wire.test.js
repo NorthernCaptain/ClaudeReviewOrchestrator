@@ -4,7 +4,7 @@
  */
 
 import { jest } from "@jest/globals"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
@@ -88,11 +88,17 @@ const startApp = async (opts = {}) => {
     const store = opts.store ?? makeStore()
     const config = opts.config ?? minimalConfig()
     const deps = opts.deps ?? happyDeps()
+    // Its own config.json, so the per-request token read never sees the
+    // real one.
+    const configDir = mkdtempSync(path.join(tmpdir(), "mcp-wire-config-"))
+    const configPath = path.join(configDir, "config.json")
+    writeFileSync(configPath, JSON.stringify(config))
     const r = await startServer({
         config,
         store,
         deps,
         log: silentLog,
+        configPath,
     })
     if (!r.ok) throw r.error
     return {
@@ -100,6 +106,7 @@ const startApp = async (opts = {}) => {
         close: () =>
             new Promise((res) => {
                 r.server.close(() => {
+                    rmSync(configDir, { recursive: true, force: true })
                     if (!opts.store)
                         rmSync(store.__dir, {
                             recursive: true,

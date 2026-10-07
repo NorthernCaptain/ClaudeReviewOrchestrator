@@ -6,106 +6,38 @@
 
 // Claude Code Stop hook for the review orchestrator.
 //
-// Reads a Stop event JSON payload from stdin, calls the local
-// /review endpoint, and either writes a Stop-hook block decision JSON to
-// stdout (forcing Claude to continue addressing review findings) or exits
-// 0 with an optional stderr summary. Failures are caught and surfaced as
-// exit 0 + a log line — the hook MUST never break the user's CLI session.
+// Reads a Stop event JSON payload from stdin, calls the local /review
+// endpoint through the shared signed client (signed-client.mjs, installed
+// next to this file), and either writes a Stop-hook block decision JSON
+// to stdout (forcing Claude to continue addressing review findings) or
+// exits 0 with an optional stderr summary. Failures are caught and
+// surfaced as exit 0 + a log line — the hook MUST never break the user's
+// CLI session.
 
 import {
     appendFileSync,
     mkdirSync,
     readdirSync,
-    readFileSync,
     renameSync,
     unlinkSync,
     writeFileSync,
 } from "node:fs"
-import http from "node:http"
 import { homedir } from "node:os"
 import path from "node:path"
+import {
+    clientHostFromBind,
+    connect as connectSignedServer,
+    httpFetch,
+    readCredentials,
+} from "./signed-client.mjs"
 
-// Minimal fetch-shaped client over node:http. We deliberately do NOT
-// use the global fetch (undici) for the /review call: undici imposes a
-// 300s headersTimeout AND a 300s bodyTimeout that fire independently of
-// our AbortController, and the server holds the connection open with no
-// response until the reviewer subprocess finishes. Any review longer
-// than 5 minutes therefore aborts with "fetch failed", the hook fails
-// open, and Claude stops WITHOUT ever seeing the blocking findings.
-// undici can't be reconfigured here (it isn't importable from this
-// dependency-free hook), so we drop to node:http, which has no such cap
-// — the only timeout is the abort signal we wire up below. Returns the
-// subset of the fetch Response API the hook uses.
-export const nodeHttpFetch = (url, { method, headers, body, signal } = {}) =>
-    new Promise((resolve, reject) => {
-        // Settle exactly once: a connection drop after headers, an abort
-        // mid-response, and a normal end can otherwise race. Without this
-        // guard the hook could see an unhandled stream error or a promise
-        // that never settles until the outer timeout — both break its
-        // fail-open contract.
-        let settled = false
-        const fail = (err) => {
-            if (settled) return
-            settled = true
-            reject(err)
-        }
-        const succeed = (value) => {
-            if (settled) return
-            settled = true
-            resolve(value)
-        }
-        const u = new URL(url)
-        // URL.hostname keeps the brackets on an IPv6 literal
-        // ("[::1]"); http.request would try to resolve that bracketed
-        // string and fail. Strip them so the bare address ("::1") is
-        // passed, which the net layer recognizes as an IPv6 host. This
-        // matters for installs binding "::" / "::1".
-        const hostname = u.hostname.replace(/^\[|\]$/g, "")
-        const req = http.request(
-            {
-                hostname,
-                port: u.port,
-                path: u.pathname + u.search,
-                method,
-                headers,
-            },
-            (res) => {
-                // The server can drop the connection or abort the stream
-                // after headers are sent; surface those as a rejection
-                // instead of hanging or throwing unhandled.
-                res.once("error", fail)
-                res.once("aborted", () => fail(new Error("response aborted")))
-                const chunks = []
-                res.on("data", (c) => chunks.push(c))
-                res.on("end", () => {
-                    const text = Buffer.concat(chunks).toString("utf8")
-                    succeed({
-                        status: res.statusCode,
-                        headers: {
-                            get: (name) =>
-                                res.headers[String(name).toLowerCase()] ?? null,
-                        },
-                        json: async () => JSON.parse(text),
-                    })
-                })
-            }
-        )
-        req.on("error", fail)
-        if (signal) {
-            const onAbort = () => {
-                const err = new Error("aborted")
-                err.name = "AbortError"
-                req.destroy(err)
-            }
-            if (signal.aborted) onAbort()
-            else signal.addEventListener("abort", onAbort, { once: true })
-        }
-        if (body) req.write(body)
-        req.end()
-    })
+// The opencode plugin loads this module as its protocol lib.
+export { clientHostFromBind, connectSignedServer as connect, readCredentials }
 
-const DEFAULT_CONFIG_PATH = () =>
-    path.join(homedir(), ".config", "review-orchestrator", "config.json")
+// The node:http transport, not the global fetch: undici's 300 s header and
+// body timeouts would cut any review longer than 5 minutes.
+export const nodeHttpFetch = httpFetch
+
 const DEFAULT_LOG_FILE = () =>
     path.join(homedir(), ".claude", "logs", "review-hook.log")
 const DEFAULT_CALLS_DIR = () =>
@@ -113,8 +45,6 @@ const DEFAULT_CALLS_DIR = () =>
 // How many per-call snapshot files to retain. New invocations prune the
 // oldest beyond this cap so the directory doesn't grow forever.
 const CALLS_RETAIN = 50
-const DEFAULT_PORT = 7777
-const DEFAULT_BIND = "127.0.0.1"
 // Fallback when no config value and no reviewer timeout can be read.
 // Slightly larger than the orchestrator's default 600s reviewer timeout
 // to preserve the prior behavior for callers that don't pass either.
@@ -135,21 +65,6 @@ const AUTO_BUFFER_MS = 60 * 1000
 // this are not supported.
 //   reviewer (≤1680s) +60 → hook wait (≤1740s) +60 → harness (1800s)
 export const MAX_FETCH_TIMEOUT_MS = 1_740_000 // 29 min
-
-// Map a server `config.bind` value to the host portion of a CLIENT URL.
-// Wildcard binds (0.0.0.0, ::) are translated to their loopback
-// equivalent; bare IPv6 addresses are wrapped in square brackets per
-// RFC 3986. This is exported for tests.
-export const clientHostFromBind = (bind) => {
-    if (!bind || bind === "0.0.0.0") return "127.0.0.1"
-    if (bind === "::" || bind === "::1") return "[::1]"
-    // Already-bracketed IPv6 → keep as is.
-    if (bind.startsWith("[")) return bind
-    // Bare IPv6 (multiple colons, no brackets) → wrap.
-    const colonCount = (bind.match(/:/g) ?? []).length
-    if (colonCount >= 2) return `[${bind}]`
-    return bind
-}
 
 // Resolve the hook's fetch timeout from a parsed config object.
 // Precedence:
@@ -182,43 +97,6 @@ export const resolveFetchTimeoutMs = (parsed) => {
                 : Math.max(...candidates) * 1000 + AUTO_BUFFER_MS
     }
     return Math.min(MAX_FETCH_TIMEOUT_MS, ms)
-}
-
-// Read the local server's connection info from the config file. Both the
-// token AND the URL come from the same file so a custom port set in
-// config.json automatically reaches the hook. Returns
-//   { token, url, fetchTimeoutMs } on success, or null on any error /
-// missing fields — every error becomes a fail-open signal so the calling
-// hook can exit 0 without spamming the user.
-export const readToken = ({
-    configPath = DEFAULT_CONFIG_PATH(),
-    read = readFileSync,
-} = {}) => {
-    try {
-        const raw = read(configPath, "utf8")
-        const parsed = JSON.parse(raw)
-        if (
-            !parsed ||
-            typeof parsed.authToken !== "string" ||
-            parsed.authToken.length === 0
-        ) {
-            return null
-        }
-        const port = Number.isInteger(parsed.port) ? parsed.port : DEFAULT_PORT
-        const bind =
-            typeof parsed.bind === "string" && parsed.bind.length > 0
-                ? parsed.bind
-                : DEFAULT_BIND
-        const host = clientHostFromBind(bind)
-        const url = `http://${host}:${port}/review`
-        return {
-            token: parsed.authToken,
-            url,
-            fetchTimeoutMs: resolveFetchTimeoutMs(parsed),
-        }
-    } catch {
-        return null
-    }
 }
 
 // Append a JSON-line log entry. Best-effort — log failures are silently
@@ -619,45 +497,21 @@ const defaultSnapshotForEnv = () =>
 // per-claude-invocation; close the CLI and the var is gone, so it
 // can't accidentally disable review for the next session.
 // One POST /review, aborted after `timeoutMs`.
-const postOnce = async ({ fetchFn, url, token, body, timeoutMs }) => {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-    let httpStatus = null
-    let parsed = null
-    let fetchError = null
-    let serverRequestId = null
-    try {
-        const res = await fetchFn(url, {
-            method: "POST",
-            headers: {
-                "content-type": "application/json",
-                "x-review-token": token,
-            },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-        })
-        httpStatus = res.status
-        // Capture the server's request id so the user can grep the server
-        // log for the matching pipeline trace.
-        try {
-            serverRequestId = res.headers?.get?.("x-request-id") ?? null
-        } catch {
-            serverRequestId = null
-        }
-        try {
-            parsed = await res.json()
-        } catch {
-            parsed = null
-        }
-    } catch (err) {
-        fetchError =
-            err?.name === "AbortError"
-                ? `request timed out after ${timeoutMs}ms`
-                : (err?.message ?? String(err))
-    } finally {
-        clearTimeout(timer)
+// One signed POST /review, aborted after `timeoutMs`. A response that
+// fails verification comes back as a fetchError (fail open).
+const postOnce = async ({ conn, body, timeoutMs }) => {
+    const r = await conn.request({
+        method: "POST",
+        path: "/review",
+        body,
+        timeoutMs,
+    })
+    return {
+        httpStatus: r.httpStatus,
+        body: r.body,
+        fetchError: r.fetchError,
+        serverRequestId: r.serverRequestId ?? null,
     }
-    return { httpStatus, body: parsed, fetchError, serverRequestId }
 }
 
 export const MAX_REVIEW_ATTEMPTS = 3
@@ -672,9 +526,7 @@ export const MAX_REVIEW_ATTEMPTS = 3
 // carries finalAttempt: true, which the server never answers with a 409.
 // Shared by the Stop hooks and the opencode plugin.
 export const postReview = async ({
-    fetchFn,
-    url,
-    token,
+    conn,
     requestBody,
     limitMs,
     now = Date.now,
@@ -697,9 +549,7 @@ export const postReview = async ({
         }
         last = {
             ...(await postOnce({
-                fetchFn,
-                url,
-                token,
+                conn,
                 body,
                 timeoutMs: attemptMs,
             })),
@@ -735,8 +585,8 @@ export const main = async ({
     now = Date.now,
     log = appendLogLine,
     snapshot = defaultSnapshotForEnv(),
-    tokenReader = readToken,
-    urlOverride = null,
+    // ({ fetchFn }) → the signed client's connect() result.
+    connect = connectSignedServer,
     timeoutMs = null,
     env = process.env,
 } = {}) => {
@@ -823,40 +673,47 @@ export const main = async ({
         return 0
     }
 
-    const config = tokenReader()
-    if (!config) {
-        stderr.write(
-            "review-orchestrator: no auth token found in config; skipping review.\n"
-        )
-        log({ event: "no_token" }, { now })
+    const conn = await connect({ fetchFn })
+    if (!conn.ok) {
+        // No token anywhere, or no address that proves it: fail open, and
+        // say why.
+        const event = conn.stage === "credentials" ? "no_token" : "no_server"
+        stderr.write(`review-orchestrator: ${conn.reason}; skipping review.\n`)
+        log({ event, reason: conn.reason }, { now })
         snapshot(
             {
                 claudeInput: payload,
                 serverRequest: null,
                 serverResponse: null,
-                fetchError: "no auth token found in config",
-                decision: { event: "no_token" },
+                fetchError: conn.reason,
+                decision: { event },
             },
             { now }
         )
         return 0
     }
-    // urlOverride lets tests target a fake server; in production the URL
-    // is derived from the same config file as the token.
-    const targetUrl = urlOverride ?? config.url
+    if (conn.credentialsSource === "cache") {
+        stderr.write(
+            `review-orchestrator: ${conn.configError}; using the cached hook credentials.\n`
+        )
+        log(
+            { event: "credentials_from_cache", reason: conn.configError },
+            { now }
+        )
+    }
+    const targetUrl = `${conn.server.baseUrl}/review`
 
-    // Caller override > config-derived > legacy default. The config-
-    // derived value tracks the reviewer's own timeout so a single edit
-    // to reviewer.claude.timeoutSeconds widens both ends of the chain.
+    // Caller override > the running server's published wait (server.json)
+    // > the wait derived from the config, as before.
     const effectiveTimeoutMs =
-        timeoutMs ?? config.fetchTimeoutMs ?? DEFAULT_TIMEOUT_MS
+        timeoutMs ??
+        conn.server.hookTimeoutMs ??
+        resolveFetchTimeoutMs(conn.creds)
 
     stderr.write("review-orchestrator: reviewing changes…\n")
 
     const posted = await postReview({
-        fetchFn,
-        url: targetUrl,
-        token: config.token,
+        conn,
         requestBody: { cwd, session_id, trigger: "stop_hook" },
         limitMs: effectiveTimeoutMs,
         now,
@@ -883,7 +740,7 @@ export const main = async ({
                 method: "POST",
                 headers: {
                     "content-type": "application/json",
-                    "x-review-token": "<redacted>",
+                    "x-review-signature": "<redacted>",
                 },
                 body: requestBody,
             },

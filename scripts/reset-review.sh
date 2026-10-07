@@ -11,12 +11,15 @@
 #   scripts/reset-review.sh                 # reset the current directory's repo+branch
 #   scripts/reset-review.sh /path/to/repo   # reset a specific repo path
 #
-# Requires: jq, curl. Reads token + URL from the same config file the
-# server and hook do.
+# Requires: jq, node. Sends the request through hooks/signed-client.mjs,
+# which reads the token from the same config file the server and hooks
+# do and signs the request with it.
 
 set -euo pipefail
 
 CONFIG_PATH="${REVIEW_ORCH_CONFIG:-$HOME/.config/review-orchestrator/config.json}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLIENT="$SCRIPT_DIR/../hooks/signed-client.mjs"
 
 usage() {
     cat <<EOF >&2
@@ -42,7 +45,7 @@ case "${1:-}" in
 esac
 
 require jq
-require curl
+require node
 
 # Resolve the target to an absolute path the server can match against
 # allowedRoots. Default to the current directory.
@@ -54,32 +57,18 @@ fi
 # Absolute, symlink-resolved path (BSD-compatible: cd + pwd -P).
 CWD=$(cd "$TARGET" && pwd -P)
 
-if [[ ! -r "$CONFIG_PATH" ]]; then
-    echo "error: config not readable: $CONFIG_PATH" >&2
-    exit 3
-fi
-
-TOKEN=$(jq -r '.authToken // empty' "$CONFIG_PATH")
-PORT=$(jq -r '.port // 7777' "$CONFIG_PATH")
-BIND=$(jq -r '.bind // "127.0.0.1"' "$CONFIG_PATH")
-case "$BIND" in
-    "0.0.0.0") HOST="127.0.0.1" ;;
-    "::" | "::1") HOST="[::1]" ;;
-    *) HOST="$BIND" ;;
-esac
-URL="http://$HOST:$PORT/reset"
-
-if [[ -z "$TOKEN" ]]; then
-    echo "error: no authToken in $CONFIG_PATH" >&2
-    exit 3
-fi
+# A signed request through the shared client (the token is never sent).
+# Prints the response body; exits 0 on a 2xx, 1 on an error status, 4 when
+# no server proves the token or the response doesn't verify.
+signed() {
+    node "$CLIENT" --config "$CONFIG_PATH" "$@"
+}
 
 BODY=$(jq -n --arg cwd "$CWD" '{cwd: $cwd}')
 
-echo "==> POST $URL  (cwd=$CWD)" >&2
+echo "==> POST /reset  (cwd=$CWD)" >&2
 
-curl -sS -X POST "$URL" \
-    -H "content-type: application/json" \
-    -H "x-review-token: $TOKEN" \
-    --data "$BODY" \
-    | jq .
+RC=0
+signed POST /reset "$BODY" | jq . || RC=${PIPESTATUS[0]}
+exit "$RC"
+

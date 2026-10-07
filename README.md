@@ -52,7 +52,7 @@ The convention in this repo is **one patch bump per change** so a quick
    ┌───────────────┐  HTTP  │  POST /mcp          (MCP transport)  │
    │  Claude CLI   │◄──────►│  POST /review       (Stop-hook API)  │
    │   (session)   │        │  POST /reset                         │
-   └───────┬───────┘        │  GET  /status   (X-Review-Token)     │
+   └───────┬───────┘        │  GET  /status   (signed)             │
            │                │  GET  /        (dashboard, NO auth)  │
            │ Stop event     │  GET  /healthz                       │
            ▼                │                                      │
@@ -135,9 +135,13 @@ started by launchd. Binds `127.0.0.1` only.
 | GET    | `/`         | **no**  | HTML dashboard (version, config, timeline, history) | Browser |
 | GET    | `/healthz`  | no   | Liveness check                                | launchd / hook fail-open |
 
-Auth-protected endpoints require the `X-Review-Token` header. `GET /` is
-deliberately public because the server binds `127.0.0.1` — the network bind
-is the trust boundary, not an HTTP secret.
+`/mcp` takes the `X-Review-Token` header (its clients send a static one).
+Every other auth-protected endpoint takes only **signed** requests made
+through `hooks/signed-client.mjs`: an HMAC of the method, path, body,
+timestamp, nonce and server instance, keyed by the token, which is never
+sent; the response is signed back and verified. `X-Review-Token` on those
+routes is refused. `GET /` is deliberately public because the server binds
+`127.0.0.1` — the network bind is the trust boundary, not an HTTP secret.
 
 #### MCP tools exposed over `/mcp`
 
@@ -812,13 +816,20 @@ Hook responsibilities (kept minimal):
    `stop_hook_active` is intentionally ignored — the multi-round loop runs
    inside a single turn (see "Loop semantics" below). The server-side cap
    is one safety net; Claude Code's 8-block cap is the other.
-2. Read `authToken` directly from
-   `~/.config/review-orchestrator/config.json`. If the file is missing or
-   has no token → log, exit 0 (fail open). The hook does **not** depend on
-   the env var being inherited from Claude Code's launching shell.
-3. POST `http://127.0.0.1:7777/review` with header `X-Review-Token: <token>`
-   and body `{ cwd, session_id, trigger: "stop_hook" }`. Timeout is the
-   configured reviewer timeout + 60s (660s by default), capped at 1740s.
+2. Connect through `signed-client.mjs` (installed next to the hook): read
+   `authToken` from `~/.config/review-orchestrator/config.json` (retried
+   briefly when caught mid-edit, then
+   `~/.cache/review-orchestrator/hook-credentials.json`), and pick the
+   address — `~/.cache/review-orchestrator/server.json` when the server
+   there proves the token (`GET /healthz?challenge=`), else config.json's.
+   No token or no proving server → log, exit 0 (fail open). The hook does
+   **not** depend on the env var being inherited from Claude Code's
+   launching shell.
+3. POST `/review` as a signed request (the token itself is never sent)
+   with body `{ cwd, session_id, trigger: "stop_hook", timeoutMs }`, and
+   verify the signed response. The wait is the running server's published
+   `hookTimeoutMs` (server.json), else the configured reviewer timeout +
+   60s (660s by default), capped at 1740s.
 4. On HTTP error / connection refused → log to
    `~/.claude/logs/review-hook.log` and exit 0 (fail open).
 5. Map the response. Decision is driven by `result.status` (which the
@@ -909,7 +920,8 @@ session.
 ### 5b. Client CLIs (who calls the orchestrator)
 
 Three CLIs can drive the loop. All three hit the same `/review`, `/mcp` and
-`/notify-change` endpoints with the same `X-Review-Token`, and all three
+`/notify-change` endpoints with the same token (sent as `X-Review-Token`
+on `/mcp`, used to sign every other request), and all three
 send `trigger: "stop_hook"` for the end-of-turn review, so the server's
 round/block accounting, `NO_PROGRESS` detection and `MAX_BLOCKS` cap behave
 identically no matter who is calling.
@@ -1266,7 +1278,7 @@ truly clean tree.
 }
 ```
 
-**Server endpoint** — `POST /notify-change` (auth via `X-Review-Token`).
+**Server endpoint** — `POST /notify-change` (signed request).
 Body: `{cwd, tool?, file?}`. Resolves the context, flips
 `state.dirtySinceLastReview = true`, stamps `state.lastChangeAt`,
 returns `{ok, context, dirty, lastChangeAt}`. Logged as
@@ -1381,7 +1393,7 @@ flag is part of `reviewConfigHash` so toggling it busts the cache cleanly.
 | Payload empty/binary-only | `ESCALATE: payload empty or fully binary` (unless `payload.fallbackToHead` is on and a base commit resolves). |
 | Repo not a git repo | `ESCALATE: not a git repository`. |
 | `cwd` outside `allowedRoots` | `ESCALATE: cwd not in allowed roots`. |
-| Missing/invalid `X-Review-Token` | HTTP 401, hook fails open. |
+| Bad signature, unknown instance, or a response that doesn't verify | HTTP 401 / unverified, hook fails open and says why. |
 | `provider: "gemini"` with no key + api-key auth selected | Server exits at startup with a clear error (pre-flight check). OAuth via `~/.gemini/` is accepted. |
 
 ## Configuration

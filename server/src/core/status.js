@@ -5,9 +5,9 @@
 
 // Debug / diagnostic endpoint. Returns a server-side snapshot so the
 // human operator can answer "what's the orchestrator currently doing?"
-// without reading the state file by hand. Behind the same
-// X-Review-Token middleware as /review, so a third process on localhost
-// can't enumerate active sessions.
+// without reading the state file by hand. Signed requests only, like
+// /review, so a third process on localhost can't enumerate active
+// sessions.
 
 const REDACTED = "<redacted>"
 

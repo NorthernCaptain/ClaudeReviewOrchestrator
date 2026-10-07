@@ -28,93 +28,55 @@
 //
 // Must be FAST and silent — it fires on every Write/Edit/MultiEdit.
 // All errors are swallowed; the hook never blocks Claude's tool
-// execution or pollutes the user's CLI output.
+// execution or pollutes the user's CLI output. The request goes through
+// the shared signed client (signed-client.mjs, installed next to this
+// file), like the Stop hook's.
 
-import { readFileSync } from "node:fs"
-import { homedir } from "node:os"
 import path from "node:path"
+import { connect as connectSignedServer } from "./signed-client.mjs"
 
-const CONFIG_PATH = () =>
-    path.join(homedir(), ".config", "review-orchestrator", "config.json")
-const DEFAULT_PORT = 7777
-const DEFAULT_BIND = "127.0.0.1"
 const REQUEST_TIMEOUT_MS = 2000
+const CHALLENGE_TIMEOUT_MS = 1000
 
-// Same bind→host mapping the Stop hook uses. Keep them in sync.
-const clientHostFromBind = (bind) => {
-    if (!bind || bind === "0.0.0.0") return "127.0.0.1"
-    if (bind === "::" || bind === "::1") return "[::1]"
-    if (bind.startsWith("[")) return bind
-    const colons = (bind.match(/:/g) ?? []).length
-    if (colons >= 2) return `[${bind}]`
-    return bind
-}
-
-const readEndpoint = () => {
-    try {
-        const raw = readFileSync(CONFIG_PATH(), "utf8")
-        const cfg = JSON.parse(raw)
-        if (!cfg?.authToken) return null
-        const port = Number.isInteger(cfg.port) ? cfg.port : DEFAULT_PORT
-        const bind =
-            typeof cfg.bind === "string" && cfg.bind.length > 0
-                ? cfg.bind
-                : DEFAULT_BIND
-        return {
-            token: cfg.authToken,
-            url: `http://${clientHostFromBind(bind)}:${port}/notify-change`,
-        }
-    } catch {
-        return null
-    }
-}
-
-const readStdinJSON = async () => {
+const readStdinJSON = async (stdin) => {
     let buf = ""
-    for await (const chunk of process.stdin) {
+    for await (const chunk of stdin) {
         buf += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk)
     }
     if (!buf.trim()) return {}
     return JSON.parse(buf)
 }
 
-const main = async () => {
+const main = async ({
+    stdin = process.stdin,
+    connect = connectSignedServer,
+} = {}) => {
     let payload
     try {
-        payload = await readStdinJSON()
+        payload = await readStdinJSON(stdin)
     } catch {
         return 0
     }
     const cwd = payload?.cwd
     if (typeof cwd !== "string" || cwd.length === 0) return 0
 
-    const ep = readEndpoint()
-    if (!ep) return 0
-
-    const body = {
-        cwd,
-        tool: payload?.tool_name ?? null,
-        file: payload?.tool_input?.file_path ?? null,
-    }
-
-    const ctl = new AbortController()
-    const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS)
     try {
-        await fetch(ep.url, {
+        const conn = await connect({ challengeTimeoutMs: CHALLENGE_TIMEOUT_MS })
+        if (!conn.ok) return 0
+        // Server down, timeout or an unverified answer: nothing to do. The
+        // Stop hook's slow path covers it (dirty stays as it was).
+        await conn.request({
             method: "POST",
-            headers: {
-                "content-type": "application/json",
-                "x-review-token": ep.token,
+            path: "/notify-change",
+            body: {
+                cwd,
+                tool: payload?.tool_name ?? null,
+                file: payload?.tool_input?.file_path ?? null,
             },
-            body: JSON.stringify(body),
-            signal: ctl.signal,
+            timeoutMs: REQUEST_TIMEOUT_MS,
         })
     } catch {
-        // Server down / timeout / network. Swallow — the Stop hook's
-        // existing slow-path covers this case correctly (dirty stays
-        // at its current value).
-    } finally {
-        clearTimeout(timer)
+        // never break the user's session
     }
     return 0
 }
@@ -133,8 +95,4 @@ if (isDirectInvocation()) {
     })
 }
 
-export {
-    main as __main_for_tests,
-    readEndpoint as __readEndpoint_for_tests,
-    clientHostFromBind as __clientHostFromBind_for_tests,
-}
+export { main as __main_for_tests }

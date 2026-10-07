@@ -3,14 +3,14 @@
  * Author: Leo Khramov
  */
 
-import { randomBytes } from "node:crypto"
+import { randomBytes, randomUUID } from "node:crypto"
 import { readFileSync, rmSync } from "node:fs"
 import path from "node:path"
 import express from "express"
 import { VERSION } from "./version.js"
 
 export { VERSION }
-import { authMiddleware } from "./auth.js"
+import { createAuth, createTokenState, DEFAULT_GRACE_HOURS } from "./auth.js"
 import {
     captureCore,
     codexSchemaPathFor,
@@ -35,6 +35,11 @@ import { createArchive } from "./archive.js"
 import { createConfigStore } from "./config-store.js"
 import { createReloadController, requiredHookWaitMs } from "./reload.js"
 import { MAX_FETCH_TIMEOUT_MS } from "../../hooks/stop-review.mjs"
+import { defaultServerInfoPath, SERVICE } from "../../hooks/signed-client.mjs"
+import {
+    defaultCredentialsPath,
+    writeFileAtomic,
+} from "../../install/config-lock.mjs"
 import { createMetrics } from "./metrics.js"
 import { logger } from "./logger.js"
 import { createHttpAccessLog, createHttpErrorHandler } from "./http-log.js"
@@ -151,6 +156,72 @@ const reloadErrorStatus = (err) =>
         ? 422
         : 500)
 
+// ~/.cache/review-orchestrator/server.json (hot-reload plan §5.7): where
+// the running server listens and how long a hook should wait, for the
+// hooks' address selection. Written once listening, rewritten whenever the
+// published wait changes, removed on graceful shutdown.
+export const createServerInfo = ({
+    path: filePath,
+    instanceId,
+    startedAt,
+    hookTimeoutMs,
+    logger: log = null,
+    write = writeFileAtomic,
+    read = readFileSync,
+    remove = rmSync,
+    pid = process.pid,
+}) => {
+    let address = null
+    let written = null
+    const refresh = () => {
+        if (!filePath || !address) return false
+        const text =
+            JSON.stringify(
+                {
+                    pid,
+                    port: address.port,
+                    bind: address.address,
+                    startedAt: new Date(startedAt).toISOString(),
+                    instanceId,
+                    hookTimeoutMs: hookTimeoutMs(),
+                },
+                null,
+                2
+            ) + "\n"
+        if (text === written) return false
+        try {
+            write(filePath, text)
+            written = text
+            return true
+        } catch (err) {
+            log?.warn?.({ err: err.message }, "failed to write server.json")
+            return false
+        }
+    }
+    return {
+        setAddress: (value) => {
+            address = value
+            return refresh()
+        },
+        refresh,
+        // Only while it's still ours: a newer instance may have replaced it.
+        remove: () => {
+            if (!filePath || written === null) return false
+            try {
+                if (
+                    JSON.parse(read(filePath, "utf8"))?.instanceId !==
+                    instanceId
+                )
+                    return false
+                remove(filePath, { force: true })
+                return true
+            } catch {
+                return false
+            }
+        },
+    }
+}
+
 // Every route below except /healthz and the favicon is a delegate: it
 // runs on the core current at that moment (hot-reload plan §5.1), pinned
 // for the request's life. The shell owns paths, auth, the loopback guard,
@@ -170,6 +241,12 @@ export const createApp = ({
     startedAt = Date.now(),
     shellVersion = shellVersionId(),
     loadCandidate = createCandidateLoader(),
+    // Random per start: signed requests name the instance they're for.
+    instanceId = randomUUID(),
+    // Where hook-credentials.json and server.json go; null writes neither
+    // (tests, embedders).
+    credentialsPath = null,
+    serverInfoPath = null,
 }) => {
     // Shell-owned in-flight registries (hot-reload plan §5.5): duplicate
     // matching, per-context ordering and the dashboard's in-flight view
@@ -216,6 +293,29 @@ export const createApp = ({
             }
         },
         fs: callerDeps.configFs,
+        credentialsPath,
+        onCommit: () => serverInfo.refresh(),
+    })
+    // The token is read from config.json per request (§5.7); a change
+    // refreshes the hooks' credentials cache.
+    const tokenState = createTokenState({
+        configPath,
+        initialToken: config.authToken,
+        graceHours: () =>
+            configStore.current().auth?.previousTokenGraceHours ??
+            DEFAULT_GRACE_HOURS,
+        onChange: () => {
+            configStore.syncCredentials()
+        },
+        logger: log,
+    })
+    const auth = createAuth({ tokenState, instanceId })
+    const serverInfo = createServerInfo({
+        path: serverInfoPath,
+        instanceId,
+        startedAt,
+        hookTimeoutMs: () => reloads.publishedHookTimeoutMs(),
+        logger: log,
     })
     const registries = Object.freeze({
         inflight: deps.inflight,
@@ -225,7 +325,13 @@ export const createApp = ({
     })
     const shellStatus = () => {
         const { coreVersion, ...reload } = reloads.status()
-        return { shellVersion, coreVersion, reload }
+        return {
+            shellVersion,
+            coreVersion,
+            instanceId,
+            reload,
+            auth: tokenState.status(),
+        }
     }
     // What a core attaches: the same shell objects for every core, except
     // the archive, which stamps each record with the core that wrote it.
@@ -281,6 +387,7 @@ export const createApp = ({
             const level = applied.logging?.level
             if (level && log && "level" in log) log.level = level
         },
+        onPendingChange: () => serverInfo.refresh(),
         logger: log,
     })
     // Non-review requests pin the current core for their whole life.
@@ -299,18 +406,41 @@ export const createApp = ({
     app.locals.reloads = reloads
     app.locals.live = liveFor({ version: core.version })
     app.locals.configStore = configStore
+    app.locals.serverInfo = serverInfo
+    app.locals.instanceId = instanceId
 
     // Access log runs before body parsing so we see every incoming
     // request including ones rejected by JSON parsing or auth. It logs
     // on response finish/close so the line carries the final status and
     // duration.
     app.use(createHttpAccessLog({ logger: log }))
-    app.use(express.json({ limit: "1mb" }))
+    // The raw bytes are kept for request signatures.
+    app.use(
+        express.json({
+            limit: "1mb",
+            verify: (req, _res, buf) => {
+                req.rawBody = buf
+            },
+        })
+    )
 
-    app.get("/healthz", (_req, res) => {
+    // Unauthenticated. With ?challenge=<nonce>, proves the token (after the
+    // same refresh an authenticated request does) for address selection.
+    app.get("/healthz", (req, res) => {
+        const answer = auth.challenge(req.query.challenge)
+        if (answer.error) {
+            res.status(400).json({
+                ok: false,
+                service: SERVICE,
+                error: answer.error,
+            })
+            return
+        }
         const { coreVersion, pending } = reloads.status()
         res.json({
             ok: true,
+            service: SERVICE,
+            ...answer,
             shellVersion,
             coreVersion,
             reloadPending: pending !== null,
@@ -371,7 +501,8 @@ export const createApp = ({
         route((r) => r.dashboardPage)
     )
 
-    app.use(authMiddleware({ token: config.authToken }))
+    // /mcp takes X-Review-Token; every route below it only signed requests.
+    app.use(auth.middleware)
     // Reviews are admitted before anything else happens (hot-reload plan
     // §5.5): counted toward "busy", pinned to the current core and to a
     // frozen copy of the config, released when the work ends (which, for
@@ -470,6 +601,8 @@ export const startServer = async ({
     coreInfo = {},
     shellVersion = shellVersionId(),
     loadCandidate = createCandidateLoader(),
+    credentialsPath = null,
+    serverInfoPath = null,
 } = {}) => {
     const active =
         core ??
@@ -487,6 +620,8 @@ export const startServer = async ({
             startedAt,
             shellVersion,
             loadCandidate,
+            credentialsPath,
+            serverInfoPath,
         })
         const server = app.listen(config.port, config.bind)
         let settled = false
@@ -544,6 +679,8 @@ export const startServer = async ({
             // the operator can verify the daemon picked up the right
             // version + provider + timeouts without curling /status.
             log.info(active.summarizeConfig(config), "active config")
+            app.locals.serverInfo.setAddress(addr)
+            app.locals.configStore.syncCredentials()
             settle({ ok: true, server, address: addr, sockets, app })
         })
     })
@@ -826,6 +963,8 @@ const main = async () => {
         },
         shellVersion,
         loadCandidate: createCandidateLoader({ codexSchemaPathOf }),
+        credentialsPath: defaultCredentialsPath(),
+        serverInfoPath: defaultServerInfoPath(),
     })
     if (!result.ok) {
         process.exitCode = 1
@@ -845,6 +984,8 @@ const main = async () => {
             return
         }
         logger.info({ signal }, "shutting down")
+        // First, so no new hook picks a server that's going away.
+        app.locals.serverInfo.remove()
         gracefulShutdown({
             server,
             sockets,

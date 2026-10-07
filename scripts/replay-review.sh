@@ -13,12 +13,15 @@
 #   scripts/replay-review.sh --cwd /path/to/repo
 #                                               # ad-hoc, no snapshot needed
 #
-# Requires: jq, curl. Reads token + URL from the same config file the
-# server and hook do.
+# Requires: jq, node. Sends the request through hooks/signed-client.mjs,
+# which reads the token from the same config file the server and hooks
+# do and signs the request with it.
 
 set -euo pipefail
 
 CONFIG_PATH="${REVIEW_ORCH_CONFIG:-$HOME/.config/review-orchestrator/config.json}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLIENT="$SCRIPT_DIR/../hooks/signed-client.mjs"
 CALLS_DIR="$HOME/.claude/logs/review-hook-calls"
 
 usage() {
@@ -42,27 +45,14 @@ require() {
 }
 
 require jq
-require curl
+require node
 
-if [[ ! -r "$CONFIG_PATH" ]]; then
-    echo "error: config not readable: $CONFIG_PATH" >&2
-    exit 3
-fi
-
-TOKEN=$(jq -r '.authToken // empty' "$CONFIG_PATH")
-PORT=$(jq -r '.port // 7777' "$CONFIG_PATH")
-BIND=$(jq -r '.bind // "127.0.0.1"' "$CONFIG_PATH")
-case "$BIND" in
-    "0.0.0.0") HOST="127.0.0.1" ;;
-    "::" | "::1") HOST="[::1]" ;;
-    *) HOST="$BIND" ;;
-esac
-URL="http://$HOST:$PORT/review"
-
-if [[ -z "$TOKEN" ]]; then
-    echo "error: no authToken in $CONFIG_PATH" >&2
-    exit 3
-fi
+# A signed request through the shared client (the token is never sent).
+# Prints the response body; exits 0 on a 2xx, 1 on an error status, 4 when
+# no server proves the token or the response doesn't verify.
+signed() {
+    node "$CLIENT" --config "$CONFIG_PATH" "$@"
+}
 
 REQUEST_BODY=""
 SOURCE=""
@@ -104,26 +94,17 @@ else
 fi
 
 echo "==> replay from: $SOURCE" >&2
-echo "==> POST $URL" >&2
+echo "==> POST /review" >&2
 echo "==> body:" >&2
 echo "$REQUEST_BODY" | jq . >&2
 echo "" >&2
 
-curl -sS -X POST "$URL" \
-    -H "content-type: application/json" \
-    -H "x-review-token: $TOKEN" \
-    -D /tmp/replay-headers.$$ \
-    --data "$REQUEST_BODY" \
-    | jq .
-
-RC=${PIPESTATUS[0]}
-
-REQ_ID=$(grep -i '^x-request-id:' /tmp/replay-headers.$$ \
-    | awk '{print $2}' | tr -d '\r' | head -1)
+# A review can run up to the hooks' 29-minute cap.
+RC=0
+signed --timeout 1740 --verbose POST /review "$REQUEST_BODY" | jq . \
+    || RC=${PIPESTATUS[0]}
 echo "" >&2
-echo "==> server request id: ${REQ_ID:-<none>}" >&2
-echo "==> grep the server log for that id to see the full pipeline trace." >&2
-
-rm -f /tmp/replay-headers.$$
+echo "==> grep the server log for the request id above to see the full pipeline trace." >&2
 
 exit "$RC"
+

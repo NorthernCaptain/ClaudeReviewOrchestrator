@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { createConfigStore } from "./config-store.js"
+import { ConfigLockError } from "../../install/config-lock.mjs"
 import {
     baseHookLimitMs,
     configChanges,
@@ -144,6 +145,8 @@ const setup = ({
     file = initialConfig,
     v1Schema = schema(),
     onApplied = null,
+    onPendingChange = undefined,
+    withFileLock = undefined,
 } = {}) => {
     writeConfig(file)
     const v1 = fakeCore("v1", { validateConfig: v1Schema })
@@ -163,6 +166,7 @@ const setup = ({
             selfCheck: ctl.currentCore().selfCheck,
         }),
         now: timers.now,
+        ...(withFileLock ? { withFileLock } : {}),
     })
     const applied = []
     ctl = createReloadController({
@@ -188,6 +192,7 @@ const setup = ({
         now: timers.now,
         setTimer: timers.setTimer,
         clearTimer: timers.clearTimer,
+        ...(onPendingChange ? { onPendingChange } : {}),
     })
     return {
         ctl,
@@ -1139,5 +1144,225 @@ describe("requiredHookWaitMs", () => {
             })
         ).toBe(90_000)
         expect(requiredHookWaitMs({})).toBe(660_000)
+    })
+})
+
+describe("the published hook wait and the config lock", () => {
+    const raiseTimeout = (seconds) =>
+        editConfig((c) => {
+            c.limits.codexTimeoutSeconds = seconds
+        })
+
+    test("idle: the running config's wait; pending: the larger one plus the hold, republished on each change", async () => {
+        const onPendingChange = jest.fn()
+        const { ctl } = setup({ onPendingChange })
+        expect(ctl.publishedHookTimeoutMs()).toBe(660_000)
+        const ticket = await ctl.admitReview()
+        raiseTimeout(900)
+        expect(await ctl.trigger()).toMatchObject({ scheduled: true })
+        expect(onPendingChange).toHaveBeenCalledTimes(1)
+        expect(ctl.publishedHookTimeoutMs()).toBe(960_000 + 45_000)
+        ticket.release()
+        await new Promise((r) => setImmediate(r))
+        await new Promise((r) => setImmediate(r))
+        expect(ctl.status().pending).toBeNull()
+        expect(onPendingChange).toHaveBeenCalledTimes(2)
+        expect(ctl.publishedHookTimeoutMs()).toBe(960_000)
+    })
+
+    test("the hold is clamped so the published wait stays within the hooks' cap", async () => {
+        const { ctl } = setup()
+        const ticket = await ctl.admitReview()
+        raiseTimeout(1680)
+        await ctl.trigger()
+        expect(ctl.publishedHookTimeoutMs()).toBe(1_740_000)
+        ticket.release()
+    })
+
+    test("a pending rollback publishes the larger of now and the config it restores", async () => {
+        const { ctl } = setup()
+        raiseTimeout(300)
+        await ctl.trigger()
+        expect(ctl.publishedHookTimeoutMs()).toBe(360_000)
+        const ticket = await ctl.admitReview()
+        await ctl.trigger({ rollback: true })
+        expect(ctl.publishedHookTimeoutMs()).toBe(660_000 + 45_000)
+        ticket.release()
+    })
+
+    test("a failing pending-change listener is logged, not fatal", async () => {
+        const { ctl } = setup({
+            onPendingChange: () => {
+                throw new Error("listener broke")
+            },
+        })
+        const ticket = await ctl.admitReview()
+        raiseTimeout(900)
+        await expect(ctl.trigger()).resolves.toMatchObject({ scheduled: true })
+        ticket.release()
+    })
+
+    test("swaps run under the config lock; a lock held elsewhere fails the reload and reopens admission", async () => {
+        const locked = []
+        let refuse = false
+        const withFileLock = async (p, fn) => {
+            if (refuse) {
+                throw new ConfigLockError(
+                    "config.json is locked by another writer — try again"
+                )
+            }
+            locked.push(p)
+            return fn()
+        }
+        const { ctl } = setup({ withFileLock })
+        raiseTimeout(900)
+        expect(await ctl.trigger()).toMatchObject({ applied: true })
+        expect(locked).toEqual([configPath])
+        raiseTimeout(1000)
+        refuse = true
+        const r = await ctl.trigger()
+        expect(r).toMatchObject({
+            ok: false,
+            cancelled: true,
+            code: "CONFIG_LOCKED",
+        })
+        expect(ctl.status().pending).toBeNull()
+        expect(ctl.status().history[0]).toMatchObject({
+            ok: false,
+            error: /locked by another writer/,
+        })
+        const ticket = await ctl.admitReview()
+        expect(ticket.config.limits.codexTimeoutSeconds).toBe(900)
+        ticket.release()
+    })
+})
+
+describe("rollback never restores what config.json owns", () => {
+    const rotation = (n) => ({
+        tokenHash: `h${n}`,
+        previousTokenHash: `h${n - 1}`,
+        grace: "default",
+        at: "2026-10-07T12:00:00.000Z",
+    })
+
+    test("a rotation picked up by a reload survives its rollback, in the file and out of the reverted list", async () => {
+        const { ctl, configStore } = setup()
+        editConfig((c) => {
+            c.authToken = "rotated"
+            c.auth = { rotations: [rotation(1)] }
+            c.limits.maxCodexRounds = 9
+        })
+        await ctl.trigger()
+        expect(configStore.current().auth.rotations).toHaveLength(1)
+        const r = await ctl.trigger({ rollback: true })
+        expect(r.reverted).toEqual(["limits.maxCodexRounds"])
+        expect(readConfig()).toMatchObject({
+            authToken: "rotated",
+            auth: { rotations: [rotation(1)] },
+            limits: { maxCodexRounds: 5 },
+        })
+    })
+
+    test("a later rotation isn't undone either", async () => {
+        const { ctl } = setup()
+        editConfig((c) => {
+            c.auth = { rotations: [rotation(1)] }
+            c.limits.maxCodexRounds = 9
+        })
+        await ctl.trigger()
+        editConfig((c) => {
+            c.authToken = "again"
+            c.auth.rotations.push(rotation(2))
+        })
+        await ctl.trigger({ rollback: true })
+        expect(readConfig().auth.rotations).toEqual([rotation(1), rotation(2)])
+        expect(readConfig().authToken).toBe("again")
+    })
+
+    // v1 knows no top-level "auth".
+    const preAuthSchema = (raw) => {
+        if (raw.auth !== undefined) {
+            throw Object.assign(new Error("unknown auth"), {
+                code: "CONFIG_INVALID",
+                issues: [
+                    { code: "unrecognized_keys", path: [], keys: ["auth"] },
+                ],
+            })
+        }
+        return schema()(raw)
+    }
+
+    test("a rollback to a core that can't accept the file's rotation history is refused, changing nothing", async () => {
+        const { ctl, willLoad, configStore } = setup({
+            v1Schema: preAuthSchema,
+        })
+        editConfig((c) => {
+            c.auth = { rotations: [rotation(1)], previousTokenGraceHours: 2 }
+        })
+        willLoad(candidate("v2"))
+        await ctl.trigger()
+        const fileBefore = readConfig()
+        await expect(ctl.trigger({ rollback: true })).resolves.toMatchObject({
+            ok: false,
+            code: "ROLLBACK_DROPS_FILE_OWNED_KEYS",
+            error: /doesn't accept auth\.rotations/,
+        })
+        expect(ctl.status().coreVersion).toBe("v2")
+        expect(readConfig()).toEqual(fileBefore)
+        // Config transactions keep working on the core that stayed.
+        await expect(
+            configStore.mutate([[["limits", "maxCodexRounds"], 7]])
+        ).resolves.toMatchObject({ revision: expect.any(Number) })
+    })
+
+    test("a rejected field inside a rotation record is refused too", async () => {
+        const oldRecordShape = (raw) => {
+            const bad = (raw.auth?.rotations ?? []).findIndex((r) => r.extra)
+            if (bad >= 0) {
+                throw Object.assign(new Error("unknown extra"), {
+                    code: "CONFIG_INVALID",
+                    issues: [
+                        {
+                            code: "unrecognized_keys",
+                            path: ["auth", "rotations", bad],
+                            keys: ["extra"],
+                        },
+                    ],
+                })
+            }
+            return schema()(raw)
+        }
+        const { ctl, willLoad } = setup({ v1Schema: oldRecordShape })
+        editConfig((c) => {
+            c.auth = { rotations: [{ ...rotation(1), extra: 1 }] }
+        })
+        willLoad(candidate("v2"))
+        await ctl.trigger()
+        await expect(ctl.trigger({ rollback: true })).resolves.toMatchObject({
+            ok: false,
+            code: "ROLLBACK_DROPS_FILE_OWNED_KEYS",
+        })
+    })
+
+    test("without rotation history, a schema rollback drops the auth block and edits keep working", async () => {
+        const { ctl, willLoad, configStore } = setup({
+            v1Schema: preAuthSchema,
+        })
+        editConfig((c) => {
+            c.auth = { previousTokenGraceHours: 2 }
+        })
+        willLoad(candidate("v2"))
+        await ctl.trigger()
+        const r = await ctl.trigger({ rollback: true })
+        expect(r).toMatchObject({ applied: true })
+        expect(r.reverted.sort()).toEqual([
+            "auth",
+            "auth.previousTokenGraceHours",
+        ])
+        expect(configStore.current().auth).toBeUndefined()
+        expect(readConfig().auth).toBeUndefined()
+        await expect(
+            configStore.mutate([[["limits", "maxCodexRounds"], 7]])
+        ).resolves.toMatchObject({ revision: expect.any(Number) })
     })
 })

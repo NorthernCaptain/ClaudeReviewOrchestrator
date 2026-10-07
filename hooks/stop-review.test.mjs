@@ -19,7 +19,6 @@ import {
     clientHostFromBind,
     decideStopHookResponse,
     formatBlockingFindings,
-    readToken,
     resolveFetchTimeoutMs,
     MAX_FETCH_TIMEOUT_MS,
     main,
@@ -50,79 +49,80 @@ const stdinFromJSON = (obj) => Readable.from([JSON.stringify(obj)])
 const stdinEmpty = () => Readable.from([""])
 const stdinFromString = (s) => Readable.from([s])
 
-describe("readToken", () => {
-    let dir
-    beforeEach(() => {
-        dir = makeTmpDir()
-    })
-    afterEach(() => rmSync(dir, { recursive: true, force: true }))
-
-    test("returns null when file is missing", () => {
-        expect(
-            readToken({ configPath: path.join(dir, "absent.json") })
-        ).toBeNull()
-    })
-
-    test("returns null when JSON is malformed", () => {
-        const p = path.join(dir, "bad.json")
-        writeFileSync(p, "{ not json")
-        expect(readToken({ configPath: p })).toBeNull()
-    })
-
-    test("returns null when authToken is missing or empty", () => {
-        const p = path.join(dir, "c.json")
-        writeFileSync(p, JSON.stringify({ other: "value" }))
-        expect(readToken({ configPath: p })).toBeNull()
-        writeFileSync(p, JSON.stringify({ authToken: "" }))
-        expect(readToken({ configPath: p })).toBeNull()
-    })
-
-    test("returns { token, url } when authToken is present", () => {
-        const p = path.join(dir, "c.json")
-        writeFileSync(p, JSON.stringify({ authToken: "abc123" }))
-        expect(readToken({ configPath: p })).toEqual({
-            token: "abc123",
-            url: "http://127.0.0.1:7777/review",
-            // No reviewer/codex timeout configured → fallback default.
-            fetchTimeoutMs: 660_000,
-        })
-    })
-
-    test("derives url from config.port and config.bind", () => {
-        const p = path.join(dir, "c.json")
-        writeFileSync(
-            p,
-            JSON.stringify({
-                authToken: "abc",
-                port: 17999,
-                bind: "127.0.0.1",
+// A connection like signed-client.mjs connect() over a plain fetchFn:
+// signing and response verification have their own tests there and in
+// the server's auth tests. `cfg` null is "no credentials".
+const connOver = (fetchFn, baseUrl = "http://127.0.0.1:9999") => ({
+    request: async ({ method, path: target, body, timeoutMs }) => {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), timeoutMs)
+        try {
+            const res = await fetchFn(`${baseUrl}${target}`, {
+                method,
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(body),
+                signal: controller.signal,
             })
-        )
-        const result = readToken({ configPath: p })
-        expect(result.url).toBe("http://127.0.0.1:17999/review")
-    })
-
-    test("falls back to default port/bind when config omits them", () => {
-        const p = path.join(dir, "c.json")
-        writeFileSync(p, JSON.stringify({ authToken: "abc" }))
-        const result = readToken({ configPath: p })
-        expect(result.url).toBe("http://127.0.0.1:7777/review")
-    })
-
-    test("returns the resolved fetchTimeoutMs alongside token and url", () => {
-        const p = path.join(dir, "c.json")
-        writeFileSync(
-            p,
-            JSON.stringify({
-                authToken: "t",
-                reviewer: { claude: { timeoutSeconds: 600 } },
-            })
-        )
-        const r = readToken({ configPath: p })
-        // 600s reviewer timeout + 60s buffer = 660,000ms
-        expect(r.fetchTimeoutMs).toBe(660_000)
-    })
+            let parsed = null
+            try {
+                parsed = await res.json()
+            } catch {
+                parsed = null
+            }
+            let serverRequestId = null
+            try {
+                serverRequestId = res.headers?.get?.("x-request-id") ?? null
+            } catch {
+                serverRequestId = null
+            }
+            return {
+                httpStatus: res.status,
+                body: parsed,
+                fetchError: null,
+                serverRequestId,
+            }
+        } catch (err) {
+            return {
+                httpStatus: null,
+                body: null,
+                fetchError:
+                    err?.name === "AbortError"
+                        ? `request timed out after ${timeoutMs}ms`
+                        : (err?.message ?? String(err)),
+                serverRequestId: null,
+            }
+        } finally {
+            clearTimeout(timer)
+        }
+    },
 })
+const fakeConnect =
+    (cfg) =>
+    async ({ fetchFn }) => {
+        if (cfg === null) {
+            return {
+                ok: false,
+                stage: "credentials",
+                reason: "no auth token found in config.json",
+            }
+        }
+        const baseUrl = (cfg.url ?? "http://127.0.0.1:9999/review").replace(
+            /\/review$/,
+            ""
+        )
+        return {
+            ok: true,
+            ...connOver(fetchFn, baseUrl),
+            server: {
+                baseUrl,
+                instanceId: "i-1",
+                hookTimeoutMs: cfg.fetchTimeoutMs ?? null,
+            },
+            creds: { token: cfg.token, ...(cfg.creds ?? {}) },
+            credentialsSource: cfg.source ?? "config",
+            configError: cfg.configError ?? null,
+        }
+    }
 
 describe("resolveFetchTimeoutMs", () => {
     test("returns the explicit value when hook.fetchTimeoutSeconds is set", () => {
@@ -295,37 +295,6 @@ describe("clientHostFromBind", () => {
         expect(clientHostFromBind("127.0.0.1")).toBe("127.0.0.1")
         expect(clientHostFromBind("192.168.1.1")).toBe("192.168.1.1")
         expect(clientHostFromBind("localhost")).toBe("localhost")
-    })
-
-    test("readToken uses clientHostFromBind for url construction", () => {
-        const dir = mkdtempSync(path.join(tmpdir(), "stop-hook-bind-"))
-        try {
-            const p = path.join(dir, "c.json")
-            writeFileSync(
-                p,
-                JSON.stringify({
-                    authToken: "t",
-                    port: 7777,
-                    bind: "0.0.0.0",
-                })
-            )
-            expect(readToken({ configPath: p }).url).toBe(
-                "http://127.0.0.1:7777/review"
-            )
-            writeFileSync(
-                p,
-                JSON.stringify({
-                    authToken: "t",
-                    port: 7777,
-                    bind: "::1",
-                })
-            )
-            expect(readToken({ configPath: p }).url).toBe(
-                "http://[::1]:7777/review"
-            )
-        } finally {
-            rmSync(dir, { recursive: true, force: true })
-        }
     })
 })
 
@@ -839,7 +808,7 @@ describe("main (integration with injected I/O)", () => {
                 findings: [],
                 blockingFindings: [],
             }),
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -882,7 +851,7 @@ describe("main (integration with injected I/O)", () => {
                 ],
                 state: { codexRounds: 1, blockCount: 1 },
             }),
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -904,7 +873,7 @@ describe("main (integration with injected I/O)", () => {
             stdout,
             stderr,
             fetchFn: fakeFetchThrowing(new Error("ECONNREFUSED")),
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -930,7 +899,7 @@ describe("main (integration with injected I/O)", () => {
                 status: 500,
                 json: async () => ({}),
             }),
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -950,7 +919,7 @@ describe("main (integration with injected I/O)", () => {
             stdout,
             stderr,
             fetchFn: fetchSpy,
-            tokenReader: () => null,
+            connect: fakeConnect(null),
             log: () => {},
         })
         expect(code).toBe(0)
@@ -973,7 +942,7 @@ describe("main (integration with injected I/O)", () => {
                 status: 200,
                 json: async () => ({}),
             }),
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -1009,7 +978,7 @@ describe("main (integration with injected I/O)", () => {
             stdout,
             stderr,
             fetchFn: fetchSpy,
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -1028,7 +997,7 @@ describe("main (integration with injected I/O)", () => {
             stdout,
             stderr,
             fetchFn: async () => ({ status: 200, json: async () => ({}) }),
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -1047,7 +1016,7 @@ describe("main (integration with injected I/O)", () => {
             stdout,
             stderr,
             fetchFn: fetchSpy,
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -1057,7 +1026,7 @@ describe("main (integration with injected I/O)", () => {
         expect(fetchSpy).not.toHaveBeenCalled()
     })
 
-    test("sends trigger:stop_hook and the X-Review-Token header", async () => {
+    test("sends trigger:stop_hook as a POST to /review", async () => {
         const stdout = mkWritable()
         const stderr = mkWritable()
         let seenInit = null
@@ -1077,7 +1046,7 @@ describe("main (integration with injected I/O)", () => {
             stdout,
             stderr,
             fetchFn: fetchSpy,
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "tok-xyz",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -1085,7 +1054,6 @@ describe("main (integration with injected I/O)", () => {
         })
         expect(seenInit.url).toMatch(/\/review$/)
         expect(seenInit.init.method).toBe("POST")
-        expect(seenInit.init.headers["x-review-token"]).toBe("tok-xyz")
         const body = JSON.parse(seenInit.init.body)
         expect(body).toEqual({
             cwd,
@@ -1180,7 +1148,7 @@ describe("main snapshot wiring", () => {
                 { status: "GOOD_TO_GO", findings: [], blockingFindings: [] },
                 { "x-request-id": "rid-xyz" }
             ),
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "T",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -1192,7 +1160,9 @@ describe("main snapshot wiring", () => {
         const [entry] = snap.mock.calls[0]
         expect(entry.claudeInput).toEqual({ cwd, session_id: "s1" })
         expect(entry.serverRequest.url).toBe("http://127.0.0.1:9999/review")
-        expect(entry.serverRequest.headers["x-review-token"]).toBe("<redacted>")
+        expect(entry.serverRequest.headers["x-review-signature"]).toBe(
+            "<redacted>"
+        )
         expect(entry.serverRequest.body).toEqual({
             cwd,
             session_id: "s1",
@@ -1226,7 +1196,7 @@ describe("main snapshot wiring", () => {
             fetchFn: async () => {
                 throw new Error("ECONNREFUSED")
             },
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "T",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -1247,7 +1217,7 @@ describe("main snapshot wiring", () => {
             fetchFn: () => {
                 throw new Error("should not be called")
             },
-            tokenReader: () => ({ token: "T", url: "u" }),
+            connect: fakeConnect({ token: "T", url: "u" }),
             log: () => {},
             snapshot: snap,
         })
@@ -1265,7 +1235,7 @@ describe("main snapshot wiring", () => {
             fetchFn: () => {
                 throw new Error("should not be called")
             },
-            tokenReader: () => null,
+            connect: fakeConnect(null),
             log: () => {},
             snapshot: snap,
         })
@@ -1292,7 +1262,7 @@ describe("main — REVIEW_ORCH_SKIP env", () => {
             stdout,
             stderr,
             fetchFn: fetchSpy,
-            tokenReader: () => ({
+            connect: fakeConnect({
                 token: "T",
                 url: "http://127.0.0.1:9999/review",
             }),
@@ -1332,7 +1302,7 @@ describe("main — REVIEW_ORCH_SKIP env", () => {
                 stdout: mkWritable(),
                 stderr,
                 fetchFn: fetchSpy,
-                tokenReader: () => ({ token: "T", url: "u" }),
+                connect: fakeConnect({ token: "T", url: "u" }),
                 log: () => {},
                 snapshot: () => null,
                 env: { REVIEW_ORCH_SKIP: value },
@@ -1368,7 +1338,7 @@ describe("main — REVIEW_ORCH_SKIP env", () => {
                 stdout: mkWritable(),
                 stderr: mkWritable(),
                 fetchFn: fakeFetch,
-                tokenReader: () => ({ token: "T", url: "u" }),
+                connect: fakeConnect({ token: "T", url: "u" }),
                 log: () => {},
                 snapshot: () => null,
                 env,
@@ -1385,7 +1355,7 @@ describe("main — REVIEW_ORCH_SKIP env", () => {
             stdout: mkWritable(),
             stderr,
             fetchFn: () => {},
-            tokenReader: () => ({ token: "T", url: "u" }),
+            connect: fakeConnect({ token: "T", url: "u" }),
             log: () => {},
             snapshot: () => null,
             env: { REVIEW_ORCH_SKIP: long },
@@ -1409,7 +1379,7 @@ describe("main — REVIEW_ORCH_SKIP env", () => {
             stdout: mkWritable(),
             stderr: mkWritable(),
             fetchFn: fetchSpy,
-            tokenReader: () => ({ token: "T", url: "u" }),
+            connect: fakeConnect({ token: "T", url: "u" }),
             log: () => {},
             snapshot: () => null,
             env: { REVIEW_ORCH_SKIP: "1" },
@@ -1600,9 +1570,7 @@ describe("postReview  the limit handshake", () => {
         const clock = { t: 0 }
         const fake = fakeFetch(replies, clock)
         return postReview({
-            fetchFn: fake.fetchFn,
-            url: "http://x/review",
-            token: "t",
+            conn: connOver(fake.fetchFn),
             requestBody: { cwd: "/r", trigger: "stop_hook" },
             limitMs: 660_000,
             now: () => clock.t,
@@ -1667,9 +1635,7 @@ describe("postReview  the limit handshake", () => {
         expect(r.calls).toHaveLength(1)
         expect(r.httpStatus).toBe(409)
         const none = await postReview({
-            fetchFn: jest.fn(),
-            url: "u",
-            token: "t",
+            conn: connOver(jest.fn()),
             requestBody: {},
             limitMs: 1,
             budgetMs: 0,
@@ -1684,13 +1650,114 @@ describe("postReview  the limit handshake", () => {
             throw new Error("ECONNREFUSED")
         })
         const r = await postReview({
-            fetchFn,
-            url: "u",
-            token: "t",
+            conn: connOver(fetchFn),
             requestBody: {},
             limitMs: 1000,
         })
         expect(fetchFn).toHaveBeenCalledTimes(1)
         expect(r.fetchError).toBe("ECONNREFUSED")
+    })
+})
+
+describe("main — the signed connection", () => {
+    const cwd = "/repo"
+    const okFetch = jest.fn(async () => ({
+        status: 200,
+        json: async () => ({ status: "GOOD_TO_GO", findings: [] }),
+    }))
+
+    test("no server proving the token: fail open, naming the reason", async () => {
+        const stderr = mkWritable()
+        const logSpy = jest.fn()
+        const code = await main({
+            stdin: stdinFromJSON({ cwd, session_id: "s" }),
+            stdout: mkWritable(),
+            stderr,
+            connect: async () => ({
+                ok: false,
+                stage: "address",
+                reason: "no server proved the token — http://127.0.0.1:7777: no answer",
+            }),
+            log: logSpy,
+            snapshot: () => null,
+        })
+        expect(code).toBe(0)
+        expect(stderr.text()).toMatch(
+            /no server proved the token .*; skipping review/
+        )
+        expect(logSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ event: "no_server" }),
+            expect.any(Object)
+        )
+    })
+
+    test("cached credentials are used and reported", async () => {
+        const stderr = mkWritable()
+        const logSpy = jest.fn()
+        await main({
+            stdin: stdinFromJSON({ cwd, session_id: "s" }),
+            stdout: mkWritable(),
+            stderr,
+            fetchFn: okFetch,
+            connect: fakeConnect({
+                token: "T",
+                source: "cache",
+                configError: "config.json doesn't parse",
+            }),
+            log: logSpy,
+            snapshot: () => null,
+        })
+        expect(stderr.text()).toMatch(
+            /config.json doesn't parse; using the cached hook credentials/
+        )
+        expect(logSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ event: "credentials_from_cache" }),
+            expect.any(Object)
+        )
+    })
+
+    test("the running server's published wait beats the config-derived one", async () => {
+        const fetchFn = jest.fn(async () => ({
+            status: 200,
+            json: async () => ({ status: "GOOD_TO_GO", findings: [] }),
+        }))
+        await main({
+            stdin: stdinFromJSON({ cwd, session_id: "s" }),
+            stdout: mkWritable(),
+            stderr: mkWritable(),
+            fetchFn,
+            connect: fakeConnect({
+                token: "T",
+                fetchTimeoutMs: 987_000,
+                creds: { limits: { codexTimeoutSeconds: 100 } },
+            }),
+            log: () => {},
+            snapshot: () => null,
+        })
+        expect(JSON.parse(fetchFn.mock.calls[0][1].body).timeoutMs).toBe(
+            987_000
+        )
+    })
+
+    test("without server.json the wait comes from the credentials' config", async () => {
+        const fetchFn = jest.fn(async () => ({
+            status: 200,
+            json: async () => ({ status: "GOOD_TO_GO", findings: [] }),
+        }))
+        await main({
+            stdin: stdinFromJSON({ cwd, session_id: "s" }),
+            stdout: mkWritable(),
+            stderr: mkWritable(),
+            fetchFn,
+            connect: fakeConnect({
+                token: "T",
+                creds: { limits: { codexTimeoutSeconds: 100 } },
+            }),
+            log: () => {},
+            snapshot: () => null,
+        })
+        expect(JSON.parse(fetchFn.mock.calls[0][1].body).timeoutMs).toBe(
+            160_000
+        )
     })
 })

@@ -66,12 +66,14 @@ HEADERS_SCRIPT="$CONFIG_DIR/mcp-headers.sh"
 CLAUDE_DIR="$HOME_DIR/.claude"
 HOOK_PATH="$CLAUDE_DIR/hooks/stop-review.mjs"
 NOTIFY_HOOK_PATH="$CLAUDE_DIR/hooks/notify-change.mjs"
+SIGNED_CLIENT_PATH="$CLAUDE_DIR/hooks/signed-client.mjs"
 CLAUDE_JSON="$HOME_DIR/.claude.json"
 SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
 CODEX_DIR="$HOME_DIR/.codex"
 CODEX_STOP_HOOK="$CODEX_DIR/hooks/stop-review.mjs"
 CODEX_NOTIFY_HOOK="$CODEX_DIR/hooks/notify-change.mjs"
+CODEX_SIGNED_CLIENT="$CODEX_DIR/hooks/signed-client.mjs"
 CODEX_CONFIG_TOML="$CODEX_DIR/config.toml"
 CODEX_HOOKS_JSON="$CODEX_DIR/hooks.json"
 CODEX_SKILL_DIR="$CODEX_DIR/skills/code-review-loop"
@@ -83,6 +85,8 @@ OPENCODE_SKILL="$OPENCODE_SKILL_DIR/SKILL.md"
 OPENCODE_AGENTS_MD="$OPENCODE_DIR/AGENTS.md"
 LIB_DIR="$CONFIG_DIR/lib"
 LIB_STOP_REVIEW="$LIB_DIR/stop-review.mjs"
+LIB_SIGNED_CLIENT="$LIB_DIR/signed-client.mjs"
+CREDENTIALS_CACHE="$HOME_DIR/.cache/review-orchestrator/hook-credentials.json"
 PLIST_NAME="com.leo.review-orchestrator.plist"
 PLIST_DST="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME"
 
@@ -161,6 +165,7 @@ if [ "$CODEX" -eq 1 ]; then
         "$CODEX_HOOKS_JSON" "$CODEX_STOP_HOOK" "$CODEX_NOTIFY_HOOK"
     remove_file_idempotent "$CODEX_STOP_HOOK" "codex Stop hook"
     remove_file_idempotent "$CODEX_NOTIFY_HOOK" "codex PostToolUse hook"
+    remove_file_idempotent "$CODEX_SIGNED_CLIENT" "codex signed client"
     remove_file_idempotent "$CODEX_SKILL" "codex skill"
     # Drop the skill dir if our SKILL.md was its only content.
     if [ -d "$CODEX_SKILL_DIR" ] && [ -z "$(ls -A "$CODEX_SKILL_DIR" 2>/dev/null)" ]; then
@@ -176,6 +181,7 @@ if [ "$OPENCODE" -eq 1 ]; then
     remove_file_idempotent "$OPENCODE_PLUGIN" "opencode plugin"
     remove_file_idempotent "$OPENCODE_SKILL" "opencode skill"
     remove_file_idempotent "$LIB_STOP_REVIEW" "opencode protocol lib"
+    remove_file_idempotent "$LIB_SIGNED_CLIENT" "opencode signed client"
     # Child dirs before their parents; the guard only rmdirs when empty, so
     # a user's own plugins/skills keep those dirs alive.
     for d in "$OPENCODE_SKILL_DIR" "$OPENCODE_DIR/skill" \
@@ -191,6 +197,7 @@ fi
 # 5. Hook files
 remove_file_idempotent "$HOOK_PATH" "Stop hook"
 remove_file_idempotent "$NOTIFY_HOOK_PATH" "PostToolUse hook"
+remove_file_idempotent "$SIGNED_CLIENT_PATH" "signed client"
 
 # 6. Headers script + config dir.
 if [ "$KEEP_CONFIG" -eq 1 ]; then
@@ -198,9 +205,12 @@ if [ "$KEEP_CONFIG" -eq 1 ]; then
 else
     remove_file_idempotent "$HEADERS_SCRIPT" "mcp-headers.sh"
     remove_file_idempotent "$CONFIG_PATH" "config.json"
+    remove_file_idempotent "$CONFIG_PATH.lock" "config.json lock file"
+    remove_file_idempotent "$CREDENTIALS_CACHE" "hook credentials cache"
     # lib/ is ours unconditionally, so it goes even without --opencode —
     # otherwise it orphans here and the rmdir below silently fails.
     remove_file_idempotent "$LIB_STOP_REVIEW" "protocol lib"
+    remove_file_idempotent "$LIB_SIGNED_CLIENT" "signed client lib"
     if [ -d "$LIB_DIR" ] && [ -z "$(ls -A "$LIB_DIR" 2>/dev/null)" ]; then
         if maybe "rmdir $LIB_DIR"; then
             rmdir "$LIB_DIR" 2>/dev/null && note "  removed:   lib dir ($LIB_DIR)" || true

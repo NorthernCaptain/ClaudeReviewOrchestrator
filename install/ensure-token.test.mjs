@@ -6,6 +6,7 @@
 import {
     chmodSync,
     mkdtempSync,
+    readdirSync,
     readFileSync,
     rmSync,
     statSync,
@@ -13,7 +14,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { ensureToken } from "./ensure-token.mjs"
+import { ensureToken, runEnsureToken } from "./ensure-token.mjs"
 
 const makeTmp = () => mkdtempSync(path.join(tmpdir(), "ensure-token-"))
 
@@ -99,6 +100,14 @@ describe("ensureToken", () => {
         expect(cfg.authToken).toBe("FRESH")
         expect(cfg.port).toBe(12345)
         expect(cfg.allowedRoots).toEqual(["/x"])
+        // A locked update: the file as read is kept as a backup.
+        const backups = readdirSync(dir).filter((n) =>
+            n.startsWith("config.json.bak-")
+        )
+        expect(backups).toHaveLength(1)
+        expect(
+            JSON.parse(readFileSync(path.join(dir, backups[0]), "utf8"))
+        ).toEqual({ port: 12345, allowedRoots: ["/x"] })
     })
 
     test("treats empty-string authToken as missing (regenerates)", () => {
@@ -161,5 +170,52 @@ describe("ensureToken", () => {
             generate: () => "T",
         })
         expect(readFileSync(p, "utf8")).toMatch(/"authToken":/)
+    })
+})
+
+describe("runEnsureToken", () => {
+    let home
+    beforeEach(() => {
+        home = mkdtempSync(path.join(tmpdir(), "ensure-token-home-"))
+    })
+    afterEach(() => {
+        rmSync(home, { recursive: true, force: true })
+    })
+
+    test("writes config.json and the credentials cache only beneath the given home, under the lock", async () => {
+        const configPath = path.join(
+            home,
+            ".config",
+            "review-orchestrator",
+            "config.json"
+        )
+        const locked = []
+        const r = await runEnsureToken({
+            configPath,
+            home,
+            generate: () => "TOK",
+            lock: async (p, fn) => {
+                locked.push(p)
+                return fn()
+            },
+        })
+        expect(r.action).toBe("installed")
+        expect(locked).toEqual([configPath])
+        const cache = path.join(
+            home,
+            ".cache",
+            "review-orchestrator",
+            "hook-credentials.json"
+        )
+        expect(JSON.parse(readFileSync(cache, "utf8")).token).toBe("TOK")
+    })
+
+    test("takes the real config lock by default", async () => {
+        const configPath = path.join(home, "cfg", "config.json")
+        await runEnsureToken({ configPath, home, generate: () => "T" })
+        expect(readdirSync(path.dirname(configPath)).sort()).toEqual([
+            "config.json",
+            "config.json.lock",
+        ])
     })
 })

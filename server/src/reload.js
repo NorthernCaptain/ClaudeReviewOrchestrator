@@ -30,6 +30,16 @@ export const RESTART_ONLY_KEYS = Object.freeze([
     "reviewsDir",
     "reviewsRetentionDays",
 ])
+// Owned by config.json and its writers, never by a reload: the token and
+// its rotation history (§5.7). A rollback never restores them; an older
+// rotation history next to a newer token would turn a scripted rotation
+// into a hand edit and restart the old token's grace.
+export const FILE_OWNED_KEYS = Object.freeze(["authToken", "auth.rotations"])
+const isFileOwned = (key) =>
+    FILE_OWNED_KEYS.some((k) => key === k || key.startsWith(`${k}.`))
+// One key is the other, or inside it.
+const overlaps = (a, b) =>
+    a === b || a.startsWith(`${b}.`) || b.startsWith(`${a}.`)
 export const HISTORY_LIMIT = 20
 const DEFAULT_MAX_WAIT_MINUTES = 5
 const DEFAULT_MAX_HOLD_SECONDS = 45
@@ -134,6 +144,9 @@ export const createReloadController = ({
     now = Date.now,
     setTimer = setTimeout,
     clearTimer = clearTimeout,
+    // () → called whenever a reload becomes pending or stops being
+    // pending (server.json republishes the hook wait).
+    onPendingChange = () => {},
 }) => {
     const makeRecord = (fields) => ({
         loadedAt: now(),
@@ -225,17 +238,40 @@ export const createReloadController = ({
         if (waiter.holdTimer) clearTimer(waiter.holdTimer)
     }
 
+    // The larger hook wait of the running config and the one the pending
+    // change would apply (a rollback's: the config it restores).
+    const pendingWaitBaseMs = () => {
+        const running = baseHookLimitMs(configStore.current())
+        if (!pending) return running
+        const next = pending.config ?? previous?.before
+        return Math.max(running, next ? baseHookLimitMs(next) : 0)
+    }
+
     const holdMs = () => {
         const config = configStore.current()
         const wanted =
             (config.reload?.maxHoldSeconds ?? DEFAULT_MAX_HOLD_SECONDS) * 1000
         // The published hook wait is the larger limit plus the hold; keep
         // that sum within the hooks' cap.
-        const base = Math.max(
-            baseHookLimitMs(config),
-            pending ? baseHookLimitMs(pending.config) : 0
+        return Math.max(
+            0,
+            Math.min(wanted, MAX_FETCH_TIMEOUT_MS - pendingWaitBaseMs())
         )
-        return Math.max(0, Math.min(wanted, MAX_FETCH_TIMEOUT_MS - base))
+    }
+
+    // The wait server.json publishes to the hooks (§5.7): the running
+    // config's, or while a change is pending, the larger of both plus a
+    // possible hold, within the hooks' cap.
+    const publishedHookTimeoutMs = () =>
+        pending ? pendingWaitBaseMs() + holdMs() : pendingWaitBaseMs()
+
+    const setPending = (value) => {
+        pending = value
+        try {
+            onPendingChange()
+        } catch (err) {
+            logger?.warn?.({ err: err.message }, "pending-change hook failed")
+        }
     }
 
     const dispatchWaiters = () => {
@@ -335,7 +371,7 @@ export const createReloadController = ({
     // held requests run on the current core.
     const dropPending = (reason) => {
         const p = pending
-        pending = null
+        setPending(null)
         endHold()
         if (p) {
             record({
@@ -474,7 +510,9 @@ export const createReloadController = ({
         const reverted = []
         const keptEdited = []
         const keptUnapplied = []
-        for (const key of configChanges(before, applied)) {
+        for (const key of configChanges(before, applied).filter(
+            (k) => !isFileOwned(k)
+        )) {
             const keys = key.split(".")
             const a = getIn(applied, keys)
             if (!same(getIn(live, keys), a)) {
@@ -505,10 +543,26 @@ export const createReloadController = ({
                         ? issue.keys.map((k) => [...issue.path, k])
                         : [issue.path]
                 for (const keys of paths) {
+                    const key = keys.join(".")
+                    // The previous core can't accept what config.json must
+                    // keep (the rotation history): dropping it would
+                    // re-grant an old token, keeping it would leave a file
+                    // that core rejects. Refuse, changing nothing.
+                    const owned = FILE_OWNED_KEYS.filter(
+                        (k) =>
+                            overlaps(k, key) &&
+                            getIn(file.parsed, k.split(".")) !== undefined
+                    )
+                    if (owned.length > 0) {
+                        throw new ReloadError(
+                            "ROLLBACK_DROPS_FILE_OWNED_KEYS",
+                            `the previous core doesn't accept ${owned.join(", ")}, which config.json keeps — reload forward instead`
+                        )
+                    }
                     const value = getIn(before, keys)
                     setIn(restored, keys, value)
                     setIn(fileOut, keys, value)
-                    schemaReverted.push(keys.join("."))
+                    schemaReverted.push(key)
                 }
             }
             config = target.validateConfig(restored)
@@ -548,15 +602,18 @@ export const createReloadController = ({
         }
     }
 
-    // Closes admission, runs `fn` under the config lock, then reopens and
-    // dispatches waiting requests in arrival order.
+    // Closes admission, runs `fn` under the config store's queue and the
+    // cross-process config lock, then reopens and dispatches waiting
+    // requests in arrival order.
     const runGate = async (fn) => {
         let open
         gate = new Promise((resolve) => {
             open = resolve
         })
         try {
-            return await configStore.exclusive(fn)
+            return await configStore.exclusive(() =>
+                configStore.underFileLock(fn)
+            )
         } finally {
             gate = null
             open()
@@ -565,7 +622,9 @@ export const createReloadController = ({
     }
 
     // Applies the pending reload or rollback through the gate. Never
-    // rejects: the outcome goes into the result and the history.
+    // rejects: the outcome goes into the result and the history. The lock
+    // not being granted (another writer holding config.json) fails it the
+    // same way as a failed swap.
     const applyPending = () => {
         const p = pending
         if (!p || p.swapping || gate) {
@@ -573,10 +632,18 @@ export const createReloadController = ({
         }
         p.swapping = true
         const startedAt = now()
+        const failed = (err) => {
+            if (pending === p) dropPending(err.message)
+            logger?.warn?.(
+                { err: err.message, code: err.code },
+                "core reload failed"
+            )
+            return { ok: false, cancelled: true, ...describe(err) }
+        }
         return runGate(() => {
             try {
                 const result = p.kind === "rollback" ? rollBack() : swapTo(p)
-                pending = null
+                setPending(null)
                 endHold()
                 record({
                     kind: p.kind,
@@ -594,14 +661,9 @@ export const createReloadController = ({
                 )
                 return { ok: true, applied: true, kind: p.kind, ...result }
             } catch (err) {
-                dropPending(err.message)
-                logger?.warn?.(
-                    { err: err.message, code: err.code },
-                    "core reload failed"
-                )
-                return { ok: false, cancelled: true, ...describe(err) }
+                return failed(err)
             }
-        })
+        }).catch(failed)
     }
 
     const summaryOf = (p) => ({
@@ -714,11 +776,11 @@ export const createReloadController = ({
         // The newest trigger wins; a replacement keeps the place in the
         // wait (and any hold already running).
         const replaced = pending
-        pending = {
+        setPending({
             ...next,
             requestedAt: replaced?.requestedAt ?? now(),
             swapping: false,
-        }
+        })
         if (replaced && replaced.record !== pending.record) {
             maybeDispose(replaced.record)
         }
@@ -761,6 +823,7 @@ export const createReloadController = ({
         pin,
         trigger,
         status,
+        publishedHookTimeoutMs,
         currentCore: () => current.core,
         isIssuedConfig: (config) => issued.has(config),
         // For tests and diagnostics.

@@ -17,7 +17,10 @@
 //     meanwhile means redo, up to 3 times), goes through a temp file and a
 //     rename (0600), and keeps a timestamped backup of the file as read;
 //   * the holder's value is an immutable snapshot, replaced on commit,
-//     with a revision bumped on every commit.
+//     with a revision bumped on every commit;
+//   * every write runs under the cross-process config lock
+//     (install/config-lock.mjs, §5.7), shared with the installer and
+//     rotate-token, and refreshes hook-credentials.json inside it.
 
 import { createHash, randomBytes } from "node:crypto"
 import {
@@ -28,6 +31,11 @@ import {
     writeFileSync as nodeWriteFileSync,
 } from "node:fs"
 import path from "node:path"
+import {
+    ConfigLockError,
+    refreshHookCredentials,
+    withConfigLock,
+} from "../../install/config-lock.mjs"
 
 export const MAX_SAVE_ATTEMPTS = 3
 export const KEEP_BACKUPS = 10
@@ -90,6 +98,12 @@ export const createConfigStore = ({
     now = Date.now,
     nonce = () => randomBytes(6).toString("hex"),
     fs = {},
+    // Where hook-credentials.json goes; null writes none (tests).
+    credentialsPath = null,
+    withFileLock = withConfigLock,
+    // (config) → called after every commit (server.json republishes the
+    // hook wait). Its failure never undoes the commit.
+    onCommit = () => {},
 }) => {
     const read = fs.readFileSync ?? nodeReadFileSync
     const write = fs.writeFileSync ?? nodeWriteFileSync
@@ -188,6 +202,11 @@ export const createConfigStore = ({
     const commit = (next) => {
         config = frozenCopy(next)
         revision++
+        try {
+            onCommit(config)
+        } catch {
+            // the commit stands
+        }
         return config
     }
 
@@ -200,70 +219,99 @@ export const createConfigStore = ({
         return liveConfig
     }
 
+    // Best effort: hooks fall back to config.json itself.
+    const refreshCredentials = () => {
+        if (!credentialsPath) return
+        try {
+            refreshHookCredentials({ configPath, credentialsPath, now })
+        } catch {
+            // a stale cache only matters when config.json is unreadable
+        }
+    }
+
+    // Runs `fn` holding the config lock, then refreshes the hook
+    // credentials from a read taken inside it. Callers that write
+    // config.json also run inside exclusive().
+    const underFileLock = async (fn) => {
+        try {
+            return await withFileLock(configPath, async () => {
+                const result = await fn()
+                refreshCredentials()
+                return result
+            })
+        } catch (err) {
+            if (!(err instanceof ConfigLockError)) throw err
+            throw new ConfigChangeError("CONFIG_LOCKED", err.message, 503)
+        }
+    }
+
     // A dashboard edit. Resolves to { revision, config, replaced, backup };
     // rejects with a ConfigChangeError (or the core's validation error)
     // having written nothing.
     const mutate = (delta) =>
-        exclusive(async () => {
-            for (let attempt = 1; attempt <= MAX_SAVE_ATTEMPTS; attempt++) {
-                const file = readFile()
-                // A key the delta sets whose file value differs from the
-                // holder's: an unapplied manual edit, replaced by the
-                // user's latest explicit action. The holder is normalized
-                // (defaults filled, paths expanded), so the file is compared
-                // in that form too; a file that doesn't validate (and so
-                // holds a manual edit somewhere) is compared as written.
-                let fileView = file.parsed
-                try {
-                    fileView = checks().validate(file.parsed)
-                } catch {
-                    // compared raw
-                }
-                const replaced = delta
-                    .filter(
-                        ([keys]) =>
-                            !sameValue(
-                                getIn(fileView, keys),
-                                getIn(config, keys)
-                            )
-                    )
-                    .map(([keys]) => ({
-                        key: keys.join("."),
-                        manualValue: getIn(file.parsed, keys) ?? null,
-                    }))
-                const mergedFile = applyDelta(file.parsed, delta)
-                let liveConfig
-                try {
-                    liveConfig = checkBoth(
-                        mergedFile,
-                        applyDelta(config, delta)
-                    )
-                } catch (err) {
-                    if (err instanceof ConfigChangeError) throw err
-                    throw new ConfigChangeError(
-                        err.code ?? "CONFIG_REJECTED",
-                        `config change rejected: ${err.message}`
-                    )
-                }
-                const backup = writeFile(mergedFile, {
-                    expectHash: file.hash,
-                    backupText: file.text,
-                })
-                if (backup === null) continue
-                commit(liveConfig)
-                pruneBackups()
-                return { revision, config, replaced, backup }
+        exclusive(() => underFileLock(() => saveDelta(delta)))
+
+    const saveDelta = (delta) => {
+        for (let attempt = 1; attempt <= MAX_SAVE_ATTEMPTS; attempt++) {
+            const file = readFile()
+            // A key the delta sets whose file value differs from the
+            // holder's: an unapplied manual edit, replaced by the
+            // user's latest explicit action. The holder is normalized
+            // (defaults filled, paths expanded), so the file is compared
+            // in that form too; a file that doesn't validate (and so
+            // holds a manual edit somewhere) is compared as written.
+            let fileView = file.parsed
+            try {
+                fileView = checks().validate(file.parsed)
+            } catch {
+                // compared raw
             }
-            throw new ConfigChangeError(
-                "CONFIG_CHANGED_WHILE_SAVING",
-                "config.json changed while saving — try again"
-            )
-        })
+            const replaced = delta
+                .filter(
+                    ([keys]) =>
+                        !sameValue(getIn(fileView, keys), getIn(config, keys))
+                )
+                .map(([keys]) => ({
+                    key: keys.join("."),
+                    manualValue: getIn(file.parsed, keys) ?? null,
+                }))
+            const mergedFile = applyDelta(file.parsed, delta)
+            let liveConfig
+            try {
+                liveConfig = checkBoth(mergedFile, applyDelta(config, delta))
+            } catch (err) {
+                if (err instanceof ConfigChangeError) throw err
+                throw new ConfigChangeError(
+                    err.code ?? "CONFIG_REJECTED",
+                    `config change rejected: ${err.message}`
+                )
+            }
+            const backup = writeFile(mergedFile, {
+                expectHash: file.hash,
+                backupText: file.text,
+            })
+            if (backup === null) continue
+            commit(liveConfig)
+            pruneBackups()
+            return { revision, config, replaced, backup }
+        }
+        throw new ConfigChangeError(
+            "CONFIG_CHANGED_WHILE_SAVING",
+            "config.json changed while saving — try again"
+        )
+    }
 
     return {
         current: () => config,
         revision: () => revision,
         exclusive,
+        underFileLock,
+        // Rewrites hook-credentials.json from config.json under the lock
+        // (startup, a noticed token change). Never rejects.
+        syncCredentials: () =>
+            credentialsPath
+                ? exclusive(() => underFileLock(() => null)).catch(() => false)
+                : Promise.resolve(false),
         mutate,
         readFile,
         writeFile,
