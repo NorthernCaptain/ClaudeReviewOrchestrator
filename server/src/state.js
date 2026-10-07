@@ -75,7 +75,13 @@ const blankContext = ({ key, repoRoot, branch }) => ({
 //
 // lastReviewedAt is set to 0 so a follow-up get() doesn't trigger a
 // second idle reset until a real review writes a new value.
+// Spread first, so every field this list doesn't name, including any a
+// newer core persisted, survives (hot-reload plan §5.5: persisted state
+// changes are additive and must not be dropped by the shell). Only the
+// loop counters are cleared; the rest keep their defaults for contexts
+// that predate them.
 const idleResetContext = ({ key, repoRoot, branch }, existing) => ({
+    ...existing,
     key,
     repoRoot,
     branch,

@@ -180,6 +180,74 @@ describe("createApp wiring", () => {
         }
     })
 
+    test("/inflight reads the shell-owned registry the caller injected", async () => {
+        const inflightMeta = new Map([
+            [
+                "k",
+                {
+                    contextKey: "/repo|main",
+                    repo: "repo",
+                    branch: "main",
+                    provider: "codex",
+                    force: false,
+                    startedAt: Date.now(),
+                },
+            ],
+        ])
+        const { url, close } = await start(minimalConfig(), {
+            ...happyDeps,
+            inflightMeta,
+        })
+        try {
+            const body = await (await fetch(`${url}/inflight`)).json()
+            expect(body.inFlight).toEqual([
+                expect.objectContaining({ contextKey: "/repo|main" }),
+            ])
+        } finally {
+            await close()
+        }
+    })
+
+    test("each app gets its own in-flight registries by default", async () => {
+        let release
+        let started
+        const running = new Promise((r) => {
+            started = r
+        })
+        const blockingDeps = {
+            ...happyDeps,
+            runAndParse: async (...args) => {
+                started()
+                await new Promise((r) => {
+                    release = r
+                })
+                return happyDeps.runAndParse(...args)
+            },
+        }
+        const a = await start(minimalConfig(), blockingDeps)
+        const b = await start(minimalConfig(), happyDeps)
+        try {
+            const review = fetch(`${a.url}/review`, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    "x-review-token": minimalConfig().authToken,
+                },
+                body: JSON.stringify({ cwd: "/repo" }),
+            })
+            await running
+            const inA = await (await fetch(`${a.url}/inflight`)).json()
+            const inB = await (await fetch(`${b.url}/inflight`)).json()
+            expect(inA.inFlight).toHaveLength(1)
+            expect(inB.inFlight).toEqual([])
+            release()
+            expect((await review).status).toBe(200)
+        } finally {
+            await a.close()
+            await b.close()
+        }
+    })
+
     test("PUT /dashboard/provider switches in-memory without a token (v0.1.35)", async () => {
         // Inject a fake fs so handleSetProvider's persistence step
         // doesn't touch the real ~/.config/review-orchestrator/config.json

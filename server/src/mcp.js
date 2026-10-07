@@ -70,16 +70,17 @@ export const repoInClientRoots = (repoRoot, roots) => {
 // against client-advertised MCP roots. If the resolved repoRoot escapes
 // all of them, raises ContextError("NOT_IN_CLIENT_ROOT") which the review
 // handler maps to a 403 ESCALATE.
-const wrapResolveWithClientRoots = (resolveImpl, clientRoots) => (args) => {
-    const ctx = resolveImpl(args)
-    if (!repoInClientRoots(ctx.repoRoot, clientRoots)) {
-        throw new ContextError(
-            "NOT_IN_CLIENT_ROOT",
-            `cwd resolves to ${ctx.repoRoot}, which is outside the MCP client's advertised roots`
-        )
+const wrapResolveWithClientRoots =
+    (resolveImpl, clientRoots) => async (args) => {
+        const ctx = await resolveImpl(args)
+        if (!repoInClientRoots(ctx.repoRoot, clientRoots)) {
+            throw new ContextError(
+                "NOT_IN_CLIENT_ROOT",
+                `cwd resolves to ${ctx.repoRoot}, which is outside the MCP client's advertised roots`
+            )
+        }
+        return ctx
     }
-    return ctx
-}
 
 // Three-way result for the roots probe. Failure modes are distinct so the
 // caller can fail closed when the client claims a roots capability but the
@@ -96,7 +97,17 @@ const wrapResolveWithClientRoots = (resolveImpl, clientRoots) => (args) => {
 //     listRoots() threw. Fail CLOSED: the handler returns ESCALATE
 //     ROOTS_FETCH_FAILED instead of silently relaxing back to
 //     allowedRoots-only enforcement.
-export const maybeListClientRoots = async (mcpServer, logger) => {
+// The probe is sent on the calling tools/call's own response stream
+// (relatedRequestId). Without it the SDK routes a server→client request
+// to the standalone GET stream, which a client may not have opened yet;
+// the request is then dropped and the probe hangs.
+export const ROOTS_PROBE_TIMEOUT_MS = 10_000
+
+export const maybeListClientRoots = async (
+    mcpServer,
+    logger,
+    { relatedRequestId } = {}
+) => {
     if (!mcpServer) return { advertised: false }
     const lowLevel = mcpServer.server
     if (!lowLevel || typeof lowLevel.getClientCapabilities !== "function") {
@@ -105,7 +116,10 @@ export const maybeListClientRoots = async (mcpServer, logger) => {
     const caps = lowLevel.getClientCapabilities()
     if (!caps?.roots) return { advertised: false }
     try {
-        const result = await lowLevel.listRoots()
+        const result = await lowLevel.listRoots(undefined, {
+            relatedRequestId,
+            timeout: ROOTS_PROBE_TIMEOUT_MS,
+        })
         const roots = Array.isArray(result?.roots) ? result.roots : []
         return { advertised: true, roots }
     } catch (err) {
@@ -209,8 +223,10 @@ const asContent = (summary, structured) => ({
  */
 // Returns either { ok: true, deps } with deps possibly wrapped, or
 // { ok: false, body } where body is a ready-to-return escalate envelope.
-const applyRootsPolicy = async ({ mcpServer, logger, deps }) => {
-    const probe = await maybeListClientRoots(mcpServer, logger)
+const applyRootsPolicy = async ({ mcpServer, logger, deps, requestId }) => {
+    const probe = await maybeListClientRoots(mcpServer, logger, {
+        relatedRequestId: requestId,
+    })
     if (!probe.advertised) {
         return { ok: true, deps }
     }
@@ -252,8 +268,14 @@ export const reviewRequestHandler = async ({
         mcpServer,
         metrics = null,
     },
+    requestId,
 }) => {
-    const policy = await applyRootsPolicy({ mcpServer, logger, deps })
+    const policy = await applyRootsPolicy({
+        mcpServer,
+        logger,
+        deps,
+        requestId,
+    })
     if (!policy.ok) {
         if (metrics) metrics.record(policy.body)
         return asContent(summarizeReview(policy.body), policy.body)
@@ -284,12 +306,18 @@ export const reviewRequestHandler = async ({
 export const resetRequestHandler = async ({
     args,
     ctx: { config, store, logger, deps = {}, mcpServer },
+    requestId,
 }) => {
-    const policy = await applyRootsPolicy({ mcpServer, logger, deps })
+    const policy = await applyRootsPolicy({
+        mcpServer,
+        logger,
+        deps,
+        requestId,
+    })
     if (!policy.ok) {
         return asContent(summarizeReset(policy.body), policy.body)
     }
-    const result = handleReset({
+    const result = await handleReset({
         body: { cwd: args?.cwd },
         config,
         store,
@@ -339,7 +367,12 @@ export const buildMcpServer = (ctx) => {
             description: TOOL_TITLES.request_review,
             inputSchema: REQUEST_REVIEW_INPUT_SHAPE,
         },
-        async (args) => reviewRequestHandler({ args, ctx: ctxWithServer })
+        async (args, extra) =>
+            reviewRequestHandler({
+                args,
+                ctx: ctxWithServer,
+                requestId: extra?.requestId,
+            })
     )
 
     server.registerTool(
@@ -349,7 +382,12 @@ export const buildMcpServer = (ctx) => {
             description: TOOL_TITLES.reset_review_context,
             inputSchema: RESET_REVIEW_CONTEXT_INPUT_SHAPE,
         },
-        async (args) => resetRequestHandler({ args, ctx: ctxWithServer })
+        async (args, extra) =>
+            resetRequestHandler({
+                args,
+                ctx: ctxWithServer,
+                requestId: extra?.requestId,
+            })
     )
 
     return server

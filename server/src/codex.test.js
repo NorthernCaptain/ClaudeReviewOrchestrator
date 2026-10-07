@@ -952,3 +952,13 @@ describe("runAndParse (mocked spawn)", () => {
         expect(r.schemaError.code).toBe("SCHEMA_INVALID")
     })
 })
+
+describe("runCodex — default spawn guard", () => {
+    test("refuses a Node executable configured as the codex binary", async () => {
+        const config = baseConfig()
+        config.codex.binary = process.execPath
+        await expect(
+            runCodex({ repoRoot: "/repo", prompt: "p", config })
+        ).rejects.toMatchObject({ code: "TOOL_IS_NODE" })
+    })
+})

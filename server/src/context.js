@@ -3,9 +3,9 @@
  * Author: Leo Khramov
  */
 
-import { execFileSync } from "node:child_process"
 import { realpathSync } from "node:fs"
 import path from "node:path"
+import { createTools, isGitTimeout } from "./tools.js"
 
 export class ContextError extends Error {
     constructor(code, message) {
@@ -15,11 +15,26 @@ export class ContextError extends Error {
     }
 }
 
-const defaultGit = (cwd, args) =>
-    execFileSync("git", ["-C", cwd, ...args], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-    }).trim()
+// Async, with a hard timeout (tools.js); the shell passes its own
+// configured git through deps, and this is the fallback.
+const defaultTools = createTools()
+const defaultGit = (cwd, args) => defaultTools.git(cwd, args)
+
+// A git that timed out says nothing about the repo, so it surfaces as
+// its own error instead of being mistaken for "not a git repository".
+// HTTP status for a resolveContext failure: a root violation is 403, a
+// stalled git is a transient 503, anything else is the caller's 400.
+export const contextErrorStatus = (err) => {
+    if (isGitTimeout(err)) return 503
+    if (
+        err instanceof ContextError &&
+        (err.code === "NOT_IN_ALLOWED_ROOT" ||
+            err.code === "NOT_IN_CLIENT_ROOT")
+    ) {
+        return 403
+    }
+    return 400
+}
 
 const defaultRealpath = (p) => realpathSync(p)
 
@@ -31,30 +46,32 @@ export const isContainedIn = (parent, child) => {
     return true
 }
 
-const resolveBranch = (git, repoRoot) => {
+const resolveBranch = async (git, repoRoot) => {
     let head
     try {
-        head = git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
+        head = await git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])
     } catch (err) {
+        if (isGitTimeout(err)) throw err
         // An unborn branch (a new repo before its first commit) has no
         // HEAD commit to resolve, but HEAD still names the branch.
         try {
-            return git(repoRoot, ["symbolic-ref", "--short", "HEAD"])
-        } catch {
-            throw err
+            return await git(repoRoot, ["symbolic-ref", "--short", "HEAD"])
+        } catch (refErr) {
+            throw isGitTimeout(refErr) ? refErr : err
         }
     }
     if (head !== "HEAD") return head
-    const sha = git(repoRoot, ["rev-parse", "--short", "HEAD"])
+    const sha = await git(repoRoot, ["rev-parse", "--short", "HEAD"])
     return `detached:${sha}`
 }
 
-export const resolveContext = ({
+export const resolveContext = async ({
     cwd,
     allowedRoots,
-    git = defaultGit,
+    git: rawGit = defaultGit,
     realpath = defaultRealpath,
 }) => {
+    const git = async (cwd, args) => String(await rawGit(cwd, args)).trim()
     if (!cwd || typeof cwd !== "string" || !path.isAbsolute(cwd)) {
         throw new ContextError(
             "INVALID_CWD",
@@ -90,8 +107,9 @@ export const resolveContext = ({
 
     let repoRoot
     try {
-        repoRoot = git(cwdReal, ["rev-parse", "--show-toplevel"])
-    } catch {
+        repoRoot = await git(cwdReal, ["rev-parse", "--show-toplevel"])
+    } catch (err) {
+        if (isGitTimeout(err)) throw err
         throw new ContextError("NOT_A_GIT_REPO", `not a git repository: ${cwd}`)
     }
 
@@ -122,7 +140,7 @@ export const resolveContext = ({
         )
     }
 
-    const branch = resolveBranch(git, repoRootReal)
+    const branch = await resolveBranch(git, repoRootReal)
     const repo = path.basename(repoRootReal)
     const key = `${repoRootReal}|${branch}`
 

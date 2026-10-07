@@ -31,6 +31,7 @@ import { createArchive } from "./archive.js"
 import { createMetrics } from "./metrics.js"
 import { logger } from "./logger.js"
 import { createHttpAccessLog, createHttpErrorHandler } from "./http-log.js"
+import { createGuardedSpawn, createTools } from "./tools.js"
 
 // Build the structured "ready" log line emitted right after the server
 // starts accepting connections. Includes the version and the
@@ -112,11 +113,21 @@ export const createApp = ({
     store,
     archive = null,
     logger: log = logger,
-    deps = {},
+    deps: callerDeps = {},
     startedAt = Date.now(),
     metrics = createMetrics(),
     configPath = defaultConfigPath(),
 }) => {
+    // Shell-owned in-flight registries (hot-reload plan §5.5): duplicate
+    // matching, per-context ordering and the dashboard's in-flight view
+    // live here, outside any reloadable module, so they survive a swap.
+    // Callers (tests) may still inject their own.
+    const deps = {
+        inflight: new Map(),
+        contextChains: new Map(),
+        inflightMeta: new Map(),
+        ...callerDeps,
+    }
     const app = express()
     app.disable("x-powered-by")
 
@@ -149,7 +160,10 @@ export const createApp = ({
     // no diff or finding content.
     app.get("/inflight", (_req, res) => {
         res.setHeader("Cache-Control", "no-store")
-        res.json({ ok: true, inFlight: snapshotInFlight(Date.now) })
+        res.json({
+            ok: true,
+            inFlight: snapshotInFlight(Date.now, deps.inflightMeta),
+        })
     })
 
     // Dashboard control endpoints (v0.1.35). Mounted BEFORE auth so the
@@ -279,7 +293,7 @@ export const createApp = ({
         version: VERSION,
         startedAt,
         metrics,
-        inFlight: () => snapshotInFlight(Date.now),
+        inFlight: () => snapshotInFlight(Date.now, deps.inflightMeta),
     })
 
     app.use(authMiddleware({ token: config.authToken }))
@@ -618,7 +632,19 @@ const main = async () => {
         )
     }
 
-    const result = await startServer({ config, store, archive, configPath })
+    // Every git and reviewer process goes through the shell's tools:
+    // async git with the live limits.gitTimeoutSeconds, and a spawn that
+    // refuses Node executables.
+    const tools = createTools({
+        getGitTimeoutMs: () => config.limits.gitTimeoutSeconds * 1000,
+    })
+    const result = await startServer({
+        config,
+        store,
+        archive,
+        configPath,
+        deps: { git: tools.git, spawn: createGuardedSpawn() },
+    })
     if (!result.ok) {
         process.exitCode = 1
         return

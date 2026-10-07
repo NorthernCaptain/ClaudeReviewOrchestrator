@@ -4,7 +4,7 @@
  */
 
 import { createHash } from "node:crypto"
-import { resolveContext, ContextError } from "./context.js"
+import { contextErrorStatus, ContextError, resolveContext } from "./context.js"
 import {
     buildPayload,
     currentHeadSha,
@@ -14,6 +14,7 @@ import {
 } from "./diff.js"
 import { pickReviewer, providerCfg, wrapPrompt } from "./reviewer.js"
 import { loadProjectConfig, mergeWithGlobal } from "./project-config.js"
+import { isGitTimeout } from "./tools.js"
 
 // Tail a string buffer for log lines — the reviewer's stderr is the
 // gold for debugging auth/quota/network failures and we want it in
@@ -81,11 +82,19 @@ export const computeReviewConfigHash = (config, providerOverride = null) => {
 // only once a reviewer run is certain (after the cache short-circuits and
 // round cap), right before it starts. It is an independent build, so an
 // edit landing between the two is caught by showsNothingUnreviewed.
-const buildPriorFreePayload = ({ build, repoRoot, config, payload, log }) => {
+const buildPriorFreePayload = async ({
+    build,
+    repoRoot,
+    config,
+    payload,
+    git,
+    log,
+}) => {
     if ((payload.priorFindingPaths?.length ?? 0) === 0) return null
     try {
-        return build({ repoRoot, config, priorFindings: [] })
+        return await build({ repoRoot, config, priorFindings: [], git })
     } catch (err) {
+        if (isGitTimeout(err)) throw err
         log.warn(
             { err: err?.message },
             "prior-free payload build failed; next review will not short-circuit"
@@ -288,6 +297,12 @@ const isTransientAuthError = (reason, stderr = "") => {
 }
 
 const errorToEscalate = (err) => {
+    if (isGitTimeout(err)) {
+        return envelope("ESCALATE", {
+            reason: err.message,
+            code: "GIT_TIMEOUT",
+        })
+    }
     if (err instanceof ContextError) {
         return envelope("ESCALATE", { reason: err.message, code: err.code })
     }
@@ -467,17 +482,13 @@ export const handleReview = async ({
 
     let context
     try {
-        context = (deps.resolveContext ?? resolveContext)({
+        context = await (deps.resolveContext ?? resolveContext)({
             cwd,
             allowedRoots: config.allowedRoots,
+            git: deps.git,
         })
     } catch (err) {
-        const httpStatus =
-            err instanceof ContextError &&
-            (err.code === "NOT_IN_ALLOWED_ROOT" ||
-                err.code === "NOT_IN_CLIENT_ROOT")
-                ? 403
-                : 400
+        const httpStatus = contextErrorStatus(err)
         log.warn(
             { err: err?.message, code: err?.code, httpStatus, cwd },
             "context resolution failed"
@@ -683,7 +694,7 @@ export const handleReview = async ({
         if (fastPathEligible) {
             // Commit/pull/rebase leave the tree clean but invalidate the
             // cached review, so HEAD must match the cached baseline.
-            const headSha = (deps.currentHeadSha ?? currentHeadSha)(
+            const headSha = await (deps.currentHeadSha ?? currentHeadSha)(
                 context.repoRoot,
                 deps.git
             )
@@ -694,10 +705,10 @@ export const handleReview = async ({
                 headSha === cachedHead
             const treeClean =
                 headMatches &&
-                (deps.isWorkingTreeClean ?? isWorkingTreeClean)(
+                (await (deps.isWorkingTreeClean ?? isWorkingTreeClean)(
                     context.repoRoot,
                     deps.git
-                )
+                ))
             // With head-fallback on, a clean tree makes buildPayload review
             // the commit range, so the cached verdict must be for that same
             // range: a working-tree baseline (edits since discarded) or a
@@ -708,10 +719,10 @@ export const handleReview = async ({
                 (config.payload?.fallbackToHead !== true ||
                     (state.lastBaseline.source === "head-fallback" &&
                         typeof state.lastBaseline.baseSha === "string" &&
-                        (deps.resolveFallbackBase ?? resolveFallbackBase)(
-                            context.repoRoot,
-                            deps.git
-                        ) === state.lastBaseline.baseSha))
+                        (await (
+                            deps.resolveFallbackBase ?? resolveFallbackBase
+                        )(context.repoRoot, deps.git)) ===
+                            state.lastBaseline.baseSha))
             if (baselineMatchesCleanTree) {
                 log.info(
                     {
@@ -799,17 +810,21 @@ export const handleReview = async ({
 
         let payload
         try {
-            payload = (deps.buildPayload ?? buildPayload)({
+            payload = await (deps.buildPayload ?? buildPayload)({
+                git: deps.git,
                 repoRoot: context.repoRoot,
                 config,
                 priorFindings: state.priorFindings,
             })
         } catch (err) {
             log.error(
-                { err: err?.message, stack: err?.stack },
+                { err: err?.message, code: err?.code, stack: err?.stack },
                 "payload build failed"
             )
-            return { httpStatus: 500, body: errorToEscalate(err) }
+            return {
+                httpStatus: isGitTimeout(err) ? 503 : 500,
+                body: errorToEscalate(err),
+            }
         }
         log.info(
             {
@@ -1035,11 +1050,12 @@ export const handleReview = async ({
             }
         }
 
-        const priorFreePayload = buildPriorFreePayload({
+        const priorFreePayload = await buildPriorFreePayload({
             build: deps.buildPayload ?? buildPayload,
             repoRoot: context.repoRoot,
             config,
             payload,
+            git: deps.git,
             log,
         })
 
@@ -1128,6 +1144,7 @@ export const handleReview = async ({
                 repoRoot: context.repoRoot,
                 prompt: wrappedPrompt,
                 config,
+                spawn: deps.spawn,
             })
         } catch (err) {
             log.error(
@@ -1466,7 +1483,15 @@ export const handleReview = async ({
                 state: stateSummary(saved),
             },
         }
-    })() // end of pipelinePromise IIFE
+    })().catch((err) => {
+        // A git command that hit limits.gitTimeoutSeconds is transient:
+        // every git call runs before the reviewer and before any state
+        // write, so the request fails with nothing cached or written and
+        // the next one retries.
+        if (!isGitTimeout(err)) throw err
+        log.warn({ err: err.message }, "git timed out")
+        return { httpStatus: 503, body: errorToEscalate(err) }
+    }) // end of pipelinePromise IIFE
 
     inflight.set(inflightKey, pipelinePromise)
     // Become the new tail of this context's serialization chain so the

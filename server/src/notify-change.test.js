@@ -30,16 +30,16 @@ const makeStore = () => {
 }
 
 describe("handleNotifyChange", () => {
-    test("400 when cwd is missing or empty", () => {
+    test("400 when cwd is missing or empty", async () => {
         const store = makeStore()
-        const r1 = handleNotifyChange({
+        const r1 = await handleNotifyChange({
             body: {},
             config: minimalConfig(),
             store,
         })
         expect(r1.httpStatus).toBe(400)
         expect(r1.body.ok).toBe(false)
-        const r2 = handleNotifyChange({
+        const r2 = await handleNotifyChange({
             body: { cwd: "" },
             config: minimalConfig(),
             store,
@@ -47,9 +47,9 @@ describe("handleNotifyChange", () => {
         expect(r2.httpStatus).toBe(400)
     })
 
-    test("403 when context resolution rejects (cwd outside allowedRoots)", () => {
+    test("403 when context resolution rejects (cwd outside allowedRoots)", async () => {
         const store = makeStore()
-        const result = handleNotifyChange({
+        const result = await handleNotifyChange({
             body: { cwd: "/elsewhere" },
             config: minimalConfig(),
             store,
@@ -64,9 +64,9 @@ describe("handleNotifyChange", () => {
         expect(result.httpStatus).toBe(403)
     })
 
-    test("400 when context resolution fails for an unknown reason", () => {
+    test("400 when context resolution fails for an unknown reason", async () => {
         const store = makeStore()
-        const result = handleNotifyChange({
+        const result = await handleNotifyChange({
             body: { cwd: "/repo" },
             config: minimalConfig(),
             store,
@@ -79,9 +79,9 @@ describe("handleNotifyChange", () => {
         expect(result.httpStatus).toBe(400)
     })
 
-    test("happy path: marks the context dirty and stamps lastChangeAt", () => {
+    test("happy path: marks the context dirty and stamps lastChangeAt", async () => {
         const store = makeStore()
-        const result = handleNotifyChange({
+        const result = await handleNotifyChange({
             body: {
                 cwd: "/repo",
                 tool: "Write",
@@ -104,7 +104,7 @@ describe("handleNotifyChange", () => {
         expect(store.state["/repo|main"].branch).toBe("main")
     })
 
-    test("preserves existing cache fields (shallow merge via store.save)", () => {
+    test("preserves existing cache fields (shallow merge via store.save)", async () => {
         const store = makeStore()
         // Pre-seed an existing context with a baseline + result status.
         store.save("/repo|main", {
@@ -114,7 +114,7 @@ describe("handleNotifyChange", () => {
             lastBaseline: { progressHash: "abc" },
             dirtySinceLastReview: false,
         })
-        handleNotifyChange({
+        await handleNotifyChange({
             body: { cwd: "/repo", tool: "Edit", file: "a.js" },
             config: minimalConfig(),
             store,
@@ -129,10 +129,10 @@ describe("handleNotifyChange", () => {
         })
     })
 
-    test("logs at info level with tool + file fields", () => {
+    test("logs at info level with tool + file fields", async () => {
         const store = makeStore()
         const info = jest.fn()
-        handleNotifyChange({
+        await handleNotifyChange({
             body: { cwd: "/repo", tool: "MultiEdit", file: "src/b.ts" },
             config: minimalConfig(),
             store,
@@ -146,5 +146,42 @@ describe("handleNotifyChange", () => {
         expect(fields.file).toBe("src/b.ts")
         expect(fields.repo).toBe("repo")
         expect(fields.branch).toBe("main")
+    })
+})
+
+describe("handleNotifyChange — git capability", () => {
+    test("a git timeout is a transient 503", async () => {
+        const result = await handleNotifyChange({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store: makeStore(),
+            deps: {
+                resolveContext: async () => {
+                    throw Object.assign(new Error("git timed out"), {
+                        code: "GIT_TIMEOUT",
+                    })
+                },
+            },
+        })
+        expect(result.httpStatus).toBe(503)
+        expect(result.body.ok).toBe(false)
+    })
+
+    test("passes the shell's git through to resolveContext", async () => {
+        const git = async () => ""
+        let seen
+        await handleNotifyChange({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store: makeStore(),
+            deps: {
+                git,
+                resolveContext: async (args) => {
+                    seen = args.git
+                    return happyContext
+                },
+            },
+        })
+        expect(seen).toBe(git)
     })
 })

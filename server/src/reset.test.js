@@ -40,8 +40,8 @@ describe("handleReset", () => {
     })
     afterEach(() => cleanup(store))
 
-    test("returns 400 when cwd missing", () => {
-        const r = handleReset({
+    test("returns 400 when cwd missing", async () => {
+        const r = await handleReset({
             body: {},
             config: minimalConfig(),
             store,
@@ -51,8 +51,8 @@ describe("handleReset", () => {
         expect(r.body.code).toBe("INVALID_REQUEST")
     })
 
-    test("returns 403 on NOT_IN_ALLOWED_ROOT", () => {
-        const r = handleReset({
+    test("returns 403 on NOT_IN_ALLOWED_ROOT", async () => {
+        const r = await handleReset({
             body: { cwd: "/repo" },
             config: minimalConfig(),
             store,
@@ -66,8 +66,8 @@ describe("handleReset", () => {
         expect(r.body.code).toBe("NOT_IN_ALLOWED_ROOT")
     })
 
-    test("returns 400 on NOT_A_GIT_REPO", () => {
-        const r = handleReset({
+    test("returns 400 on NOT_A_GIT_REPO", async () => {
+        const r = await handleReset({
             body: { cwd: "/repo" },
             config: minimalConfig(),
             store,
@@ -81,8 +81,8 @@ describe("handleReset", () => {
         expect(r.body.code).toBe("NOT_A_GIT_REPO")
     })
 
-    test("falls back to INTERNAL_ERROR when resolveContext throws a non-ContextError", () => {
-        const r = handleReset({
+    test("falls back to INTERNAL_ERROR when resolveContext throws a non-ContextError", async () => {
+        const r = await handleReset({
             body: { cwd: "/repo" },
             config: minimalConfig(),
             store,
@@ -97,7 +97,7 @@ describe("handleReset", () => {
         expect(r.body.reason).toMatch(/disk read failure/)
     })
 
-    test("clears counters/baseline/priorFindings for the resolved context", () => {
+    test("clears counters/baseline/priorFindings for the resolved context", async () => {
         // Seed.
         store.save(happyContext.key, {
             ...happyContext,
@@ -108,7 +108,7 @@ describe("handleReset", () => {
             lastReviewedAt: 1,
             lastResultStatus: "ISSUES",
         })
-        const r = handleReset({
+        const r = await handleReset({
             body: { cwd: "/repo" },
             config: minimalConfig(),
             store,
@@ -123,5 +123,48 @@ describe("handleReset", () => {
         const fresh = store.get(happyContext)
         expect(fresh.codexRounds).toBe(0)
         expect(fresh.priorFindings).toEqual([])
+    })
+})
+
+describe("handleReset — git capability", () => {
+    let store
+    beforeEach(() => {
+        store = makeStore()
+    })
+    afterEach(() => cleanup(store))
+
+    test("a git timeout is a transient 503 GIT_TIMEOUT", async () => {
+        const r = await handleReset({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store,
+            deps: {
+                resolveContext: async () => {
+                    throw Object.assign(new Error("git timed out"), {
+                        code: "GIT_TIMEOUT",
+                    })
+                },
+            },
+        })
+        expect(r.httpStatus).toBe(503)
+        expect(r.body.code).toBe("GIT_TIMEOUT")
+    })
+
+    test("passes the shell's git through to resolveContext", async () => {
+        const git = async () => ""
+        let seen
+        await handleReset({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store,
+            deps: {
+                git,
+                resolveContext: async (args) => {
+                    seen = args.git
+                    return happyContext
+                },
+            },
+        })
+        expect(seen).toBe(git)
     })
 })

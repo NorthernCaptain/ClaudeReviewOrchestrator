@@ -186,6 +186,26 @@ describe("createStateStore — idle reset", () => {
         expect(s.attemptsSincePass).toBe(3)
     })
 
+    test("idle reset keeps fields it doesn't know about (additive state)", () => {
+        let t = 1000
+        const store = createStateStore({
+            filePath,
+            now: () => t,
+            idleResetMs: 500,
+        })
+        store.save(ctxKey.key, {
+            repoRoot: ctxKey.repoRoot,
+            branch: ctxKey.branch,
+            codexRounds: 2,
+            lastReviewedAt: 1000,
+            futureCoreField: { kept: true },
+        })
+        t = 2000
+        const s = store.get(ctxKey)
+        expect(s.codexRounds).toBe(0)
+        expect(s.futureCoreField).toEqual({ kept: true })
+    })
+
     test("idle reset is one-shot: a follow-up get() does not re-reset", () => {
         let t = 1000
         const store = createStateStore({

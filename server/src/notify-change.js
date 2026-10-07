@@ -13,11 +13,11 @@
 // rev-parse, one state write. No payload build, no reviewer spawn,
 // no archive. Typical latency ~10ms.
 
-import { resolveContext, ContextError } from "./context.js"
+import { contextErrorStatus, resolveContext } from "./context.js"
 
 const noopLogger = { info() {}, warn() {}, error() {} }
 
-export const handleNotifyChange = ({
+export const handleNotifyChange = async ({
     body,
     config,
     store,
@@ -39,17 +39,13 @@ export const handleNotifyChange = ({
 
     let context
     try {
-        context = (deps.resolveContext ?? resolveContext)({
+        context = await (deps.resolveContext ?? resolveContext)({
             cwd,
             allowedRoots: config.allowedRoots,
+            git: deps.git,
         })
     } catch (err) {
-        const httpStatus =
-            err instanceof ContextError &&
-            (err.code === "NOT_IN_ALLOWED_ROOT" ||
-                err.code === "NOT_IN_CLIENT_ROOT")
-                ? 403
-                : 400
+        const httpStatus = contextErrorStatus(err)
         log.warn(
             { err: err?.message, code: err?.code, cwd },
             "notify-change: context resolution failed"
@@ -102,8 +98,8 @@ export const mountNotifyChangeRoute = (
     app,
     { config, store, logger = noopLogger, deps = {} } = {}
 ) => {
-    app.post("/notify-change", (req, res) => {
-        const result = handleNotifyChange({
+    app.post("/notify-change", async (req, res) => {
+        const result = await handleNotifyChange({
             body: req.body,
             config,
             store,

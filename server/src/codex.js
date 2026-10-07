@@ -3,12 +3,15 @@
  * Author: Leo Khramov
  */
 
-import { spawn as nodeSpawn } from "node:child_process"
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import Ajv from "ajv/dist/2020.js"
+import { createGuardedSpawn } from "./tools.js"
+
+// Refuses Node executables (tools.js); tests inject their own spawn.
+const guardedSpawn = createGuardedSpawn()
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_SCHEMA_PATH = path.join(here, "codex-output.schema.json")
@@ -252,7 +255,7 @@ export const runCodex = ({
     prompt,
     config,
     schemaPath = DEFAULT_SCHEMA_PATH,
-    spawn = nodeSpawn,
+    spawn = guardedSpawn,
     now = Date.now,
 }) =>
     new Promise((resolve, reject) => {
@@ -444,7 +447,7 @@ export const runAndParse = async ({
     prompt,
     config,
     schemaPath = DEFAULT_SCHEMA_PATH,
-    spawn = nodeSpawn,
+    spawn = guardedSpawn,
     validator,
     now = Date.now,
 }) => {

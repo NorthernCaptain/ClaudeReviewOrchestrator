@@ -43,6 +43,25 @@ describe("ConfigSchema", () => {
         expect(result.limits.maxCodexRounds).toBe(5)
         expect(result.blockingSeverities).toEqual(["blocker", "major"])
     })
+    test("limits.gitTimeoutSeconds defaults to 30 and is bounded", () => {
+        expect(
+            ConfigSchema.parse({ authToken: "x" }).limits.gitTimeoutSeconds
+        ).toBe(30)
+        expect(
+            ConfigSchema.parse({
+                authToken: "x",
+                limits: { gitTimeoutSeconds: 5 },
+            }).limits.gitTimeoutSeconds
+        ).toBe(5)
+        for (const bad of [0, 601, 1.5]) {
+            expect(() =>
+                ConfigSchema.parse({
+                    authToken: "x",
+                    limits: { gitTimeoutSeconds: bad },
+                })
+            ).toThrow()
+        }
+    })
     test("rejects an unknown reasoningEffort value", () => {
         expect(() =>
             ConfigSchema.parse({

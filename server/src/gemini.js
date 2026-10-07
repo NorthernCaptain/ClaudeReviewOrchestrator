@@ -59,13 +59,16 @@
 //     you need env-var auth under launchd, add the variable to the
 //     plist's EnvironmentVariables block.
 
-import { spawn as nodeSpawn } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import Ajv from "ajv/dist/2020.js"
 import { normalizeFindings } from "./codex.js"
+import { createGuardedSpawn } from "./tools.js"
+
+// Refuses Node executables (tools.js); tests inject their own spawn.
+const guardedSpawn = createGuardedSpawn()
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_SCHEMA_PATH = path.join(here, "codex-output.schema.json")
@@ -195,7 +198,7 @@ export const runGemini = ({
     repoRoot,
     prompt,
     config,
-    spawn = nodeSpawn,
+    spawn = guardedSpawn,
     now = Date.now,
     sessionId,
 }) =>
@@ -478,7 +481,7 @@ export const runAndParse = async ({
     prompt,
     config,
     schemaPath = DEFAULT_SCHEMA_PATH,
-    spawn = nodeSpawn,
+    spawn = guardedSpawn,
     validator,
     now = Date.now,
 }) => {

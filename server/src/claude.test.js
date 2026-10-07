@@ -11,6 +11,7 @@ import {
     buildClaudeArgs,
     parseClaudeOutput,
     runAndParse,
+    runClaude,
     __defaults__,
 } from "./claude.js"
 
@@ -143,9 +144,7 @@ describe("buildClaudeArgs", () => {
         expect(inlined.allOf).toBeUndefined()
         // Everything that carries the finding contract stays.
         expect(inlined.required).toEqual(["status", "findings"])
-        expect(inlined.properties.findings.items.$ref).toBe(
-            "#/$defs/finding"
-        )
+        expect(inlined.properties.findings.items.$ref).toBe("#/$defs/finding")
         expect(inlined.$defs.finding.properties.severity.enum).toContain(
             "blocker"
         )
@@ -684,5 +683,17 @@ describe("runAndParse", () => {
         })
         expect(result.status).toBe("ESCALATE")
         expect(result.reason).toMatch(/timed out/)
+    })
+})
+
+describe("runClaude — default spawn guard", () => {
+    test("refuses a Node executable configured as the claude binary", async () => {
+        await expect(
+            runClaude({
+                repoRoot: "/repo",
+                prompt: "p",
+                config: baseConfig({ binary: process.execPath }),
+            })
+        ).rejects.toMatchObject({ code: "TOOL_IS_NODE" })
     })
 })

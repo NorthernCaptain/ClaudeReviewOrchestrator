@@ -10,6 +10,7 @@ import {
     buildGeminiArgs,
     parseGeminiOutput,
     runAndParse,
+    runGemini,
     __defaults__,
 } from "./gemini.js"
 
@@ -527,5 +528,17 @@ describe("runAndParse", () => {
         })
         expect(result.status).toBe("ESCALATE")
         expect(result.reason).toMatch(/timed out/)
+    })
+})
+
+describe("runGemini — default spawn guard", () => {
+    test("refuses a Node executable configured as the gemini binary", async () => {
+        await expect(
+            runGemini({
+                repoRoot: "/repo",
+                prompt: "p",
+                config: baseConfig({ binary: process.execPath }),
+            })
+        ).rejects.toMatchObject({ code: "TOOL_IS_NODE" })
     })
 })

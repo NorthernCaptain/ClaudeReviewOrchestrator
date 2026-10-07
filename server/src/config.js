@@ -150,6 +150,10 @@ const ConfigSchema = z
                 maxCodexRounds: z.number().int().min(1).default(5),
                 maxBlocks: z.number().int().min(1).default(6),
                 idleResetMinutes: z.number().int().min(1).default(10),
+                // Hard timeout for every git command on the request path
+                // (tools.js): a stalled git fails its own request instead
+                // of blocking the event loop.
+                gitTimeoutSeconds: z.number().int().min(1).max(600).default(30),
                 codexTimeoutSeconds: z
                     .number()
                     .int()

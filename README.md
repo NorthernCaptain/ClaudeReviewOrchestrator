@@ -1432,7 +1432,8 @@ example below shows every supported key and the current default):
     "maxCodexOutputBytes": 1048576,
     "maxPayloadBytes": 262144,
     "maxFileBytes": 65536,
-    "maxFiles": 40
+    "maxFiles": 40,
+    "gitTimeoutSeconds": 30
   },
 
   "ignorePaths": [
@@ -1474,6 +1475,7 @@ example below shows every supported key and the current default):
 | `payload.verifyCleanTree` | `false` | Deprecated, ignored. The fast path always runs the tree probe when no change notification arrived. |
 | `hook.fetchTimeoutSeconds` | `null` (auto) | When null, the hook auto-derives from `max(reviewer.{provider}.timeoutSeconds, limits.codexTimeoutSeconds) + 60s`. Override to pin. |
 | `limits.idleResetMinutes` | `10` | Loop-counter idle reset interval. **Cache fields are preserved** across the reset and across server restarts (see "State persistence" above). |
+| `limits.gitTimeoutSeconds` | `30` | Hard timeout (1–600) for every git command a request runs. A stalled git is killed (SIGTERM, then SIGKILL after 2 s) and only that request fails, with `ESCALATE` code `GIT_TIMEOUT` (HTTP 503). Nothing is cached, so the next call retries. |
 
 ### Knobs that invalidate the cache when changed
 

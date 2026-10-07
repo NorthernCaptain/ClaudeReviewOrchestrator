@@ -3,7 +3,6 @@
  * Author: Leo Khramov
  */
 
-import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
 import {
     closeSync,
@@ -17,13 +16,13 @@ import {
 } from "node:fs"
 import path from "node:path"
 import { minimatch } from "minimatch"
+import { createTools, isGitTimeout } from "./tools.js"
 
-const defaultGit = (cwd, args) =>
-    execFileSync("git", ["-C", cwd, ...args], {
-        encoding: "utf8",
-        maxBuffer: 64 * 1024 * 1024,
-        stdio: ["ignore", "pipe", "pipe"],
-    })
+// Async, with a hard timeout (tools.js). A stalled git must never block
+// the event loop that serves deadlines, admissions and reloads. The shell
+// passes its own configured git through deps; this is the fallback.
+const defaultTools = createTools()
+const defaultGit = (cwd, args) => defaultTools.git(cwd, args)
 
 // Parses `git diff --raw -z` into path → { srcMode, dstMode, status,
 // from }. Rename/copy records carry two paths; they are keyed by the
@@ -70,31 +69,38 @@ const hashOrMissing = (hashFile, abs) => {
 // failed, or nesting passed MAX_SUBMODULE_DEPTH) io.markIncomplete() is
 // called so the caller refuses a cache hit instead of trusting a gap.
 const MAX_SUBMODULE_DEPTH = 4
-const submoduleRecords = (subAbs, io, depth = 1) => {
+const submoduleRecords = async (subAbs, io, depth = 1) => {
     if (io.fileMeta(path.join(subAbs, ".git")) === "MISSING") return null
     try {
         const raw = parseRawZ(
-            io.git(subAbs, ["diff", "HEAD", "--raw", "-z", "--no-abbrev"])
+            await io.git(subAbs, ["diff", "HEAD", "--raw", "-z", "--no-abbrev"])
         )
-        const untracked = io
-            .git(subAbs, ["ls-files", "--others", "--exclude-standard", "-z"])
+        const untracked = (
+            await io.git(subAbs, [
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ])
+        )
             .split("\0")
             .filter(Boolean)
-        return [...new Set([...raw.keys(), ...untracked])].sort().map((p) => {
+        const records = []
+        for (const p of [...new Set([...raw.keys(), ...untracked])].sort()) {
             const abs = path.join(subAbs, p)
             const m = raw.get(p)
             const patch = METADATA_MODES.has(m?.dstMode)
-                ? sha256Hex(io.git(subAbs, ["diff", "HEAD", "--", p]))
+                ? sha256Hex(await io.git(subAbs, ["diff", "HEAD", "--", p]))
                 : null
             let nested = null
             if (m?.dstMode === "160000") {
                 if (depth < MAX_SUBMODULE_DEPTH) {
-                    nested = submoduleRecords(abs, io, depth + 1)
+                    nested = await submoduleRecords(abs, io, depth + 1)
                 } else {
                     io.markIncomplete()
                 }
             }
-            return [
+            records.push([
                 p,
                 hashOrMissing(io.hashFile, abs),
                 io.fileMeta(abs),
@@ -102,9 +108,11 @@ const submoduleRecords = (subAbs, io, depth = 1) => {
                 m?.from ?? null,
                 patch,
                 nested,
-            ]
-        })
+            ])
+        }
+        return records
     } catch (err) {
+        if (isGitTimeout(err)) throw err
         io.markIncomplete()
         return [["git-error", String(err?.message ?? err)]]
     }
@@ -292,20 +300,22 @@ const readBytesOrNull = (readFile, abs) => {
 // (non-ignored) files all in a single command. Empty output = clean.
 // --untracked-files overrides a user's status.showUntrackedFiles=no,
 // which would otherwise hide files buildPayload's ls-files picks up.
-// Returns true only when stdout is empty. Any error is treated as "not
-// clean" so the fast path defers to the slow path when in doubt.
+// Returns true only when stdout is empty. Any other error is treated as
+// "not clean" so the fast path defers to the slow path when in doubt; a
+// git timeout propagates and fails the request.
 //
 // ~5ms in practice — much cheaper than buildPayload's full sweep.
-export const isWorkingTreeClean = (repoRoot, git = defaultGit) => {
+export const isWorkingTreeClean = async (repoRoot, git = defaultGit) => {
     try {
-        const out = git(repoRoot, [
+        const out = await git(repoRoot, [
             "status",
             "--porcelain",
             "-z",
             "--untracked-files=normal",
         ])
         return out.length === 0
-    } catch {
+    } catch (err) {
+        if (isGitTimeout(err)) throw err
         return false
     }
 }
@@ -314,11 +324,13 @@ export const isWorkingTreeClean = (repoRoot, git = defaultGit) => {
 // since the cached baseline was captured — a commit / pull / rebase
 // done outside Claude (e.g. in a terminal) would leave the working
 // tree clean while invalidating the cache. Returns null on error so
-// callers must defer to the slow path when in doubt.
-export const currentHeadSha = (repoRoot, git = defaultGit) => {
+// callers must defer to the slow path when in doubt; a git timeout
+// propagates.
+export const currentHeadSha = async (repoRoot, git = defaultGit) => {
     try {
-        return git(repoRoot, ["rev-parse", "HEAD"]).trim() || null
-    } catch {
+        return (await git(repoRoot, ["rev-parse", "HEAD"])).trim() || null
+    } catch (err) {
+        if (isGitTimeout(err)) throw err
         return null
     }
 }
@@ -332,28 +344,29 @@ export const currentHeadSha = (repoRoot, git = defaultGit) => {
 // but can't be read (or a git too old for --exists) rethrows the original
 // HEAD error instead of silently reviewing against the empty tree.
 const REF_MISSING_STATUS = 2
-const resolveHead = (repoRoot, git) => {
+const resolveHead = async (repoRoot, git) => {
     try {
         return {
-            sha: git(repoRoot, ["rev-parse", "HEAD"]).trim(),
+            sha: (await git(repoRoot, ["rev-parse", "HEAD"])).trim(),
             unborn: false,
         }
     } catch (err) {
+        if (isGitTimeout(err)) throw err
         let missing = false
         try {
-            const ref = git(repoRoot, ["symbolic-ref", "-q", "HEAD"]).trim()
-            git(repoRoot, ["show-ref", "--exists", ref])
+            const ref = (
+                await git(repoRoot, ["symbolic-ref", "-q", "HEAD"])
+            ).trim()
+            await git(repoRoot, ["show-ref", "--exists", ref])
         } catch (refErr) {
+            if (isGitTimeout(refErr)) throw refErr
             missing = refErr?.status === REF_MISSING_STATUS
         }
         if (!missing) throw err
         return {
-            sha: git(repoRoot, [
-                "hash-object",
-                "-t",
-                "tree",
-                "/dev/null",
-            ]).trim(),
+            sha: (
+                await git(repoRoot, ["hash-object", "-t", "tree", "/dev/null"])
+            ).trim(),
             unborn: true,
         }
     }
@@ -363,25 +376,27 @@ const resolveHead = (repoRoot, git) => {
 // with the upstream branch (so a feature branch with N unreviewed
 // commits is reviewed as one range), fall back to HEAD~1 for branches
 // without an upstream. Returns null when neither resolves (e.g. an
-// initial commit with no parent). Also used by the review fast path:
+// initial commit with no parent); a git timeout propagates rather than
+// passing for a missing ref. Also used by the review fast path:
 // the merge-base can move (upstream changed or force-pushed) while HEAD
 // stays put, so a cached head-fallback verdict is only valid for the
 // same base.
-export const resolveFallbackBase = (repoRoot, git = defaultGit) => {
-    const tryGit = (args) => {
+export const resolveFallbackBase = async (repoRoot, git = defaultGit) => {
+    const tryGit = async (args) => {
         try {
-            return git(repoRoot, args).trim()
-        } catch {
+            return (await git(repoRoot, args)).trim()
+        } catch (err) {
+            if (isGitTimeout(err)) throw err
             return ""
         }
     }
-    const upstream = tryGit(["merge-base", "HEAD", "@{upstream}"])
+    const upstream = await tryGit(["merge-base", "HEAD", "@{upstream}"])
     if (upstream) return upstream
-    const parent = tryGit(["rev-parse", "HEAD~1"])
+    const parent = await tryGit(["rev-parse", "HEAD~1"])
     return parent || null
 }
 
-export const buildPayload = ({
+export const buildPayload = async ({
     repoRoot,
     config,
     priorFindings = [],
@@ -390,19 +405,19 @@ export const buildPayload = ({
     fileMeta = defaultFileMeta,
     hashFile = hashRegularFile,
 }) => {
-    const head = resolveHead(repoRoot, git)
+    const head = await resolveHead(repoRoot, git)
     const headSha = head.sha
     const workingTreeRef = head.unborn ? head.sha : "HEAD"
     const priorFindingPaths = collectPriorFindingPaths(priorFindings, repoRoot)
     const isPrior = (p) => priorFindingPaths.has(p)
 
-    const nameStatusOut = git(repoRoot, [
+    const nameStatusOut = await git(repoRoot, [
         "diff",
         workingTreeRef,
         "--name-status",
         "-z",
     ])
-    const untrackedOut = git(repoRoot, [
+    const untrackedOut = await git(repoRoot, [
         "ls-files",
         "--others",
         "--exclude-standard",
@@ -442,14 +457,19 @@ export const buildPayload = ({
     let source = "working-tree"
     let baseSha = null
     if (workingTreeClean && fallbackEnabled) {
-        baseSha = resolveFallbackBase(repoRoot, git)
+        baseSha = await resolveFallbackBase(repoRoot, git)
         if (baseSha && baseSha !== headSha) {
             diffRef = `${baseSha}..HEAD`
             // Re-fetch name-status for the commit range. Untracked is
             // irrelevant — every change in the range is committed.
             sets = selectReviewable(
                 parseNameStatusZ(
-                    git(repoRoot, ["diff", diffRef, "--name-status", "-z"])
+                    await git(repoRoot, [
+                        "diff",
+                        diffRef,
+                        "--name-status",
+                        "-z",
+                    ])
                 ),
                 []
             )
@@ -504,7 +524,7 @@ export const buildPayload = ({
             truncated = true
             continue
         }
-        const diff = git(repoRoot, ["diff", diffRef, "--", file])
+        const diff = await git(repoRoot, ["diff", diffRef, "--", file])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
         if (t) truncated = true
         pushBlock(
@@ -526,7 +546,7 @@ export const buildPayload = ({
             truncated = true
             continue
         }
-        const diff = git(repoRoot, ["diff", diffRef, "--", r.to])
+        const diff = await git(repoRoot, ["diff", diffRef, "--", r.to])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
         if (t) truncated = true
         pushBlock(
@@ -550,7 +570,7 @@ export const buildPayload = ({
             truncated = true
             continue
         }
-        const diff = git(repoRoot, ["diff", diffRef, "--", file])
+        const diff = await git(repoRoot, ["diff", diffRef, "--", file])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
         if (t) truncated = true
         pushBlock(
@@ -675,7 +695,7 @@ export const buildPayload = ({
     // symlinks also hash the full patch, which names the checked-out
     // submodule commit (and any -dirty state) or the link target.
     const rawMeta = parseRawZ(
-        git(repoRoot, ["diff", diffRef, "--raw", "-z", "--no-abbrev"])
+        await git(repoRoot, ["diff", diffRef, "--raw", "-z", "--no-abbrev"])
     )
     const untrackedPaths = new Set(untrackedSet)
     // Structured per-path records, hashed as JSON: paths and symlink
@@ -685,22 +705,26 @@ export const buildPayload = ({
     // submoduleRecords); the cache must not treat such a payload as
     // unchanged.
     let fingerprintComplete = true
-    const contentRecords = contentPaths.map((p) => {
+    const contentRecords = []
+    for (const p of contentPaths) {
         const abs = path.join(repoRoot, p)
         const h = hashOrMissing(hashFile, abs)
         const m = rawMeta.get(p)
         if (!m) {
-            return untrackedPaths.has(p) ? [p, h, fileMeta(abs)] : [p, h]
+            contentRecords.push(
+                untrackedPaths.has(p) ? [p, h, fileMeta(abs)] : [p, h]
+            )
+            continue
         }
         const patch = METADATA_MODES.has(m.dstMode)
-            ? sha256Hex(git(repoRoot, ["diff", diffRef, "--", p]))
+            ? sha256Hex(await git(repoRoot, ["diff", diffRef, "--", p]))
             : null
         const record = [p, h, m.srcMode, m.dstMode, m.status, m.from, patch]
         // A head-fallback range is committed, so a submodule's working
         // tree isn't part of what is reviewed.
         if (m.dstMode === "160000" && source === "working-tree") {
             record.push(
-                submoduleRecords(abs, {
+                await submoduleRecords(abs, {
                     git,
                     hashFile,
                     fileMeta,
@@ -710,8 +734,8 @@ export const buildPayload = ({
                 })
             )
         }
-        return record
-    })
+        contentRecords.push(record)
+    }
     const progressHash = sha256Hex(JSON.stringify([promptHash, contentRecords]))
     // Per-path fingerprint identity, the companion to blockHashes: a caller
     // can check another build saw no content, mode or path this one didn't.

@@ -545,6 +545,80 @@ describe("handleReview — codex errors", () => {
         })
         expect(r.httpStatus).toBe(500)
     })
+
+    const gitTimeout = () =>
+        Object.assign(new Error("git diff timed out after 30000ms"), {
+            code: "GIT_TIMEOUT",
+        })
+
+    test("a git timeout while resolving the context is a transient 503", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                resolveContext: async () => {
+                    throw gitTimeout()
+                },
+            }),
+        })
+        expect(r.httpStatus).toBe(503)
+        expect(r.body).toMatchObject({
+            status: "ESCALATE",
+            code: "GIT_TIMEOUT",
+        })
+    })
+
+    test("a git timeout while building the payload is a transient 503 that changes no state", async () => {
+        const r = await handleReview({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: async () => {
+                    throw gitTimeout()
+                },
+            }),
+        })
+        expect(r.httpStatus).toBe(503)
+        expect(r.body.code).toBe("GIT_TIMEOUT")
+        expect(r.body.reason).toMatch(/timed out/)
+        const state = store.get(happyContext)
+        expect(state.codexRounds).toBe(0)
+        expect(state.lastBaseline ?? null).toBeNull()
+    })
+
+    test("the shell's git and spawn capabilities reach every git and reviewer call", async () => {
+        const git = jest.fn()
+        const spawn = jest.fn()
+        const seen = {}
+        await handleReview({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                git,
+                spawn,
+                resolveContext: async (args) => {
+                    seen.context = args.git
+                    return happyContext
+                },
+                buildPayload: async (args) => {
+                    seen.payload = args.git
+                    return makePayload()
+                },
+                runAndParse: async (args) => {
+                    seen.spawn = args.spawn
+                    return {
+                        status: "GOOD_TO_GO",
+                        findings: [],
+                        raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                    }
+                },
+            }),
+        })
+        expect(seen).toEqual({ context: git, payload: git, spawn })
+    })
 })
 
 describe("handleReview — finding-path sanitization", () => {
@@ -2706,6 +2780,53 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
         // No payload was built, no reviewer was spawned.
         expect(buildSpy).not.toHaveBeenCalled()
         expect(runSpy).not.toHaveBeenCalled()
+    })
+
+    test.each(["currentHeadSha", "isWorkingTreeClean"])(
+        "a git timeout in the %s probe is a 503, not a cache miss",
+        async (probe) => {
+            seed()
+            const before = store.get(happyContext)
+            const buildSpy = jest.fn()
+            const runSpy = jest.fn()
+            const r = await handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook" },
+                config: minimalConfig(),
+                store,
+                deps: makeDeps({
+                    buildPayload: buildSpy,
+                    runAndParse: runSpy,
+                    currentHeadSha: () => "abc",
+                    isWorkingTreeClean: () => true,
+                    [probe]: async () => {
+                        throw Object.assign(new Error("git timed out"), {
+                            code: "GIT_TIMEOUT",
+                        })
+                    },
+                }),
+            })
+            expect(r.httpStatus).toBe(503)
+            expect(r.body.code).toBe("GIT_TIMEOUT")
+            expect(buildSpy).not.toHaveBeenCalled()
+            expect(runSpy).not.toHaveBeenCalled()
+            expect(store.get(happyContext)).toEqual(before)
+        }
+    )
+
+    test("a non-timeout pipeline error still rejects", async () => {
+        seed()
+        await expect(
+            handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook" },
+                config: minimalConfig(),
+                store,
+                deps: makeDeps({
+                    currentHeadSha: async () => {
+                        throw new Error("boom")
+                    },
+                }),
+            })
+        ).rejects.toThrow("boom")
     })
 
     test("without a dirty signal, reviews edits made outside the hook (e.g. a Bash-run script)", async () => {
@@ -5230,6 +5351,32 @@ describe("handleReview — baseline after a passing review clears prior findings
         })
         expect(stop.body.status).toBe("NO_CHANGES")
         expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("a git timeout in the prior-free build fails the request before the reviewer runs", async () => {
+        seedIssues()
+        const before = store.get(happyContext)
+        const runSpy = jest.fn()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", force: true },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: async (args) => {
+                    if (args.priorFindings.length === 0) {
+                        throw Object.assign(new Error("git timed out"), {
+                            code: "GIT_TIMEOUT",
+                        })
+                    }
+                    return payloadForPriors(args)
+                },
+                runAndParse: runSpy,
+            }),
+        })
+        expect(r.httpStatus).toBe(503)
+        expect(r.body.code).toBe("GIT_TIMEOUT")
+        expect(runSpy).not.toHaveBeenCalled()
+        expect(store.get(happyContext)).toEqual(before)
     })
 
     test("an ISSUES result keeps the reviewed baseline, still fast-path eligible", async () => {

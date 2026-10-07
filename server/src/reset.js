@@ -3,7 +3,7 @@
  * Author: Leo Khramov
  */
 
-import { resolveContext, ContextError } from "./context.js"
+import { contextErrorStatus, ContextError, resolveContext } from "./context.js"
 
 const escalate = (status, code, reason) => ({
     status: "ESCALATE",
@@ -14,7 +14,7 @@ const escalate = (status, code, reason) => ({
     code,
 })
 
-export const handleReset = ({ body, config, store, deps = {} }) => {
+export const handleReset = async ({ body, config, store, deps = {} }) => {
     const cwd = body?.cwd
     if (!cwd) {
         return {
@@ -25,22 +25,20 @@ export const handleReset = ({ body, config, store, deps = {} }) => {
 
     let context
     try {
-        context = (deps.resolveContext ?? resolveContext)({
+        context = await (deps.resolveContext ?? resolveContext)({
             cwd,
             allowedRoots: config.allowedRoots,
+            git: deps.git,
         })
     } catch (err) {
-        const httpStatus =
-            err instanceof ContextError &&
-            (err.code === "NOT_IN_ALLOWED_ROOT" ||
-                err.code === "NOT_IN_CLIENT_ROOT")
-                ? 403
-                : 400
+        const httpStatus = contextErrorStatus(err)
         return {
             httpStatus,
             body: escalate(
                 httpStatus,
-                err instanceof ContextError ? err.code : "INTERNAL_ERROR",
+                err instanceof ContextError || err?.code === "GIT_TIMEOUT"
+                    ? err.code
+                    : "INTERNAL_ERROR",
                 err.message ?? "unknown error"
             ),
         }
@@ -67,8 +65,8 @@ export const handleReset = ({ body, config, store, deps = {} }) => {
 }
 
 export const mountResetRoute = (app, { config, store, deps } = {}) => {
-    app.post("/reset", (req, res) => {
-        const result = handleReset({
+    app.post("/reset", async (req, res) => {
+        const result = await handleReset({
             body: req.body,
             config,
             store,

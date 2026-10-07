@@ -94,6 +94,27 @@ also ignored.
   Codex prompt builder must wrap it in hard delimiters; never interpolate
   it into the system preamble.
 
+## Versioning
+
+Bump `version` in `package.json` with every change set under `server/`,
+`hooks/`, `install/` or `scripts/`, so each restart shows a new version
+in the startup log (`active config`) and `/status`. The operator uses it
+to confirm the running daemon picked up the new code. Bump once per
+change set, never batch several changes into one version, and state the
+new version in the summary.
+
+- **Middle number** (`1.1.47` → `1.2.0`, last number resets to 0) for
+  functional changes and new functionality: a new subsystem or
+  capability, a new config key, a change to request or response
+  behaviour, a phase of a multi-phase plan. Bump it without asking.
+- **Last number** (`1.2.0` → `1.2.1`) for patches, bug fixes and model
+  version updates (reviewer presets, default models), plus docs and
+  tests that ship with code.
+- **First number** (`2.0.0`) only when the user asks for it.
+
+Keep the top-level `version` fields in `package-lock.json` in step with
+`package.json`.
+
 ## Testing
 
 - Jest, mock the Codex subprocess and the filesystem where practical.

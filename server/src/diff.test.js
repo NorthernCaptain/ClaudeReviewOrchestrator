@@ -51,15 +51,15 @@ const baseConfig = () => ({
 })
 
 describe("matchesAny / filterIgnored", () => {
-    test("ignores node_modules path", () => {
+    test("ignores node_modules path", async () => {
         expect(
             matchesAny("a/node_modules/b/c.js", ["**/node_modules/**"])
         ).toBe(true)
     })
-    test("does not match unrelated path", () => {
+    test("does not match unrelated path", async () => {
         expect(matchesAny("src/foo.js", ["**/node_modules/**"])).toBe(false)
     })
-    test("filterIgnored removes matches and keeps the rest", () => {
+    test("filterIgnored removes matches and keeps the rest", async () => {
         const out = filterIgnored(
             ["src/a.js", "node_modules/x.js", "yarn.lock"],
             ["**/node_modules/**", "**/*.lock"]
@@ -78,7 +78,7 @@ describe("readRegularFile", () => {
         rmSync(dir, { recursive: true, force: true })
     })
 
-    test("reads a regular file directly and through a symlink", () => {
+    test("reads a regular file directly and through a symlink", async () => {
         writeFileSync(path.join(dir, "f.txt"), "hello\n")
         symlinkSync("f.txt", path.join(dir, "l"))
         expect(readRegularFile(path.join(dir, "f.txt")).toString()).toBe(
@@ -87,7 +87,7 @@ describe("readRegularFile", () => {
         expect(readRegularFile(path.join(dir, "l")).toString()).toBe("hello\n")
     })
 
-    test("refuses a FIFO, directly or behind a symlink, without blocking", () => {
+    test("refuses a FIFO, directly or behind a symlink, without blocking", async () => {
         const fifo = path.join(dir, "pipe")
         execFileSync("mkfifo", [fifo])
         symlinkSync("pipe", path.join(dir, "l"))
@@ -97,12 +97,12 @@ describe("readRegularFile", () => {
         )
     })
 
-    test("refuses an endless device and a directory", () => {
+    test("refuses an endless device and a directory", async () => {
         expect(() => readRegularFile("/dev/zero")).toThrow(/not a regular file/)
         expect(() => readRegularFile(dir)).toThrow(/not a regular file/)
     })
 
-    test("propagates a missing path", () => {
+    test("propagates a missing path", async () => {
         expect(() => readRegularFile(path.join(dir, "gone"))).toThrow(/ENOENT/)
     })
 })
@@ -117,7 +117,7 @@ describe("hashRegularFile", () => {
         rmSync(dir, { recursive: true, force: true })
     })
 
-    test("streams a multi-chunk file to the same digest as hashing it whole", () => {
+    test("streams a multi-chunk file to the same digest as hashing it whole", async () => {
         const content = Buffer.alloc(200 * 1024 + 7, "xyz")
         writeFileSync(path.join(dir, "big.bin"), content)
         expect(hashRegularFile(path.join(dir, "big.bin"))).toBe(
@@ -125,14 +125,14 @@ describe("hashRegularFile", () => {
         )
     })
 
-    test("hashes an empty file", () => {
+    test("hashes an empty file", async () => {
         writeFileSync(path.join(dir, "empty"), "")
         expect(hashRegularFile(path.join(dir, "empty"))).toBe(
             createHash("sha256").update("").digest("hex")
         )
     })
 
-    test("refuses a FIFO without blocking", () => {
+    test("refuses a FIFO without blocking", async () => {
         const fifo = path.join(dir, "pipe")
         execFileSync("mkfifo", [fifo])
         expect(() => hashRegularFile(fifo)).toThrow(/not a regular file/)
@@ -149,7 +149,7 @@ describe("defaultFileMeta", () => {
         rmSync(dir, { recursive: true, force: true })
     })
 
-    test("reports regular and executable files in git mode terms", () => {
+    test("reports regular and executable files in git mode terms", async () => {
         const f = path.join(dir, "f.sh")
         writeFileSync(f, "x\n")
         chmodSync(f, 0o644)
@@ -158,16 +158,65 @@ describe("defaultFileMeta", () => {
         expect(defaultFileMeta(f)).toBe("100755")
     })
 
-    test("reports a symlink with its target, even when dangling", () => {
+    test("reports a symlink with its target, even when dangling", async () => {
         const l = path.join(dir, "l")
         symlinkSync("nowhere.txt", l)
         expect(defaultFileMeta(l)).toBe("120000 nowhere.txt")
     })
 
-    test("reports directories and missing paths", () => {
+    test("reports directories and missing paths", async () => {
         expect(defaultFileMeta(dir)).toBe("040000")
         expect(defaultFileMeta(path.join(dir, "gone"))).toBe("MISSING")
     })
+})
+
+const gitTimeout = () =>
+    Object.assign(new Error("git timed out"), { code: "GIT_TIMEOUT" })
+
+describe("git timeouts propagate instead of reading as a verdict", () => {
+    const stalled = (timeout) => async () => {
+        throw timeout
+    }
+
+    test.each([
+        ["isWorkingTreeClean", (git) => isWorkingTreeClean("/r", git)],
+        ["currentHeadSha", (git) => currentHeadSha("/r", git)],
+        ["resolveFallbackBase", (git) => resolveFallbackBase("/r", git)],
+    ])("%s", async (_name, call) => {
+        const timeout = gitTimeout()
+        await expect(call(stalled(timeout))).rejects.toBe(timeout)
+    })
+
+    test("resolveFallbackBase: a merge-base timeout doesn't fall back to HEAD~1", async () => {
+        const timeout = gitTimeout()
+        const git = jest.fn(async (_cwd, args) => {
+            if (args[0] === "merge-base") throw timeout
+            return "parent-sha\n"
+        })
+        await expect(resolveFallbackBase("/r", git)).rejects.toBe(timeout)
+        expect(git).toHaveBeenCalledTimes(1)
+    })
+
+    test.each([
+        ["rev-parse HEAD", "rev-parse"],
+        ["symbolic-ref", "symbolic-ref"],
+        ["show-ref", "show-ref"],
+    ])(
+        "buildPayload: a %s timeout isn't taken for an unborn branch",
+        async (_label, stalledCmd) => {
+            const timeout = gitTimeout()
+            const headError = new Error("bad HEAD")
+            const git = async (_cwd, args) => {
+                if (args[0] === stalledCmd) throw timeout
+                if (args[0] === "rev-parse") throw headError
+                if (args[0] === "symbolic-ref") return "refs/heads/main\n"
+                throw Object.assign(new Error("missing"), { status: 2 })
+            }
+            await expect(
+                buildPayload({ repoRoot: "/r", config: baseConfig(), git })
+            ).rejects.toBe(timeout)
+        }
+    )
 })
 
 describe("submoduleRecords", () => {
@@ -191,9 +240,9 @@ describe("submoduleRecords", () => {
             return patch
         }
 
-    test("skips a gitlink directory that is not an initialized repo", () => {
+    test("skips a gitlink directory that is not an initialized repo", async () => {
         const git = jest.fn()
-        const out = submoduleRecords(
+        const out = await submoduleRecords(
             "/r/sub",
             io({
                 git,
@@ -205,24 +254,38 @@ describe("submoduleRecords", () => {
         expect(git).not.toHaveBeenCalled()
     })
 
-    test("records a git failure and marks the fingerprint incomplete", () => {
+    test("records a git failure and marks the fingerprint incomplete", async () => {
         const deps = io({
             git: () => {
                 throw new Error("corrupt")
             },
         })
-        expect(submoduleRecords("/r/sub", deps)).toEqual([
+        expect(await submoduleRecords("/r/sub", deps)).toEqual([
             ["git-error", "corrupt"],
         ])
         expect(deps.markIncomplete).toHaveBeenCalled()
     })
 
-    test("hashes a nested gitlink's patch, which names its checked-out commit", () => {
-        const a = submoduleRecords(
+    test("a git timeout propagates instead of being fingerprinted", async () => {
+        const timeout = gitTimeout()
+        await expect(
+            submoduleRecords(
+                "/r/sub",
+                io({
+                    git: async () => {
+                        throw timeout
+                    },
+                })
+            )
+        ).rejects.toBe(timeout)
+    })
+
+    test("hashes a nested gitlink's patch, which names its checked-out commit", async () => {
+        const a = await submoduleRecords(
             "/r/sub",
             io({ git: nestedGit("Subproject commit aaa") })
         )
-        const b = submoduleRecords(
+        const b = await submoduleRecords(
             "/r/sub",
             io({ git: nestedGit("Subproject commit bbb") })
         )
@@ -230,23 +293,23 @@ describe("submoduleRecords", () => {
         expect(a[0][5]).not.toBe(b[0][5])
     })
 
-    test("recurses into nested submodules and marks incomplete past the depth limit", () => {
+    test("recurses into nested submodules and marks incomplete past the depth limit", async () => {
         const deps = io({ git: nestedGit() })
-        const out = submoduleRecords("/r/sub", deps)
+        const out = await submoduleRecords("/r/sub", deps)
         let depth = 0
         for (let level = out; level; level = level[0][6]) depth++
         expect(depth).toBe(4)
         expect(deps.markIncomplete).toHaveBeenCalledTimes(1)
     })
 
-    test("leaves the fingerprint complete for an ordinary dirty submodule", () => {
+    test("leaves the fingerprint complete for an ordinary dirty submodule", async () => {
         const deps = io({
             git: (_cwd, args) =>
                 args.includes("--raw")
                     ? `:100644 100644 ${zero} ${zero} M\0s.txt\0`
                     : "",
         })
-        submoduleRecords("/r/sub", deps)
+        await submoduleRecords("/r/sub", deps)
         expect(deps.markIncomplete).not.toHaveBeenCalled()
     })
 })
@@ -256,7 +319,7 @@ describe("parseRawZ", () => {
     const zero = "0".repeat(40)
     const sha = "a".repeat(40)
 
-    test("keys entries by path with modes and status, dropping object ids", () => {
+    test("keys entries by path with modes and status, dropping object ids", async () => {
         const out = parseRawZ(
             `:100644 100755 ${sha} ${zero} M\0run.sh\0` +
                 `:000000 100644 ${zero} ${sha} A\0new.js\0`
@@ -270,7 +333,7 @@ describe("parseRawZ", () => {
         expect(out.get("new.js").status).toBe("A")
     })
 
-    test("keys rename and copy records by the destination path", () => {
+    test("keys rename and copy records by the destination path", async () => {
         const out = parseRawZ(
             `:100644 100644 ${sha} ${sha} R087\0old.js\0new.js\0` +
                 `:100644 100644 ${sha} ${sha} C100\0a.js\0b.js\0`
@@ -283,34 +346,34 @@ describe("parseRawZ", () => {
         expect(out.get("b.js").status).toBe("C100")
     })
 
-    test("returns an empty map for empty output", () => {
+    test("returns an empty map for empty output", async () => {
         expect(parseRawZ("").size).toBe(0)
     })
 })
 
 describe("parseNameStatusZ", () => {
-    test("parses M/A/D entries", () => {
+    test("parses M/A/D entries", async () => {
         const input = "M\0a.js\0A\0b.js\0D\0c.js\0"
         const out = parseNameStatusZ(input)
         expect(out.modified).toEqual(["a.js"])
         expect(out.added).toEqual(["b.js"])
         expect(out.deleted).toEqual(["c.js"])
     })
-    test("parses rename with source and dest", () => {
+    test("parses rename with source and dest", async () => {
         const input = "R100\0old.js\0new.js\0"
         const out = parseNameStatusZ(input)
         expect(out.renamed).toEqual([{ from: "old.js", to: "new.js" }])
     })
-    test("returns empty buckets on empty input", () => {
+    test("returns empty buckets on empty input", async () => {
         const out = parseNameStatusZ("")
         expect(out.modified).toEqual([])
     })
-    test("skips rename record with missing dest", () => {
+    test("skips rename record with missing dest", async () => {
         // Truncated input: rename status with only the source path supplied.
         const out = parseNameStatusZ("R100\0only-source.js\0")
         expect(out.renamed).toEqual([])
     })
-    test("skips unknown status codes", () => {
+    test("skips unknown status codes", async () => {
         const out = parseNameStatusZ("U\0weird.js\0")
         expect(out.modified).toEqual([])
         expect(out.added).toEqual([])
@@ -321,43 +384,43 @@ describe("sanitizeFindingPath", () => {
     const { sanitizeFindingPath } = __test__
     const root = "/repo"
 
-    test("accepts a plain repo-relative path", () => {
+    test("accepts a plain repo-relative path", async () => {
         expect(sanitizeFindingPath("src/foo.js", root)).toBe("src/foo.js")
     })
 
-    test("normalizes redundant segments", () => {
+    test("normalizes redundant segments", async () => {
         expect(sanitizeFindingPath("src/./foo.js", root)).toBe("src/foo.js")
         expect(sanitizeFindingPath("src/bar/../foo.js", root)).toBe(
             "src/foo.js"
         )
     })
 
-    test("rejects absolute paths", () => {
+    test("rejects absolute paths", async () => {
         expect(sanitizeFindingPath("/etc/passwd", root)).toBeNull()
     })
 
-    test("rejects parent-directory escapes", () => {
+    test("rejects parent-directory escapes", async () => {
         expect(sanitizeFindingPath("../secret.txt", root)).toBeNull()
         expect(sanitizeFindingPath("../../secret.txt", root)).toBeNull()
         expect(sanitizeFindingPath("src/../../escape.txt", root)).toBeNull()
     })
 
-    test("rejects backslash traversal", () => {
+    test("rejects backslash traversal", async () => {
         expect(sanitizeFindingPath("..\\secret.txt", root)).toBeNull()
         expect(sanitizeFindingPath("src\\foo.js", root)).toBeNull()
     })
 
-    test("rejects null bytes", () => {
+    test("rejects null bytes", async () => {
         expect(sanitizeFindingPath("src/foo\0.js", root)).toBeNull()
     })
 
-    test("rejects empty / dotty paths", () => {
+    test("rejects empty / dotty paths", async () => {
         expect(sanitizeFindingPath("", root)).toBeNull()
         expect(sanitizeFindingPath(".", root)).toBeNull()
         expect(sanitizeFindingPath("..", root)).toBeNull()
     })
 
-    test("rejects non-string input", () => {
+    test("rejects non-string input", async () => {
         expect(sanitizeFindingPath(null, root)).toBeNull()
         expect(sanitizeFindingPath(undefined, root)).toBeNull()
         expect(sanitizeFindingPath(123, root)).toBeNull()
@@ -365,21 +428,21 @@ describe("sanitizeFindingPath", () => {
 })
 
 describe("isBinary", () => {
-    test("returns true for buffer containing a null byte in first 8KB", () => {
+    test("returns true for buffer containing a null byte in first 8KB", async () => {
         expect(isBinary(Buffer.from([1, 2, 0, 3, 4]))).toBe(true)
     })
-    test("returns false for plain ASCII", () => {
+    test("returns false for plain ASCII", async () => {
         expect(isBinary(Buffer.from("hello world\n", "utf8"))).toBe(false)
     })
 })
 
 describe("truncateText", () => {
-    test("returns text unchanged if under limit", () => {
+    test("returns text unchanged if under limit", async () => {
         const r = truncateText("hi", 10)
         expect(r.text).toBe("hi")
         expect(r.truncated).toBe(false)
     })
-    test("truncates and appends marker", () => {
+    test("truncates and appends marker", async () => {
         const r = truncateText("a".repeat(100), 10)
         expect(r.truncated).toBe(true)
         expect(r.text).toMatch(/^a{10}\n\.\.\. \(truncated\)\n$/)
@@ -395,45 +458,45 @@ describe("buildPayload (integration)", () => {
         rmSync(dir, { recursive: true, force: true })
     })
 
-    test("captures a modified file in promptText", () => {
+    test("captures a modified file in promptText", async () => {
         writeFileSync(path.join(dir, "README.md"), "hi\nmore\n")
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.empty).toBe(false)
         expect(out.files.modified.map((f) => f.path)).toContain("README.md")
         expect(out.promptText).toMatch(/=== FILE: README.md \(modified\) ===/)
     })
 
-    test("captures an untracked text file", () => {
+    test("captures an untracked text file", async () => {
         writeFileSync(path.join(dir, "new.txt"), "new content\n")
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(
             out.files.untracked.find((u) => u.path === "new.txt")
         ).toBeDefined()
         expect(out.promptText).toMatch(/new content/)
     })
 
-    test("marks untracked binary file as header-only", () => {
+    test("marks untracked binary file as header-only", async () => {
         writeFileSync(
             path.join(dir, "blob.bin"),
             Buffer.from([0, 1, 2, 0, 4, 5])
         )
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         const u = out.files.untracked.find((x) => x.path === "blob.bin")
         expect(u.binary).toBe(true)
         expect(out.promptText).toMatch(/blob.bin .*binary.*omitted/)
         expect(out.promptText).not.toMatch(//)
     })
 
-    test("captures a deleted tracked file", () => {
+    test("captures a deleted tracked file", async () => {
         rmSync(path.join(dir, "README.md"))
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.files.deleted).toContain("README.md")
         expect(out.promptText).toMatch(/=== FILE: README.md \(deleted\) ===/)
     })
 
-    test("captures a rename", () => {
+    test("captures a rename", async () => {
         execFileSync("git", ["-C", dir, "mv", "README.md", "README2.md"])
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.files.renamed).toContainEqual({
             from: "README.md",
             to: "README2.md",
@@ -441,30 +504,30 @@ describe("buildPayload (integration)", () => {
         expect(out.promptText).toMatch(/README.md -> README2.md/)
     })
 
-    test("applies ignorePaths to untracked files", () => {
+    test("applies ignorePaths to untracked files", async () => {
         mkdirSync(path.join(dir, "node_modules"), { recursive: true })
         writeFileSync(path.join(dir, "node_modules", "x.js"), "ignored\n")
         writeFileSync(path.join(dir, "src.js"), "kept\n")
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.files.untracked.map((u) => u.path)).not.toContain(
             "node_modules/x.js"
         )
         expect(out.files.untracked.map((u) => u.path)).toContain("src.js")
     })
 
-    test("returns empty=true when there are no changes", () => {
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+    test("returns empty=true when there are no changes", async () => {
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.empty).toBe(true)
         expect(out.totalBytes).toBe(0)
         expect(out.promptText).toBe("")
     })
 
-    test("truncates a file that exceeds maxFileBytes", () => {
+    test("truncates a file that exceeds maxFileBytes", async () => {
         const big = "x".repeat(2000) + "\n"
         writeFileSync(path.join(dir, "big.txt"), big)
         const cfg = baseConfig()
         cfg.limits.maxFileBytes = 100
-        const out = buildPayload({ repoRoot: dir, config: cfg })
+        const out = await buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         expect(out.promptText).toMatch(
             /=== FILE: big.txt \(untracked, truncated\) ===/
@@ -472,30 +535,30 @@ describe("buildPayload (integration)", () => {
         expect(out.promptText.length).toBeLessThan(big.length)
     })
 
-    test("limits files to maxFiles, emitting header-only for extras", () => {
+    test("limits files to maxFiles, emitting header-only for extras", async () => {
         for (let i = 0; i < 5; i++) {
             writeFileSync(path.join(dir, `f${i}.txt`), `content ${i}\n`)
         }
         const cfg = baseConfig()
         cfg.limits.maxFiles = 2
-        const out = buildPayload({ repoRoot: dir, config: cfg })
+        const out = await buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         const matches = out.promptText.match(/omitted: maxFiles/g) || []
         expect(matches.length).toBeGreaterThanOrEqual(3)
     })
 
-    test("respects maxPayloadBytes by replacing oversized blocks with header-only", () => {
+    test("respects maxPayloadBytes by replacing oversized blocks with header-only", async () => {
         for (let i = 0; i < 5; i++) {
             writeFileSync(path.join(dir, `f${i}.txt`), "x".repeat(500))
         }
         const cfg = baseConfig()
         cfg.limits.maxPayloadBytes = 600
-        const out = buildPayload({ repoRoot: dir, config: cfg })
+        const out = await buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         expect(out.totalBytes).toBeLessThanOrEqual(cfg.limits.maxPayloadBytes)
     })
 
-    test("modified files past maxFiles get header-only entries", () => {
+    test("modified files past maxFiles get header-only entries", async () => {
         // Several committed files; modify all of them so they're in `modified`.
         for (let i = 0; i < 4; i++) {
             const file = path.join(dir, `m${i}.txt`)
@@ -508,14 +571,14 @@ describe("buildPayload (integration)", () => {
         }
         const cfg = baseConfig()
         cfg.limits.maxFiles = 2
-        const out = buildPayload({ repoRoot: dir, config: cfg })
+        const out = await buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         const matches =
             out.promptText.match(/modified, omitted: maxFiles/g) || []
         expect(matches.length).toBeGreaterThanOrEqual(1)
     })
 
-    test("deleted files past maxFiles get header-only entries", () => {
+    test("deleted files past maxFiles get header-only entries", async () => {
         for (let i = 0; i < 3; i++) {
             writeFileSync(path.join(dir, `d${i}.txt`), "initial\n")
         }
@@ -526,14 +589,14 @@ describe("buildPayload (integration)", () => {
         }
         const cfg = baseConfig()
         cfg.limits.maxFiles = 1
-        const out = buildPayload({ repoRoot: dir, config: cfg })
+        const out = await buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         const matches =
             out.promptText.match(/deleted, omitted: maxFiles/g) || []
         expect(matches.length).toBeGreaterThanOrEqual(1)
     })
 
-    test("a large deleted file's diff gets truncated", () => {
+    test("a large deleted file's diff gets truncated", async () => {
         const big = "x".repeat(2000) + "\n"
         const p = path.join(dir, "big-del.txt")
         writeFileSync(p, big)
@@ -542,14 +605,14 @@ describe("buildPayload (integration)", () => {
         rmSync(p)
         const cfg = baseConfig()
         cfg.limits.maxFileBytes = 200
-        const out = buildPayload({ repoRoot: dir, config: cfg })
+        const out = await buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         expect(out.promptText).toMatch(
             /=== FILE: big-del.txt \(deleted, truncated\) ===/
         )
     })
 
-    test("renamed files past maxFiles get header-only entries", () => {
+    test("renamed files past maxFiles get header-only entries", async () => {
         for (let i = 0; i < 3; i++) {
             writeFileSync(path.join(dir, `r${i}.txt`), "initial\n")
         }
@@ -560,26 +623,26 @@ describe("buildPayload (integration)", () => {
         }
         const cfg = baseConfig()
         cfg.limits.maxFiles = 1
-        const out = buildPayload({ repoRoot: dir, config: cfg })
+        const out = await buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         const matches =
             out.promptText.match(/renamed, omitted: maxFiles/g) || []
         expect(matches.length).toBeGreaterThanOrEqual(1)
     })
 
-    test("Buffer.byteLength(promptText) equals totalBytes", () => {
+    test("Buffer.byteLength(promptText) equals totalBytes", async () => {
         writeFileSync(path.join(dir, "ascii.txt"), "hello\n")
         writeFileSync(path.join(dir, "utf8.txt"), "héllo 日本語\n")
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(Buffer.byteLength(out.promptText, "utf8")).toBe(out.totalBytes)
     })
 
-    test("multi-byte UTF-8 content keeps promptText byte length at or under maxPayloadBytes", () => {
+    test("multi-byte UTF-8 content keeps promptText byte length at or under maxPayloadBytes", async () => {
         // 600 copies of a 3-byte char would be 1800 bytes if emitted in full.
         writeFileSync(path.join(dir, "u.txt"), "あ".repeat(600) + "\n")
         const cfg = baseConfig()
         cfg.limits.maxPayloadBytes = 500
-        const out = buildPayload({ repoRoot: dir, config: cfg })
+        const out = await buildPayload({ repoRoot: dir, config: cfg })
         expect(out.truncated).toBe(true)
         expect(Buffer.byteLength(out.promptText, "utf8")).toBeLessThanOrEqual(
             cfg.limits.maxPayloadBytes
@@ -587,18 +650,18 @@ describe("buildPayload (integration)", () => {
         expect(out.totalBytes).toBe(Buffer.byteLength(out.promptText, "utf8"))
     })
 
-    test("promptHash is sha256 of promptText bytes", () => {
+    test("promptHash is sha256 of promptText bytes", async () => {
         writeFileSync(path.join(dir, "x.txt"), "hello\n")
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         const expected = createHash("sha256")
             .update(out.promptText)
             .digest("hex")
         expect(out.promptHash).toBe(expected)
     })
 
-    test("progressHash covers promptHash plus each changed file's full content", () => {
+    test("progressHash covers promptHash plus each changed file's full content", async () => {
         writeFileSync(path.join(dir, "x.txt"), "hello\n")
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         const sha = (v) => createHash("sha256").update(v).digest("hex")
         expect(out.progressHash).toBe(
             sha(
@@ -610,29 +673,29 @@ describe("buildPayload (integration)", () => {
         )
     })
 
-    test("progressHash flips for a non-prior untracked file edited PAST maxFileBytes truncation", () => {
+    test("progressHash flips for a non-prior untracked file edited PAST maxFileBytes truncation", async () => {
         // Untracked content has no git `index` header line to flip the
         // prompt, so only the full-content part can see this edit.
         const big = path.join(dir, "big.txt")
         const cfg = baseConfig()
         cfg.limits.maxFileBytes = 200
         writeFileSync(big, "a".repeat(2000) + "X\n")
-        const before = buildPayload({ repoRoot: dir, config: cfg })
+        const before = await buildPayload({ repoRoot: dir, config: cfg })
         writeFileSync(big, "a".repeat(2000) + "Y\n")
-        const after = buildPayload({ repoRoot: dir, config: cfg })
+        const after = await buildPayload({ repoRoot: dir, config: cfg })
         expect(before.truncated).toBe(true)
         expect(after.promptHash).toBe(before.promptHash)
         expect(after.progressHash).not.toBe(before.progressHash)
     })
 
-    test("progressHash flips for an edit to a file omitted by maxFiles", () => {
+    test("progressHash flips for an edit to a file omitted by maxFiles", async () => {
         const cfg = baseConfig()
         cfg.limits.maxFiles = 1
         writeFileSync(path.join(dir, "a.txt"), "a\n")
         writeFileSync(path.join(dir, "b.txt"), "b\n")
-        const before = buildPayload({ repoRoot: dir, config: cfg })
+        const before = await buildPayload({ repoRoot: dir, config: cfg })
         writeFileSync(path.join(dir, "b.txt"), "b2\n")
-        const after = buildPayload({ repoRoot: dir, config: cfg })
+        const after = await buildPayload({ repoRoot: dir, config: cfg })
         expect(after.promptHash).toBe(before.promptHash)
         expect(after.progressHash).not.toBe(before.progressHash)
     })
@@ -650,17 +713,17 @@ describe("buildPayload (integration)", () => {
             execFileSync("git", ["-C", dir, "commit", "-qm", msg])
         }
 
-        test("progressHash flips when only the executable bit changes", () => {
+        test("progressHash flips when only the executable bit changes", async () => {
             writeFileSync(path.join(dir, "run.sh"), "echo hi\n")
             commitAll("script")
             writeFileSync(path.join(dir, "README.md"), "edited\n")
             writeFileSync(path.join(dir, "run.sh"), "echo hi there\n")
-            const before = buildPayload({
+            const before = await buildPayload({
                 repoRoot: dir,
                 config: omittedConfig(),
             })
             chmodSync(path.join(dir, "run.sh"), 0o755)
-            const after = buildPayload({
+            const after = await buildPayload({
                 repoRoot: dir,
                 config: omittedConfig(),
             })
@@ -669,7 +732,7 @@ describe("buildPayload (integration)", () => {
             expect(after.progressHash).not.toBe(before.progressHash)
         })
 
-        test("progressHash flips when a symlink is retargeted to an identical file", () => {
+        test("progressHash flips when a symlink is retargeted to an identical file", async () => {
             for (const t of ["t1.txt", "t2.txt", "t3.txt"]) {
                 writeFileSync(path.join(dir, t), "same\n")
             }
@@ -681,12 +744,12 @@ describe("buildPayload (integration)", () => {
             }
             writeFileSync(path.join(dir, "README.md"), "edited\n")
             retarget("t2.txt")
-            const before = buildPayload({
+            const before = await buildPayload({
                 repoRoot: dir,
                 config: omittedConfig(),
             })
             retarget("t3.txt")
-            const after = buildPayload({
+            const after = await buildPayload({
                 repoRoot: dir,
                 config: omittedConfig(),
             })
@@ -699,7 +762,7 @@ describe("buildPayload (integration)", () => {
 
         // Adds a submodule at sub/ (committed), runs fn with helpers for
         // committing inside it, and removes its source repo afterwards.
-        const withSubmodule = (fn) => {
+        const withSubmodule = async (fn) => {
             const sub = realpathSync(mkdtempSync(path.join(tmpdir(), "sub-")))
             try {
                 execFileSync("git", ["init", "-q", "-b", "main", sub])
@@ -736,27 +799,27 @@ describe("buildPayload (integration)", () => {
                     execFileSync("git", ["-C", inner, "commit", "-qam", text])
                 }
                 writeFileSync(path.join(dir, "README.md"), "edited\n")
-                fn({ inner, innerCommit })
+                await fn({ inner, innerCommit })
             } finally {
                 rmSync(sub, { recursive: true, force: true })
             }
         }
-        const build = () =>
-            buildPayload({ repoRoot: dir, config: omittedConfig() })
+        const build = async () =>
+            await buildPayload({ repoRoot: dir, config: omittedConfig() })
 
-        test("progressHash flips when a submodule moves to another commit", () => {
-            withSubmodule(({ innerCommit }) => {
+        test("progressHash flips when a submodule moves to another commit", async () => {
+            await withSubmodule(async ({ innerCommit }) => {
                 innerCommit("s2\n")
-                const before = build()
+                const before = await build()
                 innerCommit("s3\n")
-                const after = build()
+                const after = await build()
                 expect(after.promptText).toMatch(/sub \(modified, omitted/)
                 expect(after.promptHash).toBe(before.promptHash)
                 expect(after.progressHash).not.toBe(before.progressHash)
             })
         })
 
-        test("progressHash flips when a nested submodule moves while its parent submodule stays dirty", () => {
+        test("progressHash flips when a nested submodule moves while its parent submodule stays dirty", async () => {
             const env = {
                 ...process.env,
                 GIT_AUTHOR_NAME: "t",
@@ -795,9 +858,9 @@ describe("buildPayload (integration)", () => {
                 // Keep the parent submodule dirty throughout.
                 writeFileSync(path.join(sub, "f.txt"), "dirty\n")
                 nestedCommit("2\n")
-                const before = build()
+                const before = await build()
                 nestedCommit("3\n")
-                const after = build()
+                const after = await build()
                 expect(after.promptHash).toBe(before.promptHash)
                 expect(after.progressHash).not.toBe(before.progressHash)
                 expect(after.fingerprintComplete).toBe(true)
@@ -806,15 +869,15 @@ describe("buildPayload (integration)", () => {
             }
         })
 
-        test("progressHash flips for further edits inside an already dirty submodule", () => {
-            withSubmodule(({ inner, innerCommit }) => {
+        test("progressHash flips for further edits inside an already dirty submodule", async () => {
+            await withSubmodule(async ({ inner, innerCommit }) => {
                 innerCommit("s2\n")
                 writeFileSync(path.join(inner, "s.txt"), "dirty 1\n")
-                const dirty1 = build()
+                const dirty1 = await build()
                 writeFileSync(path.join(inner, "s.txt"), "dirty 2\n")
-                const dirty2 = build()
+                const dirty2 = await build()
                 writeFileSync(path.join(inner, "extra.txt"), "new\n")
-                const withUntracked = build()
+                const withUntracked = await build()
                 // The gitlink patch reads "<sha>-dirty" every time.
                 expect(dirty2.promptHash).toBe(dirty1.promptHash)
                 expect(dirty2.progressHash).not.toBe(dirty1.progressHash)
@@ -823,27 +886,39 @@ describe("buildPayload (integration)", () => {
         })
     })
 
-    test("progressHash flips when only an untracked file's executable bit changes", () => {
+    test("progressHash flips when only an untracked file's executable bit changes", async () => {
         const script = path.join(dir, "new.sh")
         writeFileSync(script, "echo hi\n")
-        const before = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const before = await buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+        })
         chmodSync(script, 0o755)
-        const after = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const after = await buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+        })
         expect(after.promptHash).toBe(before.promptHash)
         expect(after.progressHash).not.toBe(before.progressHash)
     })
 
-    test("progressHash flips when an untracked symlink is retargeted to an identical file", () => {
+    test("progressHash flips when an untracked symlink is retargeted to an identical file", async () => {
         writeFileSync(path.join(dir, "t1.txt"), "same\n")
         writeFileSync(path.join(dir, "t2.txt"), "same\n")
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "targets"])
         const lnk = path.join(dir, "lnk")
         symlinkSync("t1.txt", lnk)
-        const before = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const before = await buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+        })
         rmSync(lnk)
         symlinkSync("t2.txt", lnk)
-        const after = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const after = await buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+        })
         expect(after.files.untracked.map((u) => u.path)).toContain("lnk")
         expect(after.promptHash).toBe(before.promptHash)
         expect(after.progressHash).not.toBe(before.progressHash)
@@ -856,25 +931,28 @@ describe("buildPayload (integration)", () => {
         }
         // README.md's block is emitted first; sizing maxPayloadBytes to
         // exactly that block leaves no room for any later header.
-        const tightConfig = () => {
+        const tightConfig = async () => {
             writeFileSync(path.join(dir, "README.md"), "edited\n")
-            const probe = buildPayload({ repoRoot: dir, config: baseConfig() })
+            const probe = await buildPayload({
+                repoRoot: dir,
+                config: baseConfig(),
+            })
             const cfg = baseConfig()
             cfg.limits.maxPayloadBytes = probe.totalBytes
             return cfg
         }
         const git = (...args) => execFileSync("git", ["-C", dir, ...args])
 
-        test("progressHash flips when a different tracked file is deleted", () => {
+        test("progressHash flips when a different tracked file is deleted", async () => {
             writeFileSync(path.join(dir, "a.txt"), "a\n")
             writeFileSync(path.join(dir, "b.txt"), "b\n")
             commitAll("files")
-            const cfg = tightConfig()
+            const cfg = await tightConfig()
             rmSync(path.join(dir, "a.txt"))
-            const before = buildPayload({ repoRoot: dir, config: cfg })
+            const before = await buildPayload({ repoRoot: dir, config: cfg })
             git("checkout", "--", "a.txt")
             rmSync(path.join(dir, "b.txt"))
-            const after = buildPayload({ repoRoot: dir, config: cfg })
+            const after = await buildPayload({ repoRoot: dir, config: cfg })
             expect(before.files.deleted).toEqual(["a.txt"])
             expect(after.files.deleted).toEqual(["b.txt"])
             expect(after.promptText).not.toMatch(/deleted/)
@@ -882,35 +960,35 @@ describe("buildPayload (integration)", () => {
             expect(after.progressHash).not.toBe(before.progressHash)
         })
 
-        test("a symlink target can't forge another path's record", () => {
+        test("a symlink target can't forge another path's record", async () => {
             // Under newline-joined "path:hash:mode" records, a dangling
             // link whose target spells out m.txt's record hashed the same
             // as the link plus a real m.txt.
-            const cfg = tightConfig()
+            const cfg = await tightConfig()
             const sha = (v) => createHash("sha256").update(v).digest("hex")
             const lnk = path.join(dir, "lnk")
             symlinkSync("x", lnk)
             writeFileSync(path.join(dir, "m.txt"), "c\n")
-            const before = buildPayload({ repoRoot: dir, config: cfg })
+            const before = await buildPayload({ repoRoot: dir, config: cfg })
             rmSync(path.join(dir, "m.txt"))
             rmSync(lnk)
             symlinkSync(`x\nm.txt:${sha("c\n")}:100644`, lnk)
-            const after = buildPayload({ repoRoot: dir, config: cfg })
+            const after = await buildPayload({ repoRoot: dir, config: cfg })
             expect(before.files.untracked.map((u) => u.path)).toContain("m.txt")
             expect(after.promptHash).toBe(before.promptHash)
             expect(after.progressHash).not.toBe(before.progressHash)
         })
 
-        test("progressHash flips when a different source is renamed into an identical file", () => {
+        test("progressHash flips when a different source is renamed into an identical file", async () => {
             writeFileSync(path.join(dir, "x.txt"), "same content\n")
             writeFileSync(path.join(dir, "z.txt"), "same content\n")
             commitAll("sources")
-            const cfg = tightConfig()
+            const cfg = await tightConfig()
             git("mv", "x.txt", "y.txt")
-            const before = buildPayload({ repoRoot: dir, config: cfg })
+            const before = await buildPayload({ repoRoot: dir, config: cfg })
             git("mv", "y.txt", "x.txt")
             git("mv", "z.txt", "y.txt")
-            const after = buildPayload({ repoRoot: dir, config: cfg })
+            const after = await buildPayload({ repoRoot: dir, config: cfg })
             expect(before.files.renamed.map((r) => r.from)).toEqual(["x.txt"])
             expect(after.files.renamed.map((r) => r.from)).toEqual(["z.txt"])
             expect(after.promptHash).toBe(before.promptHash)
@@ -918,7 +996,7 @@ describe("buildPayload (integration)", () => {
         })
     })
 
-    test("completes when changed symlinks point at a FIFO or an endless device", () => {
+    test("completes when changed symlinks point at a FIFO or an endless device", async () => {
         writeFileSync(path.join(dir, "t.txt"), "t\n")
         symlinkSync("t.txt", path.join(dir, "tracked-link"))
         execFileSync("git", ["-C", dir, "add", "."])
@@ -927,7 +1005,7 @@ describe("buildPayload (integration)", () => {
         rmSync(path.join(dir, "tracked-link"))
         symlinkSync("pipe", path.join(dir, "tracked-link"))
         symlinkSync("/dev/zero", path.join(dir, "untracked-link"))
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.files.modified.map((f) => f.path)).toContain("tracked-link")
         expect(typeof out.progressHash).toBe("string")
     })
@@ -938,18 +1016,18 @@ describe("buildPayload (integration)", () => {
             execFileSync("git", ["-C", dir, "commit", "-qm", msg])
         }
 
-        test("a prior-free build of the same tree shows a subset when the prior file is in the diff", () => {
+        test("a prior-free build of the same tree shows a subset when the prior file is in the diff", async () => {
             writeFileSync(path.join(dir, "a.js"), "one\n")
             commitAll("a")
             writeFileSync(path.join(dir, "a.js"), "two\n")
             writeFileSync(path.join(dir, "README.md"), "edited\n")
             const priorFindings = [{ file: "a.js", severity: "major" }]
-            const reviewed = buildPayload({
+            const reviewed = await buildPayload({
                 repoRoot: dir,
                 config: baseConfig(),
                 priorFindings,
             })
-            const priorFree = buildPayload({
+            const priorFree = await buildPayload({
                 repoRoot: dir,
                 config: baseConfig(),
             })
@@ -961,7 +1039,7 @@ describe("buildPayload (integration)", () => {
             ).toBe(true)
         })
 
-        test("a prior-free build exposes a block the reviewed one omitted when an ignored flagged file used the budget", () => {
+        test("a prior-free build exposes a block the reviewed one omitted when an ignored flagged file used the budget", async () => {
             writeFileSync(path.join(dir, "deps.lock"), "v1\n")
             writeFileSync(path.join(dir, "z.txt"), "z1\n")
             commitAll("files")
@@ -970,15 +1048,20 @@ describe("buildPayload (integration)", () => {
             const cfg = baseConfig()
             // Budget fits the flagged lock file's block and nothing more.
             cfg.limits.maxPayloadBytes =
-                buildPayload({ repoRoot: dir, config: cfg, priorFindings })
-                    .totalBytes + 10
+                (
+                    await buildPayload({
+                        repoRoot: dir,
+                        config: cfg,
+                        priorFindings,
+                    })
+                ).totalBytes + 10
             writeFileSync(path.join(dir, "z.txt"), "z2\n")
-            const reviewed = buildPayload({
+            const reviewed = await buildPayload({
                 repoRoot: dir,
                 config: cfg,
                 priorFindings,
             })
-            const priorFree = buildPayload({ repoRoot: dir, config: cfg })
+            const priorFree = await buildPayload({ repoRoot: dir, config: cfg })
             expect(reviewed.promptText).not.toMatch(/z\.txt/)
             expect(priorFree.promptText).toMatch(/z\.txt \(modified\)/)
             expect(
@@ -989,14 +1072,14 @@ describe("buildPayload (integration)", () => {
         })
     })
 
-    test("hashes tracked modified files without reading them whole", () => {
+    test("hashes tracked modified files without reading them whole", async () => {
         writeFileSync(path.join(dir, "asset.bin"), Buffer.from([0, 1, 2]))
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "asset"])
         writeFileSync(path.join(dir, "asset.bin"), Buffer.from([0, 1, 3]))
         const readFile = jest.fn(readFileSync)
         const hashFile = jest.fn(() => "digest")
-        buildPayload({
+        await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             readFile,
@@ -1007,16 +1090,22 @@ describe("buildPayload (integration)", () => {
         expect(readFile).not.toHaveBeenCalledWith(abs)
     })
 
-    test("progressHash ignores edits to ignorePaths files", () => {
+    test("progressHash ignores edits to ignorePaths files", async () => {
         writeFileSync(path.join(dir, "x.txt"), "hello\n")
         writeFileSync(path.join(dir, "deps.lock"), "v1\n")
-        const before = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const before = await buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+        })
         writeFileSync(path.join(dir, "deps.lock"), "v2\n")
-        const after = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const after = await buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+        })
         expect(after.progressHash).toBe(before.progressHash)
     })
 
-    test("progressHash changes when a prior-finding file is edited", () => {
+    test("progressHash changes when a prior-finding file is edited", async () => {
         const flagged = path.join(dir, "flagged.txt")
         writeFileSync(flagged, "before\n")
         execFileSync("git", ["-C", dir, "add", "."])
@@ -1025,13 +1114,13 @@ describe("buildPayload (integration)", () => {
         const priorFindings = [
             { file: "flagged.txt", line: 1, severity: "blocker" },
         ]
-        const before = buildPayload({
+        const before = await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             priorFindings,
         })
         writeFileSync(flagged, "after\n")
-        const after = buildPayload({
+        const after = await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             priorFindings,
@@ -1039,7 +1128,7 @@ describe("buildPayload (integration)", () => {
         expect(after.progressHash).not.toBe(before.progressHash)
     })
 
-    test("progressHash flips even when the edit is PAST maxFileBytes truncation", () => {
+    test("progressHash flips even when the edit is PAST maxFileBytes truncation", async () => {
         // The flagged file is large. We change a byte far past maxFileBytes.
         // promptHash may stay the same (the truncated prompt prefix is
         // identical) but progressHash uses the FULL file content, so it must
@@ -1056,7 +1145,7 @@ describe("buildPayload (integration)", () => {
         const cfg = baseConfig()
         cfg.limits.maxFileBytes = 200 // truncate well before our edit point.
 
-        const before = buildPayload({
+        const before = await buildPayload({
             repoRoot: dir,
             config: cfg,
             priorFindings,
@@ -1065,7 +1154,7 @@ describe("buildPayload (integration)", () => {
         // Mutate the file far past the prompt's truncation point.
         writeFileSync(flagged, initial.replace(/X$/, "Y") + "\n")
 
-        const after = buildPayload({
+        const after = await buildPayload({
             repoRoot: dir,
             config: cfg,
             priorFindings,
@@ -1080,20 +1169,20 @@ describe("buildPayload (integration)", () => {
         expect(after.progressHash).not.toBe(before.progressHash)
     })
 
-    test("progressHash treats a deleted prior-finding file as MISSING", () => {
+    test("progressHash treats a deleted prior-finding file as MISSING", async () => {
         const flagged = path.join(dir, "f.txt")
         writeFileSync(flagged, "content\n")
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "add"])
 
         const priorFindings = [{ file: "f.txt", line: 1, severity: "blocker" }]
-        const before = buildPayload({
+        const before = await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             priorFindings,
         })
         rmSync(flagged)
-        const after = buildPayload({
+        const after = await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             priorFindings,
@@ -1101,11 +1190,11 @@ describe("buildPayload (integration)", () => {
         expect(after.progressHash).not.toBe(before.progressHash)
     })
 
-    test("force-include: prior-finding file in ignorePaths is still in the prompt", () => {
+    test("force-include: prior-finding file in ignorePaths is still in the prompt", async () => {
         mkdirSync(path.join(dir, "node_modules"), { recursive: true })
         const flagged = "node_modules/foo.js"
         writeFileSync(path.join(dir, flagged), "x = 1\n")
-        const out = buildPayload({
+        const out = await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             priorFindings: [{ file: flagged, line: 1, severity: "blocker" }],
@@ -1114,12 +1203,12 @@ describe("buildPayload (integration)", () => {
         expect(out.promptText).toMatch(/node_modules\/foo.js/)
     })
 
-    test("force-include: a prior-finding file that the user hasn't touched gets a 'prior-finding' block", () => {
+    test("force-include: a prior-finding file that the user hasn't touched gets a 'prior-finding' block", async () => {
         const flagged = path.join(dir, "untouched.txt")
         writeFileSync(flagged, "still here\n")
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "init"])
-        const out = buildPayload({
+        const out = await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             priorFindings: [
@@ -1134,7 +1223,7 @@ describe("buildPayload (integration)", () => {
         )
     })
 
-    test("force-include: prior-finding files don't consume the maxFiles budget", () => {
+    test("force-include: prior-finding files don't consume the maxFiles budget", async () => {
         // 3 untracked files + 1 prior-finding file flagged in node_modules.
         // maxFiles=2: untracked files take both slots; the prior-finding file
         // still gets included.
@@ -1147,7 +1236,7 @@ describe("buildPayload (integration)", () => {
         const cfg = baseConfig()
         cfg.limits.maxFiles = 2
 
-        const out = buildPayload({
+        const out = await buildPayload({
             repoRoot: dir,
             config: cfg,
             priorFindings: [{ file: flagged, line: 1, severity: "blocker" }],
@@ -1155,14 +1244,14 @@ describe("buildPayload (integration)", () => {
         expect(out.promptText).toMatch(/node_modules\/foo.js/)
     })
 
-    test("a malicious priorFinding path (../../) is silently dropped", () => {
+    test("a malicious priorFinding path (../../) is silently dropped", async () => {
         // Place a file outside the repo. If sanitization were broken,
         // buildPayload would join repoRoot + "../" and read it.
         const parent = path.dirname(dir)
         const secretAbs = path.join(parent, "outside-secret.txt")
         writeFileSync(secretAbs, "SECRET\n")
         try {
-            const out = buildPayload({
+            const out = await buildPayload({
                 repoRoot: dir,
                 config: baseConfig(),
                 priorFindings: [
@@ -1184,9 +1273,9 @@ describe("buildPayload (integration)", () => {
         }
     })
 
-    test("force-include: deleted prior-finding file emits a 'deleted on disk' marker", () => {
+    test("force-include: deleted prior-finding file emits a 'deleted on disk' marker", async () => {
         // File is in priorFindings but never existed at HEAD or on disk.
-        const out = buildPayload({
+        const out = await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             priorFindings: [
@@ -1201,11 +1290,11 @@ describe("buildPayload (integration)", () => {
         )
     })
 
-    test("headSha is the current HEAD", () => {
+    test("headSha is the current HEAD", async () => {
         const sha = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], {
             encoding: "utf8",
         }).trim()
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.headSha).toBe(sha)
     })
 })
@@ -1233,13 +1322,13 @@ describe("buildPayload — unborn branch (no commits yet)", () => {
         rmSync(dir, { recursive: true, force: true })
     })
 
-    test("diffs staged and untracked files against the empty tree", () => {
+    test("diffs staged and untracked files against the empty tree", async () => {
         writeFileSync(path.join(dir, "app.js"), "one\n")
         execFileSync("git", ["-C", dir, "add", "."])
         // An unstaged edit on top of the staged file is reviewed too.
         writeFileSync(path.join(dir, "app.js"), "one\ntwo\n")
         writeFileSync(path.join(dir, "notes.txt"), "loose\n")
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.headSha).toBe(emptyTree())
         expect(out.source).toBe("working-tree")
         expect(out.files.modified.map((f) => f.path)).toEqual(["app.js"])
@@ -1247,23 +1336,23 @@ describe("buildPayload — unborn branch (no commits yet)", () => {
         expect(out.promptText).toMatch(/\+one\n\+two/)
     })
 
-    test("keeps a stable fingerprint until something changes, then the first commit moves headSha", () => {
+    test("keeps a stable fingerprint until something changes, then the first commit moves headSha", async () => {
         writeFileSync(path.join(dir, "app.js"), "one\n")
         execFileSync("git", ["-C", dir, "add", "."])
-        const a = buildPayload({ repoRoot: dir, config: baseConfig() })
-        const b = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const a = await buildPayload({ repoRoot: dir, config: baseConfig() })
+        const b = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(b.progressHash).toBe(a.progressHash)
         writeFileSync(path.join(dir, "app.js"), "changed\n")
-        const c = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const c = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(c.progressHash).not.toBe(a.progressHash)
         execFileSync("git", ["-C", dir, "commit", "-qam", "first"])
-        const d = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const d = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(d.headSha).not.toBe(emptyTree())
         expect(d.empty).toBe(true)
     })
 
-    test("an empty unborn repo with fallbackToHead on builds an empty payload", () => {
-        const out = buildPayload({
+    test("an empty unborn repo with fallbackToHead on builds an empty payload", async () => {
+        const out = await buildPayload({
             repoRoot: dir,
             config: { ...baseConfig(), payload: { fallbackToHead: true } },
         })
@@ -1275,23 +1364,26 @@ describe("buildPayload — unborn branch (no commits yet)", () => {
         ["exists but can't be read", 1],
         ["exists, yet HEAD still won't resolve", 0],
         ["can't be checked by an old git without --exists", 129],
-    ])("rethrows the HEAD error when the branch ref %s", (_label, status) => {
-        const headError = new Error("bad HEAD")
-        const git = (_cwd, args) => {
-            if (args[0] === "rev-parse") throw headError
-            if (args[0] === "symbolic-ref") return "refs/heads/main\n"
-            if (args[0] === "show-ref") {
-                if (status === 0) return ""
-                throw Object.assign(new Error("show-ref"), { status })
+    ])(
+        "rethrows the HEAD error when the branch ref %s",
+        async (_label, status) => {
+            const headError = new Error("bad HEAD")
+            const git = (_cwd, args) => {
+                if (args[0] === "rev-parse") throw headError
+                if (args[0] === "symbolic-ref") return "refs/heads/main\n"
+                if (args[0] === "show-ref") {
+                    if (status === 0) return ""
+                    throw Object.assign(new Error("show-ref"), { status })
+                }
+                throw new Error(`unexpected git ${args.join(" ")}`)
             }
-            throw new Error(`unexpected git ${args.join(" ")}`)
+            await expect(
+                buildPayload({ repoRoot: dir, config: baseConfig(), git })
+            ).rejects.toThrow(headError)
         }
-        expect(() =>
-            buildPayload({ repoRoot: dir, config: baseConfig(), git })
-        ).toThrow(headError)
-    })
+    )
 
-    test("a corrupt branch ref is reported, not reviewed against the empty tree", () => {
+    test("a corrupt branch ref is reported, not reviewed against the empty tree", async () => {
         writeFileSync(path.join(dir, "a.js"), "x\n")
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "a"])
@@ -1299,20 +1391,20 @@ describe("buildPayload — unborn branch (no commits yet)", () => {
             path.join(dir, ".git", "refs", "heads", "main"),
             "garbage\n"
         )
-        expect(() =>
+        await expect(
             buildPayload({ repoRoot: dir, config: baseConfig() })
-        ).toThrow()
+        ).rejects.toThrow()
     })
 
-    test("rethrows when HEAD is neither a commit nor a branch", () => {
+    test("rethrows when HEAD is neither a commit nor a branch", async () => {
         const headError = new Error("bad HEAD")
         const git = (_cwd, args) => {
             if (args[0] === "rev-parse") throw headError
             throw new Error("not a symbolic ref")
         }
-        expect(() =>
+        await expect(
             buildPayload({ repoRoot: dir, config: baseConfig(), git })
-        ).toThrow(headError)
+        ).rejects.toThrow(headError)
     })
 })
 
@@ -1335,29 +1427,32 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
         payload: { fallbackToHead: true },
     })
 
-    test("clean tree + fallback off → empty payload (existing behavior)", () => {
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+    test("clean tree + fallback off → empty payload (existing behavior)", async () => {
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.empty).toBe(true)
         expect(out.source).toBe("working-tree")
         expect(out.baseSha).toBeNull()
     })
 
-    test("an edit to only an ignored file still falls back to the commit range", () => {
-        const clean = buildPayload({
+    test("an edit to only an ignored file still falls back to the commit range", async () => {
+        const clean = await buildPayload({
             repoRoot: dir,
             config: fallbackOnConfig(),
         })
         writeFileSync(path.join(dir, "deps.lock"), "v2\n")
-        const out = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+        const out = await buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+        })
         expect(out.source).toBe("head-fallback")
         expect(out.empty).toBe(false)
         // Same range, same fingerprint: a repeat Stop hook hits NO_CHANGES.
         expect(out.progressHash).toBe(clean.progressHash)
     })
 
-    test("an ignored file a prior finding flagged is reviewable, so no fallback", () => {
+    test("an ignored file a prior finding flagged is reviewable, so no fallback", async () => {
         writeFileSync(path.join(dir, "deps.lock"), "v2\n")
-        const out = buildPayload({
+        const out = await buildPayload({
             repoRoot: dir,
             config: fallbackOnConfig(),
             priorFindings: [{ file: "deps.lock", severity: "major" }],
@@ -1366,15 +1461,18 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
         expect(out.files.untracked.map((u) => u.path)).toContain("deps.lock")
     })
 
-    test("an ignored-only edit with fallback off leaves an empty working-tree payload", () => {
+    test("an ignored-only edit with fallback off leaves an empty working-tree payload", async () => {
         writeFileSync(path.join(dir, "deps.lock"), "v2\n")
-        const out = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const out = await buildPayload({ repoRoot: dir, config: baseConfig() })
         expect(out.source).toBe("working-tree")
         expect(out.empty).toBe(true)
     })
 
-    test("clean tree + fallback ON → emits the HEAD~1..HEAD diff with source tag", () => {
-        const out = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+    test("clean tree + fallback ON → emits the HEAD~1..HEAD diff with source tag", async () => {
+        const out = await buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+        })
         expect(out.empty).toBe(false)
         expect(out.source).toBe("head-fallback")
         expect(out.baseSha).toBeTruthy()
@@ -1384,11 +1482,14 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
         expect(out.files.modified.map((f) => f.path)).toContain("feature.js")
     })
 
-    test("uncommitted working-tree change suppresses the fallback", () => {
+    test("uncommitted working-tree change suppresses the fallback", async () => {
         // Working tree is not clean → working-tree path wins even
         // when fallbackToHead is on.
         writeFileSync(path.join(dir, "scratch.txt"), "wip\n")
-        const out = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+        const out = await buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+        })
         expect(out.source).toBe("working-tree")
         expect(out.baseSha).toBeNull()
         // The untracked file is what's reviewed, not the commit range.
@@ -1398,20 +1499,26 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
         )
     })
 
-    test("two fallback runs at the same HEAD produce identical progressHash (cache stability)", () => {
+    test("two fallback runs at the same HEAD produce identical progressHash (cache stability)", async () => {
         // The whole point: a Stop hook firing repeatedly at the same
         // HEAD must hit the existing NO_CHANGES cache. That requires
         // buildPayload to be deterministic for the same git state.
-        const a = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
-        const b = buildPayload({ repoRoot: dir, config: fallbackOnConfig() })
+        const a = await buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+        })
+        const b = await buildPayload({
+            repoRoot: dir,
+            config: fallbackOnConfig(),
+        })
         expect(a.progressHash).toBe(b.progressHash)
         expect(a.promptHash).toBe(b.promptHash)
         expect(a.headSha).toBe(b.headSha)
         expect(a.baseSha).toBe(b.baseSha)
     })
 
-    test("a new commit changes the headSha AND the progressHash (cache busts)", () => {
-        const before = buildPayload({
+    test("a new commit changes the headSha AND the progressHash (cache busts)", async () => {
+        const before = await buildPayload({
             repoRoot: dir,
             config: fallbackOnConfig(),
         })
@@ -1419,7 +1526,7 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
         writeFileSync(path.join(dir, "feature.js"), "function f(){return 2}\n")
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "tweak"])
-        const after = buildPayload({
+        const after = await buildPayload({
             repoRoot: dir,
             config: fallbackOnConfig(),
         })
@@ -1427,7 +1534,7 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
         expect(after.progressHash).not.toBe(before.progressHash)
     })
 
-    test("returns empty when working tree is clean AND no parent exists (initial commit)", () => {
+    test("returns empty when working tree is clean AND no parent exists (initial commit)", async () => {
         // Initialize a one-commit repo so HEAD~1 fails.
         const empty = realpathSync(mkdtempSync(path.join(tmpdir(), "fb-init-")))
         try {
@@ -1437,7 +1544,7 @@ describe("buildPayload — head-fallback (clean working tree)", () => {
             writeFileSync(path.join(empty, "a.txt"), "hi\n")
             execFileSync("git", ["-C", empty, "add", "."])
             execFileSync("git", ["-C", empty, "commit", "-qm", "first"])
-            const out = buildPayload({
+            const out = await buildPayload({
                 repoRoot: empty,
                 config: fallbackOnConfig(),
             })
@@ -1473,13 +1580,16 @@ describe("prior-free builds of the same tree", () => {
     const priors = [{ file: "b.js", severity: "major" }]
     const subset = (a, b) => a.every((h) => b.includes(h))
 
-    test("on an unchanged tree shows only blocks and fingerprints the reviewed build had", () => {
-        const reviewed = buildPayload({
+    test("on an unchanged tree shows only blocks and fingerprints the reviewed build had", async () => {
+        const reviewed = await buildPayload({
             repoRoot: dir,
             config: baseConfig(),
             priorFindings: priors,
         })
-        const priorFree = buildPayload({ repoRoot: dir, config: baseConfig() })
+        const priorFree = await buildPayload({
+            repoRoot: dir,
+            config: baseConfig(),
+        })
         expect(reviewed.progressHash).not.toBe(priorFree.progressHash)
         expect(subset(priorFree.blockHashes, reviewed.blockHashes)).toBe(true)
         expect(subset(priorFree.contentHashes, reviewed.contentHashes)).toBe(
@@ -1487,17 +1597,17 @@ describe("prior-free builds of the same tree", () => {
         )
     })
 
-    test("an edit between the two builds hidden from the prompt surfaces as an unseen fingerprint", () => {
+    test("an edit between the two builds hidden from the prompt surfaces as an unseen fingerprint", async () => {
         const cfg = baseConfig()
         cfg.limits.maxFileBytes = 200
         writeFileSync(path.join(dir, "new.js"), "a".repeat(2000) + "X\n")
-        const reviewed = buildPayload({
+        const reviewed = await buildPayload({
             repoRoot: dir,
             config: cfg,
             priorFindings: priors,
         })
         writeFileSync(path.join(dir, "new.js"), "a".repeat(2000) + "Y\n")
-        const priorFree = buildPayload({ repoRoot: dir, config: cfg })
+        const priorFree = await buildPayload({ repoRoot: dir, config: cfg })
         expect(subset(priorFree.blockHashes, reviewed.blockHashes)).toBe(true)
         expect(subset(priorFree.contentHashes, reviewed.contentHashes)).toBe(
             false
@@ -1520,21 +1630,21 @@ describe("isWorkingTreeClean", () => {
         rmSync(dir, { recursive: true, force: true })
     })
 
-    test("returns true on a freshly committed tree", () => {
-        expect(isWorkingTreeClean(dir)).toBe(true)
+    test("returns true on a freshly committed tree", async () => {
+        expect(await isWorkingTreeClean(dir)).toBe(true)
     })
 
-    test("returns false when a tracked file is modified", () => {
+    test("returns false when a tracked file is modified", async () => {
         writeFileSync(path.join(dir, "a.js"), "y\n")
-        expect(isWorkingTreeClean(dir)).toBe(false)
+        expect(await isWorkingTreeClean(dir)).toBe(false)
     })
 
-    test("returns false when an untracked file exists", () => {
+    test("returns false when an untracked file exists", async () => {
         writeFileSync(path.join(dir, "scratch.txt"), "wip\n")
-        expect(isWorkingTreeClean(dir)).toBe(false)
+        expect(await isWorkingTreeClean(dir)).toBe(false)
     })
 
-    test("returns false for an untracked file even with status.showUntrackedFiles=no", () => {
+    test("returns false for an untracked file even with status.showUntrackedFiles=no", async () => {
         execFileSync("git", [
             "-C",
             dir,
@@ -1543,18 +1653,18 @@ describe("isWorkingTreeClean", () => {
             "no",
         ])
         writeFileSync(path.join(dir, "scratch.txt"), "wip\n")
-        expect(isWorkingTreeClean(dir)).toBe(false)
+        expect(await isWorkingTreeClean(dir)).toBe(false)
     })
 
-    test("returns false when git fails (defer to slow path)", () => {
+    test("returns false when git fails (defer to slow path)", async () => {
         const bogus = path.join(dir, "not-a-repo")
         // No .git dir → git exits non-zero.
-        expect(isWorkingTreeClean(bogus)).toBe(false)
+        expect(await isWorkingTreeClean(bogus)).toBe(false)
     })
 
-    test("honors an injected git function (no real subprocess needed)", () => {
+    test("honors an injected git function (no real subprocess needed)", async () => {
         const fakeGit = jest.fn(() => "") // empty = clean
-        expect(isWorkingTreeClean("/anywhere", fakeGit)).toBe(true)
+        expect(await isWorkingTreeClean("/anywhere", fakeGit)).toBe(true)
         expect(fakeGit).toHaveBeenCalledWith("/anywhere", [
             "status",
             "--porcelain",
@@ -1562,17 +1672,17 @@ describe("isWorkingTreeClean", () => {
             "--untracked-files=normal",
         ])
         const dirtyGit = jest.fn(() => " M file.txt\0?? scratch.txt\0")
-        expect(isWorkingTreeClean("/anywhere", dirtyGit)).toBe(false)
+        expect(await isWorkingTreeClean("/anywhere", dirtyGit)).toBe(false)
     })
 })
 
 describe("resolveFallbackBase", () => {
-    test("prefers the merge-base with the upstream branch", () => {
+    test("prefers the merge-base with the upstream branch", async () => {
         const git = jest.fn((_root, args) => {
             if (args[0] === "merge-base") return "upbase\n"
             return "parent\n"
         })
-        expect(resolveFallbackBase("/repo", git)).toBe("upbase")
+        expect(await resolveFallbackBase("/repo", git)).toBe("upbase")
         expect(git).toHaveBeenCalledWith("/repo", [
             "merge-base",
             "HEAD",
@@ -1580,19 +1690,19 @@ describe("resolveFallbackBase", () => {
         ])
     })
 
-    test("falls back to HEAD~1 when there is no upstream", () => {
+    test("falls back to HEAD~1 when there is no upstream", async () => {
         const git = jest.fn((_root, args) => {
             if (args[0] === "merge-base") throw new Error("no upstream")
             return "parent\n"
         })
-        expect(resolveFallbackBase("/repo", git)).toBe("parent")
+        expect(await resolveFallbackBase("/repo", git)).toBe("parent")
     })
 
-    test("returns null when neither resolves", () => {
+    test("returns null when neither resolves", async () => {
         const git = jest.fn(() => {
             throw new Error("initial commit")
         })
-        expect(resolveFallbackBase("/repo", git)).toBeNull()
+        expect(await resolveFallbackBase("/repo", git)).toBeNull()
     })
 })
 
@@ -1611,8 +1721,8 @@ describe("currentHeadSha", () => {
         rmSync(dir, { recursive: true, force: true })
     })
 
-    test("returns the current HEAD SHA after a commit", () => {
-        const sha = currentHeadSha(dir)
+    test("returns the current HEAD SHA after a commit", async () => {
+        const sha = await currentHeadSha(dir)
         const expected = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], {
             encoding: "utf8",
         }).trim()
@@ -1620,23 +1730,23 @@ describe("currentHeadSha", () => {
         expect(sha).toMatch(/^[0-9a-f]{40}$/)
     })
 
-    test("reflects a new commit (HEAD moves)", () => {
-        const before = currentHeadSha(dir)
+    test("reflects a new commit (HEAD moves)", async () => {
+        const before = await currentHeadSha(dir)
         writeFileSync(path.join(dir, "b.js"), "y\n")
         execFileSync("git", ["-C", dir, "add", "."])
         execFileSync("git", ["-C", dir, "commit", "-qm", "second"])
-        const after = currentHeadSha(dir)
+        const after = await currentHeadSha(dir)
         expect(after).not.toBe(before)
     })
 
-    test("returns null when git fails (non-repo path)", () => {
+    test("returns null when git fails (non-repo path)", async () => {
         const bogus = path.join(dir, "not-a-repo")
-        expect(currentHeadSha(bogus)).toBeNull()
+        expect(await currentHeadSha(bogus)).toBeNull()
     })
 
-    test("honors an injected git function", () => {
+    test("honors an injected git function", async () => {
         const fakeGit = jest.fn(() => "deadbeef\n")
-        expect(currentHeadSha("/x", fakeGit)).toBe("deadbeef")
+        expect(await currentHeadSha("/x", fakeGit)).toBe("deadbeef")
         expect(fakeGit).toHaveBeenCalledWith("/x", ["rev-parse", "HEAD"])
     })
 })

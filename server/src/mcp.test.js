@@ -12,6 +12,7 @@ import {
     resetRequestHandler,
     buildMcpServer,
     repoInClientRoots,
+    ROOTS_PROBE_TIMEOUT_MS,
     REQUEST_REVIEW_INPUT_SHAPE,
     RESET_REVIEW_CONTEXT_INPUT_SHAPE,
     __test__,
@@ -577,6 +578,32 @@ describe("reviewRequestHandler — MCP roots check", () => {
         expect(out.structuredContent.code).toBe("ROOTS_FETCH_FAILED")
         expect(out.structuredContent.reason).toMatch(/not supported/)
         expect(logger.warn).toHaveBeenCalled()
+    })
+
+    test("the roots probe rides the tool call's own stream, with a bounded timeout", async () => {
+        const listRoots = jest.fn(async () => ({ roots: [] }))
+        const mcpServer = {
+            server: { getClientCapabilities: () => ({ roots: {} }), listRoots },
+        }
+        for (const handler of [reviewRequestHandler, resetRequestHandler]) {
+            await handler({
+                args: { cwd: "/repo" },
+                ctx: {
+                    config: minimalConfig(),
+                    store,
+                    deps: happyDeps(),
+                    mcpServer,
+                },
+                requestId: 42,
+            })
+        }
+        expect(listRoots).toHaveBeenCalledTimes(2)
+        for (const call of listRoots.mock.calls) {
+            expect(call[1]).toEqual({
+                relatedRequestId: 42,
+                timeout: ROOTS_PROBE_TIMEOUT_MS,
+            })
+        }
     })
 
     test("when client doesn't advertise roots capability, no listRoots call is made", async () => {
