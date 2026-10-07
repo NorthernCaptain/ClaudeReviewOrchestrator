@@ -3,19 +3,18 @@
  * Author: Leo Khramov
  */
 
-// Runtime reviewer-provider switch. PUT /provider { provider } mutates
-// the live in-memory config so the very next review uses the new
-// provider, and best-effort persists the change to the on-disk config
-// file so it survives a restart. Behind the X-Review-Token middleware
-// like every other mutating route.
+// Runtime reviewer-provider switch. PUT /provider { provider } sets
+// reviewer.provider in the live config and in config.json together, so
+// the next admitted review uses the new provider and it survives a
+// restart. Behind the X-Review-Token middleware like every other
+// mutating route.
 //
-// We persist by reading the existing config JSON, setting only
-// reviewer.provider, and writing it back — never serializing the
-// home-expanded, schema-normalized in-memory object (that would
-// rewrite paths and drop comments-by-omission semantics the operator
-// hand-authored).
+// The change goes through the shell's config transaction (a delta merged
+// into a fresh read of config.json, checked, then written atomically) —
+// never a dump of the home-expanded, schema-normalized holder, which
+// would rewrite paths and drop what the operator hand-authored.
 
-import { readFileSync, writeFileSync } from "node:fs"
+import { commitConfigChange, configChangeBody } from "./config.js"
 
 export const VALID_PROVIDERS = ["codex", "claude", "gemini"]
 
@@ -177,47 +176,11 @@ export const REVIEWER_PRESETS = {
     ],
 }
 
-const persistProvider = ({ configPath, provider, fs }) => {
-    const read = fs?.readFileSync ?? readFileSync
-    const write = fs?.writeFileSync ?? writeFileSync
-    const raw = read(configPath, "utf8")
-    const parsed = JSON.parse(raw)
-    if (!parsed.reviewer || typeof parsed.reviewer !== "object") {
-        parsed.reviewer = {}
-    }
-    parsed.reviewer.provider = provider
-    write(configPath, JSON.stringify(parsed, null, 2) + "\n", "utf8")
-}
-
-const persistPreset = ({ configPath, provider, preset, fs }) => {
-    const read = fs?.readFileSync ?? readFileSync
-    const write = fs?.writeFileSync ?? writeFileSync
-    const parsed = JSON.parse(read(configPath, "utf8"))
-    if (provider === "codex") {
-        parsed.codex = {
-            ...(parsed.codex ?? {}),
-            model: preset.model,
-            reasoningEffort: preset.effortOrMode,
-        }
-    } else {
-        parsed.reviewer = { ...(parsed.reviewer ?? {}) }
-        parsed.reviewer[provider] = {
-            ...(parsed.reviewer[provider] ?? {}),
-            model: preset.model,
-            ...(provider === "claude"
-                ? { effort: preset.effortOrMode }
-                : { approvalMode: preset.effortOrMode }),
-        }
-    }
-    write(configPath, JSON.stringify(parsed, null, 2) + "\n", "utf8")
-}
-
-export const handleSetReviewerPreset = ({
+export const handleSetReviewerPreset = async ({
     body,
     config,
-    configPath,
+    configTransaction,
     logger = null,
-    deps = {},
 }) => {
     const provider = config?.reviewer?.provider ?? "codex"
     const preset = REVIEWER_PRESETS[provider]?.find(
@@ -229,58 +192,46 @@ export const handleSetReviewerPreset = ({
             body: { ok: false, error: "unknown model preset", provider },
         }
     }
-    if (provider === "codex") {
-        config.codex = {
-            ...(config.codex ?? {}),
-            model: preset.model,
-            reasoningEffort: preset.effortOrMode,
-        }
-    } else {
-        config.reviewer = { ...(config.reviewer ?? {}) }
-        config.reviewer[provider] = {
-            ...(config.reviewer[provider] ?? {}),
-            model: preset.model,
-            ...(provider === "claude"
-                ? { effort: preset.effortOrMode }
-                : { approvalMode: preset.effortOrMode }),
-        }
-    }
-    let persisted = false
-    let persistError = null
-    try {
-        persistPreset({ configPath, provider, preset, fs: deps.fs })
-        persisted = true
-    } catch (err) {
-        persistError = err?.message ?? String(err)
-        logger?.warn?.(
-            { err: persistError, provider, preset: preset.id },
-            "reviewer model preset switched in memory but failed to persist"
-        )
-    }
-    logger?.info?.(
-        { provider, preset: preset.id, persisted },
-        "reviewer model preset switched"
-    )
+    const delta =
+        provider === "codex"
+            ? [
+                  [["codex", "model"], preset.model],
+                  [["codex", "reasoningEffort"], preset.effortOrMode],
+              ]
+            : [
+                  [["reviewer", provider, "model"], preset.model],
+                  [
+                      [
+                          "reviewer",
+                          provider,
+                          provider === "claude" ? "effort" : "approvalMode",
+                      ],
+                      preset.effortOrMode,
+                  ],
+              ]
+    const result = await commitConfigChange({
+        configTransaction,
+        delta,
+        logger,
+        what: "reviewer preset",
+    })
+    if (!result.ok) return result.response
     return {
         httpStatus: 200,
-        body: {
-            ok: true,
+        body: configChangeBody(result, {
             provider,
             model: preset.model,
             effortOrMode: preset.effortOrMode,
             preset: preset.id,
-            persisted,
-            ...(persistError ? { persistError } : {}),
-        },
+        }),
     }
 }
 
-export const handleSetProvider = ({
+export const handleSetProvider = async ({
     body,
     config,
-    configPath,
+    configTransaction,
     logger = null,
-    deps = {},
 }) => {
     const provider = body?.provider
     if (!provider || typeof provider !== "string") {
@@ -304,55 +255,29 @@ export const handleSetProvider = ({
         }
     }
 
-    const previous = config.reviewer?.provider ?? null
-    // Mutate the live config object in place. Every route was handed
-    // this same reference at mount time, so the next request through
-    // handleReview picks up the new provider immediately.
-    if (!config.reviewer || typeof config.reviewer !== "object") {
-        config.reviewer = {}
-    }
-    config.reviewer.provider = provider
-
-    let persisted = false
-    let persistError = null
-    try {
-        persistProvider({ configPath, provider, fs: deps.fs })
-        persisted = true
-    } catch (err) {
-        persistError = err?.message ?? String(err)
-        logger?.warn?.(
-            { err: persistError, configPath, provider },
-            "provider switched in memory but failed to persist to config file"
-        )
-    }
-
-    logger?.info?.(
-        { previous, provider, persisted },
-        "reviewer provider switched"
-    )
-
+    const previous = config?.reviewer?.provider ?? null
+    const result = await commitConfigChange({
+        configTransaction,
+        delta: [[["reviewer", "provider"], provider]],
+        logger,
+        what: "reviewer provider",
+    })
+    if (!result.ok) return result.response
     return {
         httpStatus: 200,
-        body: {
-            ok: true,
-            provider,
-            previous,
-            persisted,
-            ...(persistError ? { persistError } : {}),
-        },
+        body: configChangeBody(result, { provider, previous }),
     }
 }
 
 // PUT /provider. `getOptions` is read per request
-// ({ config, configPath, logger, deps }).
-export const createProviderHandler = (getOptions) => (req, res) => {
-    const { config, configPath, logger, deps } = getOptions()
-    const result = handleSetProvider({
+// ({ config, configTransaction, logger }).
+export const createProviderHandler = (getOptions) => async (req, res) => {
+    const { config, configTransaction, logger } = getOptions()
+    const result = await handleSetProvider({
         body: req.body,
         config,
-        configPath,
+        configTransaction,
         logger,
-        deps,
     })
     res.status(result.httpStatus).json(result.body)
 }

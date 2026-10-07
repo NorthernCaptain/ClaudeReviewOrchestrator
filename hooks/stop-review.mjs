@@ -618,6 +618,115 @@ const defaultSnapshotForEnv = () =>
 // long Q&A session, a docs-only edit, scratch exploration. The skip is
 // per-claude-invocation; close the CLI and the var is gone, so it
 // can't accidentally disable review for the next session.
+// One POST /review, aborted after `timeoutMs`.
+const postOnce = async ({ fetchFn, url, token, body, timeoutMs }) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    let httpStatus = null
+    let parsed = null
+    let fetchError = null
+    let serverRequestId = null
+    try {
+        const res = await fetchFn(url, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-review-token": token,
+            },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        })
+        httpStatus = res.status
+        // Capture the server's request id so the user can grep the server
+        // log for the matching pipeline trace.
+        try {
+            serverRequestId = res.headers?.get?.("x-request-id") ?? null
+        } catch {
+            serverRequestId = null
+        }
+        try {
+            parsed = await res.json()
+        } catch {
+            parsed = null
+        }
+    } catch (err) {
+        fetchError =
+            err?.name === "AbortError"
+                ? `request timed out after ${timeoutMs}ms`
+                : (err?.message ?? String(err))
+    } finally {
+        clearTimeout(timer)
+    }
+    return { httpStatus, body: parsed, fetchError, serverRequestId }
+}
+
+export const MAX_REVIEW_ATTEMPTS = 3
+
+// POST /review with the limit handshake (hot-reload plan §5.5). Each
+// attempt tells the server the wait limit it's using (`timeoutMs`); a
+// server whose pinned config needs a longer wait answers 409
+// HOOK_LIMIT_STALE with the limit it needs, before doing any work, and the
+// hook resends with it. One overall deadline (start + 29 min) bounds every
+// attempt, so retries and time spent held can't outlast the harness. The
+// third attempt, or an earlier one the remaining budget can't fully cover,
+// carries finalAttempt: true, which the server never answers with a 409.
+// Shared by the Stop hooks and the opencode plugin.
+export const postReview = async ({
+    fetchFn,
+    url,
+    token,
+    requestBody,
+    limitMs,
+    now = Date.now,
+    startedAt = now(),
+    budgetMs = MAX_FETCH_TIMEOUT_MS,
+}) => {
+    const deadline = startedAt + budgetMs
+    let limit = Math.min(limitMs, MAX_FETCH_TIMEOUT_MS)
+    let last = null
+    for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt++) {
+        const remaining = deadline - now()
+        if (remaining <= 0) break
+        const attemptMs = Math.min(limit, remaining)
+        const finalAttempt =
+            attempt === MAX_REVIEW_ATTEMPTS || remaining < limit
+        const body = {
+            ...requestBody,
+            timeoutMs: attemptMs,
+            ...(finalAttempt ? { finalAttempt: true } : {}),
+        }
+        last = {
+            ...(await postOnce({
+                fetchFn,
+                url,
+                token,
+                body,
+                timeoutMs: attemptMs,
+            })),
+            requestBody: body,
+            attempts: attempt,
+            timeoutMs: attemptMs,
+        }
+        const stale =
+            last.httpStatus === 409 &&
+            last.body?.code === "HOOK_LIMIT_STALE" &&
+            Number.isFinite(last.body?.hookTimeoutMs)
+        if (!stale || finalAttempt) return last
+        limit = Math.min(last.body.hookTimeoutMs, MAX_FETCH_TIMEOUT_MS)
+    }
+    return (
+        last ?? {
+            httpStatus: null,
+            body: null,
+            fetchError: "the hook's overall time budget ran out",
+            serverRequestId: null,
+            requestBody,
+            attempts: 0,
+            timeoutMs: 0,
+        }
+    )
+}
+
 export const main = async ({
     stdin = process.stdin,
     stdout = process.stdout,
@@ -744,44 +853,16 @@ export const main = async ({
 
     stderr.write("review-orchestrator: reviewing changes…\n")
 
-    const requestBody = { cwd, session_id, trigger: "stop_hook" }
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs)
-    let httpStatus = null
-    let body = null
-    let fetchError = null
-    let serverRequestId = null
-    try {
-        const res = await fetchFn(targetUrl, {
-            method: "POST",
-            headers: {
-                "content-type": "application/json",
-                "x-review-token": config.token,
-            },
-            body: JSON.stringify(requestBody),
-            signal: controller.signal,
-        })
-        httpStatus = res.status
-        // Capture the server's request id so the user can grep the server
-        // log for the matching pipeline trace.
-        try {
-            serverRequestId = res.headers?.get?.("x-request-id") ?? null
-        } catch {
-            serverRequestId = null
-        }
-        try {
-            body = await res.json()
-        } catch {
-            body = null
-        }
-    } catch (err) {
-        fetchError =
-            err?.name === "AbortError"
-                ? `request timed out after ${effectiveTimeoutMs}ms`
-                : (err?.message ?? String(err))
-    } finally {
-        clearTimeout(timer)
-    }
+    const posted = await postReview({
+        fetchFn,
+        url: targetUrl,
+        token: config.token,
+        requestBody: { cwd, session_id, trigger: "stop_hook" },
+        limitMs: effectiveTimeoutMs,
+        now,
+    })
+    const { httpStatus, body, fetchError, serverRequestId } = posted
+    const requestBody = posted.requestBody
 
     const decision = decideStopHookResponse({
         reviewResponse: body,
@@ -823,6 +904,7 @@ export const main = async ({
         {
             ...decision.logEntry,
             serverRequestId,
+            attempts: posted.attempts,
             snapshot: snapshotPath,
         },
         { now }

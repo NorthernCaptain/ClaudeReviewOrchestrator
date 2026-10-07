@@ -13,7 +13,7 @@ const staging = (over = {}) =>
     Object.freeze({
         resources: { "review/codex-output.schema.json": SCHEMA },
         version: "abc123",
-        shellVersion: "1.2.3",
+        packageVersion: "1.2.3",
         startedAt: 1000,
         codexSchemaPath: null,
         ...over,
@@ -147,7 +147,7 @@ describe("createCore", () => {
         ).toThrow(/unknown reviewer.provider/)
     })
 
-    test("summarizeConfig carries the shell's version", () => {
+    test("summarizeConfig carries the package version", () => {
         const core = createCore(staging())
         expect(core.summarizeConfig({}).version).toBe("1.2.3")
     })

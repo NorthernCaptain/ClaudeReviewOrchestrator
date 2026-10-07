@@ -8,152 +8,97 @@ import {
     SEVERITY_ORDER,
 } from "./blockingSeverities.js"
 
-const fakeFs = (initial) => {
-    let stored = initial
-    return {
-        readFileSync: () => stored,
-        writeFileSync: (_p, data) => {
-            stored = data
-        },
-        read: () => stored,
+// Records each delta and answers like the shell's config transaction.
+const fakeTransaction = (result = { revision: 2, replaced: [] }) => {
+    const tx = async (delta) => {
+        tx.calls.push(delta)
+        return result
     }
+    tx.calls = []
+    return tx
 }
 
-const cfg = (overrides = {}) => ({
-    blockingSeverities: ["blocker", "major"],
-    ...overrides,
-})
+const cfg = () => ({ blockingSeverities: ["blocker", "major"] })
 
 describe("handleSetBlockingSeverities", () => {
     test("exposes the canonical severity order", () => {
         expect(SEVERITY_ORDER).toEqual(["blocker", "major", "minor", "nit"])
     })
 
-    test("400 when value is missing or not an array", () => {
-        const r1 = handleSetBlockingSeverities({ body: {}, config: cfg() })
-        expect(r1.httpStatus).toBe(400)
-        expect(r1.body.ok).toBe(false)
-
-        const r2 = handleSetBlockingSeverities({
-            body: { value: "blocker" },
-            config: cfg(),
-        })
-        expect(r2.httpStatus).toBe(400)
+    test("400 when value is missing or not an array", async () => {
+        const tx = fakeTransaction()
+        for (const body of [{}, { value: "major" }]) {
+            const r = await handleSetBlockingSeverities({
+                body,
+                config: cfg(),
+                configTransaction: tx,
+            })
+            expect(r.httpStatus).toBe(400)
+        }
+        expect(tx.calls).toEqual([])
     })
 
-    test("accepts an empty array as the 'nothing blocks' policy", () => {
-        const config = cfg()
-        const fs = fakeFs(
-            JSON.stringify({ blockingSeverities: ["blocker", "major"] })
-        )
-        const r = handleSetBlockingSeverities({
-            body: { value: [] },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
-        })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body.value).toEqual([])
-        expect(config.blockingSeverities).toEqual([])
-        expect(JSON.parse(fs.read()).blockingSeverities).toEqual([])
-    })
-
-    test("400 when value contains an invalid severity", () => {
-        const r = handleSetBlockingSeverities({
-            body: { value: ["blocker", "bogus"] },
+    test("400 when value contains an invalid severity", async () => {
+        const r = await handleSetBlockingSeverities({
+            body: { value: ["major", "critical"] },
             config: cfg(),
+            configTransaction: fakeTransaction(),
         })
         expect(r.httpStatus).toBe(400)
-        expect(r.body.error).toContain("bogus")
+        expect(r.body.error).toMatch(/critical/)
     })
 
-    test("mutates the live config and persists to disk", () => {
-        const config = cfg()
-        const fs = fakeFs(
-            JSON.stringify(
-                { blockingSeverities: ["blocker", "major"] },
-                null,
-                2
-            )
-        )
-        const r = handleSetBlockingSeverities({
-            body: { value: ["blocker", "major", "minor"] },
-            config,
-            configPath: "/tmp/whatever.json",
-            deps: { fs },
+    test("accepts an empty array as the 'nothing blocks' policy", async () => {
+        const tx = fakeTransaction()
+        const r = await handleSetBlockingSeverities({
+            body: { value: [] },
+            config: cfg(),
+            configTransaction: tx,
         })
         expect(r.httpStatus).toBe(200)
-        expect(r.body).toEqual(
-            expect.objectContaining({
-                ok: true,
-                value: ["blocker", "major", "minor"],
-                previous: ["blocker", "major"],
-                persisted: true,
-            })
-        )
-        expect(config.blockingSeverities).toEqual(["blocker", "major", "minor"])
-        const persisted = JSON.parse(fs.read())
-        expect(persisted.blockingSeverities).toEqual([
-            "blocker",
-            "major",
-            "minor",
+        expect(tx.calls).toEqual([[[["blockingSeverities"], []]]])
+    })
+
+    test("commits the normalized policy through the config transaction", async () => {
+        const tx = fakeTransaction()
+        const r = await handleSetBlockingSeverities({
+            body: { value: ["nit", "blocker", "nit"] },
+            config: cfg(),
+            configTransaction: tx,
+        })
+        expect(tx.calls).toEqual([
+            [[["blockingSeverities"], ["blocker", "nit"]]],
         ])
-    })
-
-    test("normalizes out-of-order / duplicate input into canonical order", () => {
-        const config = cfg()
-        const fs = fakeFs(JSON.stringify({}))
-        const r = handleSetBlockingSeverities({
-            body: { value: ["minor", "blocker", "blocker"] },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
+        expect(r.body).toEqual({
+            ok: true,
+            value: ["blocker", "nit"],
+            previous: ["blocker", "major"],
+            persisted: true,
+            revision: 2,
         })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body.value).toEqual(["blocker", "minor"])
-        expect(config.blockingSeverities).toEqual(["blocker", "minor"])
     })
 
-    test("previous is null when config had no prior array", () => {
-        const config = {}
-        const fs = fakeFs(JSON.stringify({}))
-        const r = handleSetBlockingSeverities({
+    test("previous is null when config had no prior array", async () => {
+        const r = await handleSetBlockingSeverities({
             body: { value: ["blocker"] },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
+            config: {},
+            configTransaction: fakeTransaction(),
         })
-        expect(r.httpStatus).toBe(200)
         expect(r.body.previous).toBeNull()
-        expect(config.blockingSeverities).toEqual(["blocker"])
     })
 
-    test("reports persistError when disk write fails (live still mutates)", () => {
-        const config = cfg()
-        const fs = {
-            readFileSync: () => JSON.stringify({ blockingSeverities: [] }),
-            writeFileSync: () => {
-                throw new Error("EROFS")
+    test("a rejected transaction is the response, with nothing changed", async () => {
+        const r = await handleSetBlockingSeverities({
+            body: { value: ["blocker"] },
+            config: cfg(),
+            configTransaction: async () => {
+                throw new Error("config.json changed while saving — try again")
             },
-        }
-        let warnCalls = 0
-        const r = handleSetBlockingSeverities({
-            body: { value: ["blocker", "major", "minor", "nit"] },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
-            logger: { warn: () => warnCalls++, info: () => {} },
         })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body.ok).toBe(true)
-        expect(r.body.persisted).toBe(false)
-        expect(r.body.persistError).toContain("EROFS")
-        expect(config.blockingSeverities).toEqual([
-            "blocker",
-            "major",
-            "minor",
-            "nit",
-        ])
-        expect(warnCalls).toBe(1)
+        expect(r.httpStatus).toBe(409)
+        expect(r.body).toMatchObject({
+            ok: false,
+            code: "CONFIG_CHANGE_FAILED",
+        })
     })
 })

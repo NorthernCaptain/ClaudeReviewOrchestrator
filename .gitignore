@@ -5,3 +5,4 @@ reviews/
 .DS_Store
 .env
 .env.local
+server/.core-versions/

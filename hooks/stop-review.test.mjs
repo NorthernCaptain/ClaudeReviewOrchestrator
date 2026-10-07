@@ -25,6 +25,8 @@ import {
     main,
     appendLogLine,
     nodeHttpFetch,
+    MAX_REVIEW_ATTEMPTS,
+    postReview,
     stripControl,
     writeCallSnapshot,
 } from "./stop-review.mjs"
@@ -1089,6 +1091,8 @@ describe("main (integration with injected I/O)", () => {
             cwd,
             session_id: "abc",
             trigger: "stop_hook",
+            // The wait limit this attempt uses (the limit handshake).
+            timeoutMs: 660000,
         })
     })
 })
@@ -1193,6 +1197,7 @@ describe("main snapshot wiring", () => {
             cwd,
             session_id: "s1",
             trigger: "stop_hook",
+            timeoutMs: 660000,
         })
         expect(entry.serverResponse.status).toBe(200)
         expect(entry.serverResponse.requestId).toBe("rid-xyz")
@@ -1563,5 +1568,129 @@ describe("nodeHttpFetch", () => {
         } finally {
             srv.close()
         }
+    })
+})
+
+describe("postReview  the limit handshake", () => {
+    // A fake server: answers each attempt from `replies`, recording the
+    // body and how long the attempt was allowed to wait.
+    const fakeFetch = (replies, clock) => {
+        const calls = []
+        const fetchFn = jest.fn(async (_url, init) => {
+            const body = JSON.parse(init.body)
+            calls.push(body)
+            const reply = replies[calls.length - 1] ?? replies.at(-1)
+            if (reply.spendMs) clock.t += reply.spendMs
+            return {
+                status: reply.status,
+                headers: { get: () => null },
+                json: async () => reply.body,
+            }
+        })
+        return { fetchFn, calls }
+    }
+    const stale = (hookTimeoutMs, spendMs = 0) => ({
+        status: 409,
+        body: { status: "ESCALATE", code: "HOOK_LIMIT_STALE", hookTimeoutMs },
+        spendMs,
+    })
+    const ok = { status: 200, body: { status: "GOOD_TO_GO", findings: [] } }
+
+    const run = (replies, opts = {}) => {
+        const clock = { t: 0 }
+        const fake = fakeFetch(replies, clock)
+        return postReview({
+            fetchFn: fake.fetchFn,
+            url: "http://x/review",
+            token: "t",
+            requestBody: { cwd: "/r", trigger: "stop_hook" },
+            limitMs: 660_000,
+            now: () => clock.t,
+            ...opts,
+        }).then((r) => ({ ...r, calls: fake.calls, clock }))
+    }
+
+    test("an unchanged config passes on the first attempt, sending its limit", async () => {
+        const r = await run([ok])
+        expect(r.httpStatus).toBe(200)
+        expect(r.attempts).toBe(1)
+        expect(r.calls).toEqual([
+            { cwd: "/r", trigger: "stop_hook", timeoutMs: 660_000 },
+        ])
+    })
+
+    test("a stale limit resends with the limit the server needs", async () => {
+        const r = await run([stale(900_000), ok])
+        expect(r.httpStatus).toBe(200)
+        expect(r.calls.map((c) => c.timeoutMs)).toEqual([660_000, 900_000])
+        expect(r.calls[1].finalAttempt).toBeUndefined()
+    })
+
+    test("the third attempt is always final, so there's never a fourth", async () => {
+        const r = await run([stale(700_000), stale(800_000), stale(900_000)])
+        expect(MAX_REVIEW_ATTEMPTS).toBe(3)
+        expect(r.calls).toHaveLength(3)
+        expect(r.calls.map((c) => c.finalAttempt === true)).toEqual([
+            false,
+            false,
+            true,
+        ])
+        expect(r.httpStatus).toBe(409)
+    })
+
+    test("time spent held comes out of one budget; the final attempt is capped to it", async () => {
+        const r = await run(
+            [stale(1_000_000, 45_000), stale(1_700_000, 45_000), ok],
+            { budgetMs: 1_740_000 }
+        )
+        // 1 740 000 minus 90 000 spent leaves 1 650 000 < the 1 700 000 needed.
+        expect(r.calls[2]).toMatchObject({
+            timeoutMs: 1_650_000,
+            finalAttempt: true,
+        })
+    })
+
+    test("a budget too short for the required limit goes straight to a final attempt", async () => {
+        const r = await run([stale(1_000_000, 900_000), ok], {
+            budgetMs: 1_200_000,
+        })
+        expect(r.calls[1]).toMatchObject({
+            timeoutMs: 300_000,
+            finalAttempt: true,
+        })
+    })
+
+    test("an exhausted budget sends nothing more", async () => {
+        const r = await run([stale(1_000_000, 2_000_000)], {
+            budgetMs: 1_000_000,
+        })
+        expect(r.calls).toHaveLength(1)
+        expect(r.httpStatus).toBe(409)
+        const none = await postReview({
+            fetchFn: jest.fn(),
+            url: "u",
+            token: "t",
+            requestBody: {},
+            limitMs: 1,
+            budgetMs: 0,
+            now: () => 0,
+        })
+        expect(none).toMatchObject({ httpStatus: null, attempts: 0 })
+        expect(none.fetchError).toMatch(/budget/)
+    })
+
+    test("a network failure is reported, not retried", async () => {
+        const fetchFn = jest.fn(async () => {
+            throw new Error("ECONNREFUSED")
+        })
+        const r = await postReview({
+            fetchFn,
+            url: "u",
+            token: "t",
+            requestBody: {},
+            limitMs: 1000,
+        })
+        expect(fetchFn).toHaveBeenCalledTimes(1)
+        expect(r.fetchError).toBe("ECONNREFUSED")
     })
 })

@@ -3,20 +3,26 @@
  * Author: Leo Khramov
  */
 
-// Shell side of the core boundary (hot-reload plan §5.2–5.4): reads the
-// core's files once, hashes them into a version id, imports the core,
-// checks its contract, then builds and self-checks an instance without
-// attaching it. Startup goes through here; reloads will too.
+// Shell side of the core boundary (hot-reload plan §5.2–5.4): captures
+// the core's files once (re-reading until a multi-file save is over),
+// checks their containment, hashes them into a version id, writes them
+// to an immutable snapshot folder, imports the snapshot, verifies its
+// bytes and checks the contract; then builds and self-checks an instance
+// without attaching it. Startup and reloads both go through here.
 
 import { createHash, randomBytes } from "node:crypto"
 import {
+    mkdirSync as nodeMkdirSync,
     readdirSync as nodeReaddirSync,
     readFileSync as nodeReadFileSync,
+    renameSync as nodeRenameSync,
     rmSync as nodeRmSync,
+    writeFileSync as nodeWriteFileSync,
 } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import path from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
+import { checkContainment, importClosure } from "./containment.js"
 
 // What this shell speaks. A core exporting anything else is refused.
 export const CORE_API = 1
@@ -50,6 +56,14 @@ export const DASHBOARD_MUTATIONS = Object.freeze([
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 export const DEFAULT_CORE_DIR = path.join(here, "core")
+// Snapshots live inside the repo (decision Q1) so their package imports
+// resolve up to the repo's node_modules. Gitignored.
+export const DEFAULT_SNAPSHOT_ROOT = path.join(here, "..", ".core-versions")
+export const OWN_PACKAGE_NAME = "review-orchestrator"
+// What `reviewVersion` covers besides the review entry's import closure.
+export const REVIEW_ENTRY = "review/index.js"
+export const COMPOSITION_ROOT = "index.js"
+const CAPTURE_ATTEMPTS = 3
 export const DEFAULT_CACHE_DIR = path.join(
     homedir(),
     ".cache",
@@ -112,17 +126,161 @@ export const readCoreFiles = (
     return files
 }
 
-// Short sha256 over exactly these bytes (path + content, sorted) plus
-// the package version.
-export const coreVersionId = (files, packageVersion) => {
+const hashFiles = (files, paths, prefix = "") => {
     const hash = createHash("sha256")
-    hash.update(`package\0${packageVersion}\0`)
-    for (const relPath of Object.keys(files).sort()) {
+    hash.update(prefix)
+    for (const relPath of [...paths].sort()) {
         hash.update(`${relPath}\0`)
         hash.update(files[relPath])
         hash.update("\0")
     }
     return hash.digest("hex").slice(0, 16)
+}
+
+// Short sha256 over exactly these bytes (path + content, sorted) plus
+// the package version.
+export const coreVersionId = (files, packageVersion) =>
+    hashFiles(files, Object.keys(files), `package\0${packageVersion}\0`)
+
+// The part of the core a review runs, reads or is wired by: the review
+// entry's static-import closure, every non-JS file under review/, and
+// the composition root. A dashboard-only edit leaves it unchanged.
+export const reviewVersionId = (files) => {
+    const covered = new Set(importClosure(REVIEW_ENTRY, files))
+    covered.add(COMPOSITION_ROOT)
+    for (const relPath of Object.keys(files)) {
+        if (relPath.startsWith("review/") && !relPath.endsWith(".js")) {
+            covered.add(relPath)
+        }
+    }
+    return hashFiles(
+        files,
+        [...covered].filter((p) => Object.hasOwn(files, p))
+    )
+}
+
+// The shell's own source (every non-test .js under server/src outside
+// core/), hashed at startup. It can only change with a restart.
+export const shellVersionId = (
+    shellDir = here,
+    { readdir = nodeReaddirSync, read = nodeReadFileSync } = {}
+) => {
+    const files = {}
+    for (const name of readdir(shellDir)) {
+        if (name.endsWith(".js") && !name.endsWith(".test.js")) {
+            files[name] = read(path.join(shellDir, name))
+        }
+    }
+    return hashFiles(files, Object.keys(files))
+}
+
+const sameFiles = (a, b) => {
+    const keys = Object.keys(a)
+    return (
+        keys.length === Object.keys(b).length &&
+        keys.every(
+            (k) => Object.hasOwn(b, k) && Buffer.compare(a[k], b[k]) === 0
+        )
+    )
+}
+
+// §5.3 steps 1–3a: read every core file once, re-read and compare (a
+// multi-file save in progress shows up as a difference), then check
+// containment and hash. Nothing is written or imported.
+export const captureCore = ({
+    coreDir = DEFAULT_CORE_DIR,
+    packageVersion,
+    readFiles = readCoreFiles,
+} = {}) => {
+    let files = null
+    for (let i = 0; i < CAPTURE_ATTEMPTS && !files; i++) {
+        const first = readFiles(coreDir)
+        if (sameFiles(first, readFiles(coreDir))) files = first
+    }
+    if (!files) {
+        throw new CoreLoadError(
+            "CORE_FILES_CHANGING",
+            "core files kept changing — try again"
+        )
+    }
+    checkContainment(files, { ownName: OWN_PACKAGE_NAME })
+    const resources = {}
+    for (const [relPath, bytes] of Object.entries(files)) {
+        if (!relPath.endsWith(".js")) resources[relPath] = bytes
+    }
+    return {
+        files,
+        version: coreVersionId(files, packageVersion),
+        reviewVersion: reviewVersionId(files),
+        resources: Object.freeze(resources),
+    }
+}
+
+// §5.3 step 4: a fresh `<id>-<nonce>` folder every time, never reused,
+// written under a temporary name and renamed so a half-written snapshot
+// never exists.
+export const writeSnapshot = ({
+    files,
+    version,
+    root = DEFAULT_SNAPSHOT_ROOT,
+    nonce = randomBytes(6).toString("hex"),
+    fs = {},
+}) => {
+    const mkdir = fs.mkdirSync ?? nodeMkdirSync
+    const write = fs.writeFileSync ?? nodeWriteFileSync
+    const rename = fs.renameSync ?? nodeRenameSync
+    const name = `${version}-${nonce}`
+    const tmp = path.join(root, `.tmp-${name}`)
+    for (const [relPath, bytes] of Object.entries(files)) {
+        const target = path.join(tmp, relPath)
+        mkdir(path.dirname(target), { recursive: true })
+        write(target, bytes)
+    }
+    const dir = path.join(root, name)
+    rename(tmp, dir)
+    return dir
+}
+
+export const removeSnapshot = (dir, { rm = nodeRmSync } = {}) => {
+    if (dir) rm(dir, { recursive: true, force: true })
+}
+
+// §5.3 step 6: the folder must still hold exactly the captured bytes.
+export const verifySnapshot = (
+    dir,
+    files,
+    { readFiles = readCoreFiles } = {}
+) => {
+    if (!sameFiles(files, readFiles(dir))) {
+        throw new CoreLoadError(
+            "CORE_SNAPSHOT_MODIFIED",
+            `core snapshot ${path.basename(dir)} changed between its write and import`
+        )
+    }
+}
+
+// Startup cleanup: every snapshot folder but `keep` (and any temporary
+// leftover) belongs to a core that no longer runs.
+export const pruneSnapshots = ({
+    root = DEFAULT_SNAPSHOT_ROOT,
+    keep = null,
+    readdir = nodeReaddirSync,
+    rm = nodeRmSync,
+} = {}) => {
+    let names
+    try {
+        names = readdir(root)
+    } catch {
+        return 0
+    }
+    let removed = 0
+    for (const name of names) {
+        const dir = path.join(root, name)
+        if (dir === keep) continue
+        rm(dir, { recursive: true, force: true })
+        removed++
+    }
+    return removed
 }
 
 export const checkModuleContract = (mod) => {
@@ -151,7 +309,13 @@ export const checkModuleContract = (mod) => {
 const checkInstanceContract = (core) => {
     const missing = []
     if (core?.api !== CORE_API) missing.push("api")
-    for (const fn of ["selfCheck", "attach", "dispose", "summarizeConfig"]) {
+    for (const fn of [
+        "selfCheck",
+        "attach",
+        "dispose",
+        "summarizeConfig",
+        "validateConfig",
+    ]) {
         if (typeof core?.[fn] !== "function") missing.push(fn)
     }
     for (const key of CORE_ROUTES) {
@@ -180,27 +344,62 @@ const checkInstanceContract = (core) => {
     }
 }
 
-// Reads the core's files, imports its entry and checks the contract.
-// Phase 3 imports from an immutable snapshot of exactly these bytes.
+// Imports a captured core: from a fresh snapshot folder (verified after
+// the import), or straight from `coreDir` when `snapshotRoot` is null
+// (embedders and tests that never reload). A failure removes the folder.
+export const importCore = async ({
+    captured,
+    coreDir = DEFAULT_CORE_DIR,
+    snapshotRoot = DEFAULT_SNAPSHOT_ROOT,
+    importModule = (url) => import(url),
+    readFiles = readCoreFiles,
+    snapshotFs = {},
+}) => {
+    const snapshotDir = snapshotRoot
+        ? writeSnapshot({
+              files: captured.files,
+              version: captured.version,
+              root: snapshotRoot,
+              fs: snapshotFs,
+          })
+        : null
+    try {
+        const mod = await importModule(
+            pathToFileURL(path.join(snapshotDir ?? coreDir, "index.js")).href
+        )
+        if (snapshotDir)
+            verifySnapshot(snapshotDir, captured.files, { readFiles })
+        checkModuleContract(mod)
+        return { module: mod, snapshotDir }
+    } catch (err) {
+        removeSnapshot(snapshotDir)
+        throw err
+    }
+}
+
+// Capture + import in one step: { module, version, reviewVersion,
+// resources, snapshotDir }.
 export const loadCoreModule = async ({
     coreDir = DEFAULT_CORE_DIR,
     packageVersion,
+    snapshotRoot = DEFAULT_SNAPSHOT_ROOT,
     readFiles = readCoreFiles,
     importModule = (url) => import(url),
 } = {}) => {
-    const files = readFiles(coreDir)
-    const mod = await importModule(
-        pathToFileURL(path.join(coreDir, "index.js")).href
-    )
-    checkModuleContract(mod)
-    const resources = {}
-    for (const [relPath, bytes] of Object.entries(files)) {
-        if (!relPath.endsWith(".js")) resources[relPath] = bytes
-    }
+    const captured = captureCore({ coreDir, packageVersion, readFiles })
+    const { module: mod, snapshotDir } = await importCore({
+        captured,
+        coreDir,
+        snapshotRoot,
+        importModule,
+        readFiles,
+    })
     return {
         module: mod,
-        version: coreVersionId(files, packageVersion),
-        resources: Object.freeze(resources),
+        version: captured.version,
+        reviewVersion: captured.reviewVersion,
+        resources: captured.resources,
+        snapshotDir,
     }
 }
 
@@ -218,7 +417,8 @@ const deepFreeze = (value) => {
 export const prepareCore = ({
     loaded,
     config,
-    shellVersion,
+    packageVersion,
+    shellVersion = null,
     startedAt,
     codexSchemaPath,
 }) => {
@@ -226,7 +426,9 @@ export const prepareCore = ({
         Object.freeze({
             resources: loaded.resources,
             version: loaded.version,
+            reviewVersion: loaded.reviewVersion ?? null,
             shellVersion,
+            packageVersion,
             startedAt,
             codexSchemaPath,
         })
@@ -286,14 +488,20 @@ export const createCoreHolder = (initial) => {
     return { current: () => current }
 }
 
-// Loads the default core for `config` (already validated) with an
-// ephemeral codex schema path. For startServer callers that bring none.
-export const loadDefaultCore = async ({ config, shellVersion, startedAt }) => {
-    const loaded = await loadCoreModule({ packageVersion: shellVersion })
+// Loads the default core for `config` (already validated) straight from
+// its source folder, with no snapshot and an ephemeral codex schema
+// path. For startServer callers that bring none and never reload.
+export const loadDefaultCore = async ({
+    config,
+    packageVersion,
+    startedAt,
+}) => {
+    const loaded = await loadCoreModule({ packageVersion, snapshotRoot: null })
     return prepareCore({
         loaded,
         config,
-        shellVersion,
+        packageVersion,
+        shellVersion: shellVersionId(),
         startedAt,
         codexSchemaPath: ephemeralCodexSchemaPath(loaded.version),
     })

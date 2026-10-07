@@ -9,126 +9,108 @@ import {
     MAX_MAX_ROUNDS,
 } from "./maxRounds.js"
 
-const fakeFs = (initial) => {
-    let stored = initial
-    return {
-        readFileSync: () => stored,
-        writeFileSync: (_p, data) => {
-            stored = data
-        },
-        read: () => stored,
+// Records each delta and answers like the shell's config transaction.
+const fakeTransaction = (result = { revision: 4, replaced: [] }) => {
+    const tx = async (delta) => {
+        tx.calls.push(delta)
+        return result
     }
+    tx.calls = []
+    return tx
 }
 
-const cfg = (overrides = {}) => ({
-    limits: { maxCodexRounds: 5 },
-    reviewer: {},
-    ...overrides,
-})
+const cfg = () => ({ limits: { maxCodexRounds: 5 }, reviewer: {} })
 
 describe("handleSetMaxRounds", () => {
-    test("400 when value is missing or non-numeric", () => {
-        const r1 = handleSetMaxRounds({ body: {}, config: cfg() })
-        expect(r1.httpStatus).toBe(400)
-        expect(r1.body.ok).toBe(false)
-
-        const r2 = handleSetMaxRounds({
-            body: { value: "x" },
-            config: cfg(),
-        })
-        expect(r2.httpStatus).toBe(400)
+    test("400 when value is missing or non-numeric, without a transaction", async () => {
+        const tx = fakeTransaction()
+        for (const body of [{}, { value: "x" }, { value: Infinity }]) {
+            const r = await handleSetMaxRounds({
+                body,
+                config: cfg(),
+                configTransaction: tx,
+            })
+            expect(r.httpStatus).toBe(400)
+            expect(r.body.ok).toBe(false)
+        }
+        expect(tx.calls).toEqual([])
     })
 
-    test("400 when value is out of range", () => {
-        const below = handleSetMaxRounds({
-            body: { value: MIN_MAX_ROUNDS - 1 },
-            config: cfg(),
-        })
-        expect(below.httpStatus).toBe(400)
-        const above = handleSetMaxRounds({
-            body: { value: MAX_MAX_ROUNDS + 1 },
-            config: cfg(),
-        })
-        expect(above.httpStatus).toBe(400)
+    test("400 when value is out of range", async () => {
+        const tx = fakeTransaction()
+        for (const value of [MIN_MAX_ROUNDS - 1, MAX_MAX_ROUNDS + 1]) {
+            const r = await handleSetMaxRounds({
+                body: { value },
+                config: cfg(),
+                configTransaction: tx,
+            })
+            expect(r.httpStatus).toBe(400)
+        }
+        expect(tx.calls).toEqual([])
     })
 
-    test("mutates the live config and persists to disk", () => {
-        const config = cfg()
-        const fs = fakeFs(
-            JSON.stringify({ limits: { maxCodexRounds: 5 } }, null, 2)
-        )
-        const r = handleSetMaxRounds({
+    test("commits limits.maxCodexRounds through the config transaction", async () => {
+        const tx = fakeTransaction()
+        const r = await handleSetMaxRounds({
             body: { value: 12 },
-            config,
-            configPath: "/tmp/whatever.json",
-            deps: { fs },
+            config: cfg(),
+            configTransaction: tx,
         })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body).toEqual(
-            expect.objectContaining({
+        expect(tx.calls).toEqual([[[["limits", "maxCodexRounds"], 12]]])
+        expect(r).toEqual({
+            httpStatus: 200,
+            body: {
                 ok: true,
                 value: 12,
                 previous: 5,
                 persisted: true,
-            })
-        )
-        expect(config.limits.maxCodexRounds).toBe(12)
-        const persisted = JSON.parse(fs.read())
-        expect(persisted.limits.maxCodexRounds).toBe(12)
-    })
-
-    test("truncates non-integer numeric input before applying", () => {
-        const config = cfg()
-        const fs = fakeFs(
-            JSON.stringify({ limits: { maxCodexRounds: 5 } }, null, 2)
-        )
-        const r = handleSetMaxRounds({
-            body: { value: 7.9 },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
-        })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body.value).toBe(7)
-        expect(config.limits.maxCodexRounds).toBe(7)
-    })
-
-    test("reports persistError when disk write fails (live still mutates)", () => {
-        const config = cfg()
-        const fs = {
-            readFileSync: () =>
-                JSON.stringify({ limits: { maxCodexRounds: 5 } }),
-            writeFileSync: () => {
-                throw new Error("EROFS")
+                revision: 4,
             },
-        }
-        let warnCalls = 0
-        const r = handleSetMaxRounds({
-            body: { value: 9 },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
-            logger: { warn: () => warnCalls++, info: () => {} },
         })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body.ok).toBe(true)
-        expect(r.body.persisted).toBe(false)
-        expect(r.body.persistError).toContain("EROFS")
-        expect(config.limits.maxCodexRounds).toBe(9)
-        expect(warnCalls).toBe(1)
     })
 
-    test("creates limits block when it doesn't exist in the source config", () => {
-        const config = {}
-        const fs = fakeFs(JSON.stringify({}))
-        const r = handleSetMaxRounds({
-            body: { value: 3 },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
+    test("truncates non-integer input; previous is null without a limits block", async () => {
+        const tx = fakeTransaction()
+        const r = await handleSetMaxRounds({
+            body: { value: 7.9 },
+            config: {},
+            configTransaction: tx,
         })
-        expect(r.httpStatus).toBe(200)
-        expect(config.limits.maxCodexRounds).toBe(3)
-        expect(JSON.parse(fs.read()).limits.maxCodexRounds).toBe(3)
+        expect(r.body).toMatchObject({ value: 7, previous: null })
+    })
+
+    test("reports a manual edit the change replaced", async () => {
+        const replaced = [{ key: "limits.maxCodexRounds", manualValue: 9 }]
+        const r = await handleSetMaxRounds({
+            body: { value: 3 },
+            config: cfg(),
+            configTransaction: fakeTransaction({ revision: 1, replaced }),
+        })
+        expect(r.body.replacedManualEdits).toEqual(replaced)
+    })
+
+    test("a rejected transaction is the response, with nothing changed", async () => {
+        const err = Object.assign(new Error("config.json isn't valid JSON"), {
+            code: "CONFIG_FILE_INVALID",
+            httpStatus: 409,
+        })
+        const warn = []
+        const r = await handleSetMaxRounds({
+            body: { value: 3 },
+            config: cfg(),
+            configTransaction: async () => {
+                throw err
+            },
+            logger: { warn: (...a) => warn.push(a), info() {} },
+        })
+        expect(r).toEqual({
+            httpStatus: 409,
+            body: {
+                ok: false,
+                error: "config.json isn't valid JSON",
+                code: "CONFIG_FILE_INVALID",
+            },
+        })
+        expect(warn).toHaveLength(1)
     })
 })

@@ -4,7 +4,19 @@
  */
 
 import { jest } from "@jest/globals"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { createConfigStore } from "../config-store.js"
 import { createUiEntry } from "./routes.js"
+
+let dir
+beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "routes-"))
+})
+afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+})
 
 const mkRes = () => {
     const res = { headers: {}, statusCode: 200, body: null }
@@ -26,17 +38,6 @@ const mkRes = () => {
     return res
 }
 
-const memoryFs = (initial) => {
-    const files = { "/cfg.json": JSON.stringify(initial) }
-    return {
-        files,
-        readFileSync: (p) => files[p],
-        writeFileSync: (p, data) => {
-            files[p] = data
-        },
-    }
-}
-
 const makeLive = () => {
     const contexts = [
         {
@@ -53,9 +54,20 @@ const makeLive = () => {
         limits: { maxCodexRounds: 5, maxBlocks: 6 },
         blockingSeverities: ["blocker", "major"],
     }
+    // The shell's real config holder over a temp config.json.
+    const configPath = path.join(dir, "config.json")
+    writeFileSync(configPath, JSON.stringify(config))
+    const configStore = createConfigStore({
+        configPath,
+        initial: config,
+        checks: () => ({ validate: (raw) => raw, selfCheck: () => {} }),
+    })
     return {
-        config,
-        configPath: "/cfg.json",
+        get config() {
+            return configStore.current()
+        },
+        configTransaction: (delta) => configStore.mutate(delta),
+        readFile: () => JSON.parse(readFileSync(configPath, "utf8")),
         store: {
             list: () => contexts,
             reset: jest.fn(() => ({
@@ -70,14 +82,14 @@ const makeLive = () => {
         metrics: null,
         logger: { info() {}, warn() {}, error() {} },
         registries: { inflightMeta: new Map() },
-        deps: { fs: memoryFs(config) },
+        deps: {},
     }
 }
 
 const entry = (live) =>
     createUiEntry({
         getLive: () => live,
-        shellVersion: "1.2.3",
+        packageVersion: "1.2.3",
         startedAt: 0,
     })
 
@@ -119,15 +131,15 @@ describe("createUiEntry — dashboard mutations", () => {
             ["blocker"],
         ],
     ])(
-        "%s mutates the live config and persists to its configPath",
+        "%s commits to the live holder and config.json through a transaction",
         async (key, body, read, expected) => {
             const live = makeLive()
             const res = mkRes()
             await entry(live).routes.dashboardMutations[key]({ body }, res)
             expect(res.statusCode).toBe(200)
+            expect(res.body.revision).toBe(1)
             expect(read(live.config)).toEqual(expected)
-            const onDisk = JSON.parse(live.deps.fs.files["/cfg.json"])
-            expect(read(onDisk)).toEqual(expected)
+            expect(read(live.readFile())).toEqual(expected)
         }
     )
 
@@ -151,14 +163,14 @@ describe("createUiEntry — dashboard mutations", () => {
 })
 
 describe("createUiEntry — pages and probes", () => {
-    test("the dashboard page renders with the shell's version", () => {
+    test("the dashboard page renders with the package version", () => {
         const res = mkRes()
         entry(makeLive()).routes.dashboardPage({}, res)
         expect(res.statusCode).toBe(200)
         expect(res.body).toContain("v1.2.3")
     })
 
-    test("status reports the shell's version and start time", () => {
+    test("status reports the package version and start time", () => {
         const res = mkRes()
         entry(makeLive()).routes.status({}, res)
         expect(res.body).toMatchObject({ ok: true, version: "1.2.3" })
@@ -169,7 +181,7 @@ describe("createUiEntry — pages and probes", () => {
         let live = makeLive()
         const ui = createUiEntry({
             getLive: () => live,
-            shellVersion: "1",
+            packageVersion: "1",
             startedAt: 0,
         })
         const meta = {

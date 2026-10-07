@@ -14,22 +14,31 @@ import { createOutputSchema, OUTPUT_SCHEMA_RESOURCE } from "./schema.js"
 
 // The review half of a core. `resources` are the bytes the shell read at
 // load; `getLive` returns the attached live capabilities.
-export const createReviewEntry = ({ resources, codexSchemaPath, getLive }) => {
+// `versions` ({ reviewVersion, shellVersion, coreVersion }) feed the review
+// key and the duplicate key.
+export const createReviewEntry = ({
+    resources,
+    codexSchemaPath,
+    versions = {},
+    getLive,
+}) => {
     const bytes = resources?.[OUTPUT_SCHEMA_RESOURCE]
     if (!bytes) {
         throw new Error(`core resource missing: ${OUTPUT_SCHEMA_RESOURCE}`)
     }
     const schema = createOutputSchema(bytes, { strictPath: codexSchemaPath })
-    const options = () => {
+    // A review runs on the config the shell pinned when it admitted it.
+    const options = (request) => {
         const live = getLive()
         return {
-            config: live.config,
+            config: request?.config ?? live.config,
             store: live.store,
             archive: live.archive,
             logger: live.logger,
             deps: live.deps,
             metrics: live.metrics,
             schema,
+            versions,
         }
     }
     return {
@@ -37,11 +46,11 @@ export const createReviewEntry = ({ resources, codexSchemaPath, getLive }) => {
         routes: { review: createReviewHandler(options) },
         mcp: {
             toolDef: REQUEST_REVIEW_TOOL,
-            requestReview: ({ args, requestId, mcpServer }) =>
+            requestReview: ({ args, requestId, mcpServer, request }) =>
                 reviewRequestHandler({
                     args,
                     requestId,
-                    ctx: { ...options(), mcpServer },
+                    ctx: { ...options(request), mcpServer },
                 }),
         },
         // Pure: throws when this config can't run a review on this core.

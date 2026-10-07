@@ -264,6 +264,8 @@ describe("event hook (session.idle → review)", () => {
             cwd: "/other/repo",
             session_id: "ses_1",
             trigger: "stop_hook",
+            // Sent through the shared client, with its wait limit.
+            timeoutMs: 660000,
         })
         expect(client.calls.prompts).toEqual([])
     })

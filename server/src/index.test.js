@@ -5,7 +5,13 @@
 
 import { jest } from "@jest/globals"
 import { execFileSync } from "node:child_process"
-import { mkdtempSync, realpathSync, rmSync } from "node:fs"
+import {
+    mkdtempSync,
+    readFileSync,
+    realpathSync,
+    rmSync,
+    writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -13,6 +19,7 @@ import {
     startServer,
     gracefulShutdown,
     checkReviewerEnv,
+    requestDeadline,
     VERSION,
 } from "./index.js"
 import { loadDefaultCore } from "./core-loader.js"
@@ -87,28 +94,42 @@ const makeStore = () => {
 
 const silentLog = { info: jest.fn(), error: jest.fn(), warn: jest.fn() }
 
+// Every server gets its own temp config.json, so a dashboard edit can
+// never reach the real ~/.config/review-orchestrator/config.json.
 const start = async (config, deps = happyDeps, providedStore = null) => {
     const store = providedStore ?? makeStore()
-    const r = await startServer({ config, store, deps, log: silentLog })
-    if (!r.ok) {
-        if (!providedStore)
+    const configDir = mkdtempSync(path.join(tmpdir(), "index-config-"))
+    const configPath = path.join(configDir, "config.json")
+    writeFileSync(configPath, JSON.stringify(config, null, 2))
+    const cleanup = () => {
+        rmSync(configDir, { recursive: true, force: true })
+        if (!providedStore) {
             rmSync(store.__dir, { recursive: true, force: true })
+        }
+    }
+    const r = await startServer({
+        config,
+        store,
+        deps,
+        log: silentLog,
+        configPath,
+    })
+    if (!r.ok) {
+        cleanup()
         throw r.error
     }
     return {
         server: r.server,
+        app: r.app,
         store,
+        configPath,
+        readConfigFile: () => JSON.parse(readFileSync(configPath, "utf8")),
         url: `http://127.0.0.1:${r.address.port}`,
         port: r.address.port,
         close: () =>
             new Promise((res) => {
                 r.server.close(() => {
-                    if (!providedStore) {
-                        rmSync(store.__dir, {
-                            recursive: true,
-                            force: true,
-                        })
-                    }
+                    cleanup()
                     res()
                 })
             }),
@@ -179,10 +200,28 @@ describe("startServer without injected capabilities", () => {
             expect(reset.status).toBe(200)
             expect((await reset.json()).context.branch).toBe("main")
             expect((await post("/notify-change")).status).toBe(200)
-            const { spawn } = r.app.locals.live.deps
-            expect(() => spawn(process.execPath, [], {})).toThrow(
-                expect.objectContaining({ code: "TOOL_IS_NODE" })
+            // Reviewers run only with a config the shell pinned to an
+            // admitted review, and never as a Node executable.
+            const { spawnTool } = r.app.locals.live.deps
+            expect(() =>
+                spawnTool("codex", [], { config: { codex: {} } })
+            ).toThrow(
+                expect.objectContaining({ code: "TOOL_CONFIG_NOT_ISSUED" })
             )
+            const ticket = await r.app.locals.reloads.admitReview()
+            try {
+                const nodeConfig = {
+                    ...ticket.config,
+                    codex: { binary: process.execPath },
+                }
+                expect(() =>
+                    spawnTool("codex", [], { config: nodeConfig })
+                ).toThrow(
+                    expect.objectContaining({ code: "TOOL_CONFIG_NOT_ISSUED" })
+                )
+            } finally {
+                ticket.release()
+            }
         } finally {
             await new Promise((done) => r.server.close(done))
             rmSync(store.__dir, { recursive: true, force: true })
@@ -288,22 +327,10 @@ describe("createApp wiring", () => {
         }
     })
 
-    test("PUT /dashboard/provider switches in-memory without a token (v0.1.35)", async () => {
-        // Inject a fake fs so handleSetProvider's persistence step
-        // doesn't touch the real ~/.config/review-orchestrator/config.json
-        // when the test exercises the endpoint.
-        let writtenJson = null
-        const fakeFs = {
-            readFileSync: () =>
-                JSON.stringify({ reviewer: { provider: "codex" } }),
-            writeFileSync: (_p, data) => {
-                writtenJson = data
-            },
-        }
+    test("PUT /dashboard/provider switches the live config and the file without a token (v0.1.35)", async () => {
         const cfg = minimalConfig({ reviewer: { provider: "codex" } })
-        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+        const { url, app, readConfigFile, close } = await start(cfg)
         try {
-            expect(cfg.reviewer?.provider).toBe("codex")
             const r = await fetch(`${url}/dashboard/provider`, {
                 method: "PUT",
                 headers: { "content-type": "application/json" },
@@ -313,19 +340,15 @@ describe("createApp wiring", () => {
             const body = await r.json()
             expect(body.ok).toBe(true)
             expect(body.provider).toBe("gemini")
-            expect(cfg.reviewer.provider).toBe("gemini")
-            // Persistence wrote through the fake fs, not the real file.
-            expect(writtenJson).toMatch(/"provider": "gemini"/)
+            expect(app.locals.live.config.reviewer.provider).toBe("gemini")
+            expect(readConfigFile().reviewer.provider).toBe("gemini")
         } finally {
             await close()
         }
     })
 
     test("PUT /dashboard/provider rejects an unknown provider with 400", async () => {
-        const { url, close } = await start(minimalConfig(), {
-            ...happyDeps,
-            fs: { readFileSync: () => "{}", writeFileSync: () => {} },
-        })
+        const { url, close } = await start(minimalConfig())
         try {
             const r = await fetch(`${url}/dashboard/provider`, {
                 method: "PUT",
@@ -341,19 +364,8 @@ describe("createApp wiring", () => {
     })
 
     test("PUT /dashboard/reviewer-preset updates the active provider's model and effort", async () => {
-        let writtenJson = null
-        const fakeFs = {
-            readFileSync: () =>
-                JSON.stringify({
-                    codex: { model: "gpt-6.1-sol", reasoningEffort: "high" },
-                    reviewer: { provider: "codex" },
-                }),
-            writeFileSync: (_p, data) => {
-                writtenJson = data
-            },
-        }
         const cfg = minimalConfig({ reviewer: { provider: "codex" } })
-        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+        const { url, app, readConfigFile, close } = await start(cfg)
         try {
             const r = await fetch(`${url}/dashboard/reviewer-preset`, {
                 method: "PUT",
@@ -366,27 +378,21 @@ describe("createApp wiring", () => {
                 model: "gpt-6-astra",
                 effortOrMode: "medium",
             })
-            expect(cfg.codex).toMatchObject({
-                model: "gpt-6-astra",
-                reasoningEffort: "medium",
-            })
-            expect(writtenJson).toMatch(/"reasoningEffort": "medium"/)
+            for (const config of [app.locals.live.config, readConfigFile()]) {
+                expect(config.codex).toMatchObject({
+                    model: "gpt-6-astra",
+                    reasoningEffort: "medium",
+                })
+            }
         } finally {
             await close()
         }
     })
 
-    test("PUT /dashboard/max-rounds switches in-memory and persists (v1.1.8)", async () => {
-        let writtenJson = null
-        const fakeFs = {
-            readFileSync: () =>
-                JSON.stringify({ limits: { maxCodexRounds: 5 } }),
-            writeFileSync: (_p, data) => {
-                writtenJson = data
-            },
-        }
-        const cfg = minimalConfig({ limits: { maxCodexRounds: 5 } })
-        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+    test("PUT /dashboard/max-rounds switches the live config and the file (v1.1.8)", async () => {
+        const cfg = minimalConfig()
+        cfg.limits.maxCodexRounds = 5
+        const { url, app, readConfigFile, close } = await start(cfg)
         try {
             const r = await fetch(`${url}/dashboard/max-rounds`, {
                 method: "PUT",
@@ -398,18 +404,15 @@ describe("createApp wiring", () => {
             expect(body.ok).toBe(true)
             expect(body.value).toBe(8)
             expect(body.previous).toBe(5)
-            expect(cfg.limits.maxCodexRounds).toBe(8)
-            expect(writtenJson).toMatch(/"maxCodexRounds": 8/)
+            expect(app.locals.live.config.limits.maxCodexRounds).toBe(8)
+            expect(readConfigFile().limits.maxCodexRounds).toBe(8)
         } finally {
             await close()
         }
     })
 
     test("PUT /dashboard/max-rounds rejects out-of-range with 400", async () => {
-        const { url, close } = await start(minimalConfig(), {
-            ...happyDeps,
-            fs: { readFileSync: () => "{}", writeFileSync: () => {} },
-        })
+        const { url, close } = await start(minimalConfig())
         try {
             const r = await fetch(`${url}/dashboard/max-rounds`, {
                 method: "PUT",
@@ -980,6 +983,101 @@ describe("VERSION", () => {
         expect(VERSION.length).toBeGreaterThan(0)
         // Should match major.minor.patch (allowing pre-release suffix).
         expect(VERSION).toMatch(/^\d+\.\d+\.\d+(-.+)?$/)
+    })
+})
+
+describe("/review — the limit handshake and request deadline", () => {
+    const post = (url, body) =>
+        fetch(`${url}/review`, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-review-token": "secret",
+            },
+            body: JSON.stringify({ cwd: "/repo", ...body }),
+        })
+    const withSpy = () => {
+        const runAndParse = jest.fn(happyDeps.runAndParse)
+        return { deps: { ...happyDeps, runAndParse }, runAndParse }
+    }
+
+    test("an unchanged-config hook limit passes at once", async () => {
+        const { deps, runAndParse } = withSpy()
+        const { url, close } = await start(minimalConfig(), deps)
+        try {
+            // codexTimeoutSeconds 240 → the hooks wait 300 s.
+            const r = await post(url, {
+                trigger: "stop_hook",
+                timeoutMs: 300_000,
+            })
+            expect(r.status).toBe(200)
+            expect((await r.json()).status).toBe("GOOD_TO_GO")
+            expect(runAndParse).toHaveBeenCalledTimes(1)
+        } finally {
+            await close()
+        }
+    })
+
+    test("a limit too short for the pinned config is answered 409 HOOK_LIMIT_STALE before any work", async () => {
+        const { deps, runAndParse } = withSpy()
+        const { url, close } = await start(minimalConfig(), deps)
+        try {
+            const r = await post(url, {
+                trigger: "stop_hook",
+                timeoutMs: 60_000,
+            })
+            expect(r.status).toBe(409)
+            expect(await r.json()).toMatchObject({
+                status: "ESCALATE",
+                code: "HOOK_LIMIT_STALE",
+                hookTimeoutMs: 300_000,
+                notifyUser: false,
+            })
+            expect(runAndParse).not.toHaveBeenCalled()
+            // A final attempt is never answered with a 409.
+            const last = await post(url, {
+                trigger: "stop_hook",
+                timeoutMs: 60_000,
+                finalAttempt: true,
+            })
+            expect(last.status).toBe(200)
+            expect(runAndParse).toHaveBeenCalledTimes(1)
+        } finally {
+            await close()
+        }
+    })
+
+    test("a pinned hook.fetchTimeoutSeconds shorter than the reviewer timeout is respected", async () => {
+        const { deps } = withSpy()
+        const { url, close } = await start(
+            minimalConfig({ hook: { fetchTimeoutSeconds: 90 } }),
+            deps
+        )
+        try {
+            const r = await post(url, {
+                trigger: "stop_hook",
+                timeoutMs: 90_000,
+            })
+            expect(r.status).toBe(200)
+        } finally {
+            await close()
+        }
+    })
+
+    test("MCP-style requests without timeoutMs skip the handshake", async () => {
+        const { deps } = withSpy()
+        const { url, close } = await start(minimalConfig(), deps)
+        try {
+            expect((await post(url, { trigger: "mcp_tool" })).status).toBe(200)
+        } finally {
+            await close()
+        }
+    })
+
+    test("the deadline keeps a response margin of min(5 s, limit / 10)", () => {
+        expect(requestDeadline(1000, null)).toBeNull()
+        expect(requestDeadline(0, 3000)).toBe(2700)
+        expect(requestDeadline(0, 600_000)).toBe(595_000)
     })
 })
 

@@ -253,6 +253,7 @@ export const reviewRequestHandler = async ({
         mcpServer,
         metrics = null,
         schema = null,
+        versions = {},
     },
     requestId,
 }) => {
@@ -281,6 +282,7 @@ export const reviewRequestHandler = async ({
         logger,
         deps: policy.deps,
         schema,
+        ...versions,
         now,
     })
     if (metrics) metrics.record(result.body)

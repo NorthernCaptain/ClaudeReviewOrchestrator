@@ -140,6 +140,10 @@ export const createTools = ({
     getGitTimeoutMs = () => DEFAULT_GIT_TIMEOUT_MS,
     nodeCheck = isNodeExecutable,
     locate = locateExecutable,
+    // (config) → true for a config the shell pinned to an admitted review.
+    // When given, the reviewer tools run only with one of those, so a core
+    // can't pick a binary from a config it assembled itself.
+    isIssuedConfig = null,
     setTimer = setTimeout,
     clearTimer = clearTimeout,
     killGraceMs = KILL_GRACE_MS,
@@ -155,6 +159,12 @@ export const createTools = ({
                 throw new ToolError(
                     "TOOL_CONFIG_REQUIRED",
                     `${name} needs the caller's pinned config`
+                )
+            }
+            if (isIssuedConfig && !isIssuedConfig(config)) {
+                throw new ToolError(
+                    "TOOL_CONFIG_NOT_ISSUED",
+                    `${name} needs the config the shell pinned to this review`
                 )
             }
             binary = REVIEWER_TOOLS[name](config)
@@ -259,24 +269,3 @@ export const createTools = ({
 
     return { execTool, spawnTool, git, resolveBinary }
 }
-
-// A spawn-compatible guard for adapters that still receive a concrete
-// binary: execs the located path, refusing Node executables.
-export const createGuardedSpawn =
-    ({
-        spawn = nodeSpawn,
-        nodeCheck = isNodeExecutable,
-        locate = locateExecutable,
-    } = {}) =>
-    (binary, args, opts = {}) =>
-        spawn(
-            resolveRunnable(binary, {
-                cwd: opts.cwd,
-                env: opts.env,
-                label: "a reviewer",
-                locate,
-                nodeCheck,
-            }),
-            args,
-            opts
-        )

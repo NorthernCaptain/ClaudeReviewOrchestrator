@@ -34,10 +34,10 @@ const short = (s, n = 12) =>
     typeof s === "string" && s.length > n ? s.slice(0, n) : (s ?? null)
 
 // Stable hash of the review-policy fields that change the meaning of a
-// review result without necessarily changing the prompt bytes. The
-// unchanged-baseline check requires this hash to match what was stored
-// alongside lastBaseline; if any of these knobs flipped between rounds,
-// the cache is invalidated and Codex re-runs.
+// review result without necessarily changing the prompt bytes. Kept in
+// the baseline for display and the archive; since the hot-reload work
+// the cache is gated by computeReviewKey, which covers all of this and
+// more (effort, the whole effective config, the review code).
 //
 // Notably included:
 //   * blockingSeverities — flips between blocking and informational.
@@ -80,6 +80,70 @@ export const computeReviewConfigHash = (config, providerOverride = null) => {
     }
     return createHash("sha256").update(JSON.stringify(policy)).digest("hex")
 }
+
+const stableStringify = (value) => {
+    if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
+    if (value && typeof value === "object") {
+        return `{${Object.keys(value)
+            .sort()
+            .map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`)
+            .join(",")}}`
+    }
+    return JSON.stringify(value ?? null)
+}
+
+const sha256 = (text) => createHash("sha256").update(text).digest("hex")
+
+// The config a verdict depends on: everything the pipeline reads to
+// review (reviewer, model, effort, limits, severities, ignore paths,
+// payload options, extra instructions). Server plumbing (address, token,
+// logging, reload, hook) is left out.
+export const REVIEW_CONFIG_KEYS = Object.freeze([
+    "codex",
+    "reviewer",
+    "limits",
+    "ignorePaths",
+    "blockingSeverities",
+    "extraReviewerInstructions",
+    "payload",
+])
+
+// What a verdict depends on besides the diff (hot-reload plan §5.5): the
+// effective provider (a per-call override included), the effective
+// config (the pinned global config merged with .review-orchestrator.json),
+// the review code (reviewVersion) and the shell (shellVersion). Every
+// persisted cache shortcut requires it to match, and it's part of the
+// duplicate key. Caller extras are separate (extrasHash).
+export const computeReviewKey = ({
+    config,
+    provider,
+    reviewVersion = null,
+    shellVersion = null,
+}) =>
+    sha256(
+        stableStringify({
+            provider,
+            config: Object.fromEntries(
+                REVIEW_CONFIG_KEYS.map((k) => [k, config?.[k] ?? null])
+            ),
+            reviewVersion,
+            shellVersion,
+        })
+    )
+
+// The caller's own guidance; null when there's none (every Stop hook).
+export const computeExtrasHash = (extras) =>
+    typeof extras === "string" && extras.length > 0 ? sha256(extras) : null
+
+// Decision Q8: a request with extras needs a baseline reached with the
+// same extras; one without also accepts a PASSING baseline reached with
+// any, since a pass under extra guidance counts as reviewed.
+const extrasAccepted = (baseline, extrasHash, passing) =>
+    (baseline.extrasHash ?? null) === extrasHash ||
+    (extrasHash === null && passing)
+
+const isPassing = (status) =>
+    status === "GOOD_TO_GO" || status === "GOOD_TO_GO_WITH_NOTES"
 
 // When prior findings shaped `payload`, builds the prior-free payload —
 // what the next request builds once a passing review clears them. Called
@@ -265,6 +329,44 @@ const envelope = (status, extra = {}) => ({
     ...extra,
 })
 
+// Request deadlines (hot-reload plan §5.5) bound the response, never the
+// review: a request that runs out of time answers this quietly, nothing
+// is cached, and the review it waited on (or its own) carries on.
+const deadlineExceeded = (reason) => ({
+    httpStatus: 200,
+    body: envelope("ESCALATE", {
+        code: "DEADLINE_EXCEEDED",
+        reason,
+        notifyUser: false,
+    }),
+})
+
+const TIMED_OUT = Symbol("timed out")
+
+const raceDeadline = (promise, deadline, now) =>
+    new Promise((resolve, reject) => {
+        const timer = setTimeout(
+            () => resolve(TIMED_OUT),
+            Math.max(0, deadline - now())
+        )
+        promise.then(
+            (value) => {
+                clearTimeout(timer)
+                resolve(value)
+            },
+            (err) => {
+                clearTimeout(timer)
+                reject(err)
+            }
+        )
+    })
+
+// Requests sharing a pipeline: a queued request is abandoned at its
+// deadline only when nobody else waits on its result. The shell owns the
+// live map (deps.joinCounts), shared like the in-flight map it describes
+// across every core instance; this one is the fallback for unit tests.
+const defaultJoinCounts = new WeakMap()
+
 // ESCALATE notification gate (v0.1.14).
 //
 // Returns true only when ALL of:
@@ -323,11 +425,17 @@ const contextSummary = (context) => ({
     key: context.key,
 })
 
-const baselineSummary = (payload, reviewConfigHash = null) => ({
+const baselineSummary = (
+    payload,
+    { reviewConfigHash = null, reviewKey = null, extrasHash = null } = {}
+) => ({
     headSha: payload.headSha,
     promptHash: payload.promptHash,
     progressHash: payload.progressHash,
+    // For display and the archive; reviewKey is what gates the cache.
     reviewConfigHash,
+    reviewKey,
+    extrasHash,
     files: payload.files,
     totalBytes: payload.totalBytes,
     truncated: payload.truncated,
@@ -442,9 +550,18 @@ export const handleReview = async ({
     logger = noopLogger,
     deps = {},
     schema = null,
+    // The running core's versions: for the review key and duplicate key.
+    reviewVersion = null,
+    shellVersion = null,
+    coreVersion = null,
+    // When the response is due (Stop hooks); null waits for the result.
+    deadline = null,
     now = Date.now,
     requestId = null,
 }) => {
+    // The shell-issued config pinned at admission. Reviewer binaries are
+    // resolved from it (spawnTool), never from a merged or live copy.
+    const pinnedConfig = config
     // Bind requestId so every log line through this request is correlatable
     // with the access-log entry the http-log middleware emits. The
     // child binding is extended once the context resolves so every
@@ -543,6 +660,7 @@ export const handleReview = async ({
     const inflight = deps.inflight ?? defaultInflight
     const contextChains = deps.contextChains ?? defaultContextChains
     const inflightMeta = deps.inflightMeta ?? defaultInflightMeta
+    const joinCounts = deps.joinCounts ?? defaultJoinCounts
 
     // Anti-clobber save (v1.1.2): a long review captures state at its
     // start; if the user mutates the persisted context mid-run via
@@ -586,16 +704,69 @@ export const handleReview = async ({
         }
         return store.save(key, out)
     }
+    // Per-repo overrides via .review-orchestrator.json at the repo root,
+    // read before duplicate matching so a request whose effective config
+    // differs never joins a review running under other settings. The file
+    // is optional; loadProjectConfig returns null when missing or invalid
+    // (after logging) so the loop keeps running on the global config.
+    // Project keys win per key for limits and replace wholesale for
+    // ignorePaths / blockingSeverities / extraReviewerInstructions.
+    const projectConfig = (deps.loadProjectConfig ?? loadProjectConfig)({
+        repoRoot: context.repoRoot,
+        logger: log,
+    })
+    config = mergeWithGlobal(config, projectConfig)
     const effectiveProvider =
         providerOverride ?? config.reviewer?.provider ?? "codex"
-    const inflightKey = `${context.key}|force=${force}|provider=${effectiveProvider}`
+    const cacheKeys = {
+        reviewConfigHash: computeReviewConfigHash(config, providerOverride),
+        reviewKey: computeReviewKey({
+            config,
+            provider: effectiveProvider,
+            reviewVersion,
+            shellVersion,
+        }),
+        extrasHash: computeExtrasHash(body?.extra_instructions),
+    }
+    const { reviewConfigHash, reviewKey, extrasHash } = cacheKeys
+    log.info(
+        {
+            hasProjectConfig: Boolean(projectConfig),
+            reviewConfigHash: short(reviewConfigHash, 16),
+            reviewKey: short(reviewKey, 16),
+            hasExtras: extrasHash !== null,
+            blockingSeverities: config.blockingSeverities,
+            ignorePathsCount: config.ignorePaths?.length ?? 0,
+            extraReviewerInstructionsSet: Boolean(
+                config.extraReviewerInstructions
+            ),
+        },
+        "config resolved"
+    )
+    // Joining needs the same review key, the same caller extras and the
+    // same core: anything else queues on the context chain instead.
+    const inflightKey = `${context.key}|force=${force}|provider=${effectiveProvider}|key=${short(reviewKey, 16)}|extras=${short(extrasHash, 16) ?? "-"}|core=${coreVersion ?? "-"}`
     const existing = inflight.get(inflightKey)
     if (existing) {
         log.info(
             { contextKey: context.key, inflightKey, attached: true },
             "attached to in-flight review"
         )
-        return existing
+        // Every joiner counts, so the owner never abandons a pipeline
+        // someone else is waiting on.
+        joinCounts.set(existing, (joinCounts.get(existing) ?? 0) + 1)
+        try {
+            if (deadline === null) return await existing
+            const outcome = await raceDeadline(existing, deadline, now)
+            // Only this waiter stops; the review goes on for its owner.
+            return outcome === TIMED_OUT
+                ? deadlineExceeded(
+                      "the review this request joined is still running"
+                  )
+                : outcome
+        } finally {
+            joinCounts.set(existing, joinCounts.get(existing) - 1)
+        }
     }
 
     // Serialize against any pipeline already queued for this context.
@@ -604,45 +775,23 @@ export const handleReview = async ({
     const prevTail = contextChains.get(context.key) ?? Promise.resolve()
     const serialized = prevTail !== undefined && contextChains.has(context.key)
 
+    let started = false
+    let abandoned = false
     const pipelinePromise = (async () => {
         // Wait for any in-progress same-context review to finish so our
         // store.get → store.save sequence never races with theirs. We
         // swallow the predecessor's result/errors — we only care that it
         // has released the context.
         await prevTail.catch(() => {})
+        // Abandoned at its deadline while still queued: never runs.
+        if (abandoned) return deadlineExceeded("abandoned while queued")
+        started = true
         if (serialized) {
             log.info(
                 { contextKey: context.key, inflightKey },
                 "serialized behind in-flight same-context review"
             )
         }
-        // Per-repo overrides via .review-orchestrator.json at the repo root.
-        // The file is optional; loadProjectConfig returns null when missing or
-        // invalid (after logging) so the loop keeps running on the global
-        // config. Project keys win on a per-key basis for limits and replace
-        // wholesale for ignorePaths / blockingSeverities / extraReviewerInstructions.
-        const projectConfig = (deps.loadProjectConfig ?? loadProjectConfig)({
-            repoRoot: context.repoRoot,
-            logger: log,
-        })
-        config = mergeWithGlobal(config, projectConfig)
-        const reviewConfigHash = computeReviewConfigHash(
-            config,
-            providerOverride
-        )
-        log.info(
-            {
-                hasProjectConfig: Boolean(projectConfig),
-                reviewConfigHash: short(reviewConfigHash, 16),
-                blockingSeverities: config.blockingSeverities,
-                ignorePathsCount: config.ignorePaths?.length ?? 0,
-                extraReviewerInstructionsSet: Boolean(
-                    config.extraReviewerInstructions
-                ),
-            },
-            "config resolved"
-        )
-
         const trigger = body?.trigger ?? "manual"
         const state = store.get(context)
         // Snapshot exclusions for saveContext's mid-run-drift check.
@@ -689,14 +838,15 @@ export const handleReview = async ({
             // prior-free baseline couldn't be cached: the saved one isn't
             // what a fresh build produces, so only that build may decide.
             state.lastBaseline.fastPathEligible !== false &&
-            // The cached baseline must have been produced under the same
-            // review policy (provider, model, blockingSeverities, …).
-            // Without this, switching provider on an otherwise-unchanged
-            // tree would still short-circuit NO_CHANGES from the old
-            // provider instead of running the newly selected reviewer.
-            state.lastBaseline.reviewConfigHash === reviewConfigHash &&
-            (state.lastResultStatus === "GOOD_TO_GO" ||
-                state.lastResultStatus === "GOOD_TO_GO_WITH_NOTES")
+            // The cached verdict must have been reached under the same
+            // review key (provider, effective config, review code, shell)
+            // and acceptable extras. Without this, switching provider or
+            // effort, or reloading the review code, on an otherwise-
+            // unchanged tree would short-circuit NO_CHANGES from the old
+            // terms instead of running a review.
+            state.lastBaseline.reviewKey === reviewKey &&
+            isPassing(state.lastResultStatus) &&
+            extrasAccepted(state.lastBaseline, extrasHash, true)
         if (fastPathEligible) {
             // Commit/pull/rebase leave the tree clean but invalidate the
             // cached review, so HEAD must match the cached baseline.
@@ -873,7 +1023,7 @@ export const handleReview = async ({
                     // about. Hook stays silent and the turn ends.
                     notifyUser: false,
                     context: contextSummary(context),
-                    baseline: baselineSummary(payload, reviewConfigHash),
+                    baseline: baselineSummary(payload, cacheKeys),
                     state: stateSummary(state),
                 }),
             }
@@ -890,7 +1040,15 @@ export const handleReview = async ({
             !force &&
             state.lastBaseline &&
             state.lastBaseline.progressHash === payload.progressHash &&
-            state.lastBaseline.reviewConfigHash === reviewConfigHash &&
+            state.lastBaseline.reviewKey === reviewKey &&
+            // Q8: findings and failures were shaped by the guidance they
+            // ran under; only a pass carries over to a request without
+            // extras.
+            extrasAccepted(
+                state.lastBaseline,
+                extrasHash,
+                isPassing(state.lastResultStatus)
+            ) &&
             sameCommitRange(state.lastBaseline, payload) &&
             // Part of the tree (a submodule past the nesting limit, or one
             // git couldn't read) wasn't fingerprinted, so a matching hash
@@ -915,7 +1073,7 @@ export const handleReview = async ({
                     httpStatus: 200,
                     body: envelope("NO_CHANGES", {
                         context: contextSummary(context),
-                        baseline: baselineSummary(payload, reviewConfigHash),
+                        baseline: baselineSummary(payload, cacheKeys),
                         state: stateSummary(state),
                     }),
                 }
@@ -969,10 +1127,7 @@ export const handleReview = async ({
                             droppedFindings: [],
                             reason: "No on-disk progress on flagged files since the last review.",
                             context: contextSummary(context),
-                            baseline: baselineSummary(
-                                payload,
-                                reviewConfigHash
-                            ),
+                            baseline: baselineSummary(payload, cacheKeys),
                             state: stateSummary(nextState),
                         },
                     }
@@ -1015,7 +1170,7 @@ export const handleReview = async ({
                         code: "CODEX_ERROR_CACHED",
                         notifyUser,
                         context: contextSummary(context),
-                        baseline: baselineSummary(payload, reviewConfigHash),
+                        baseline: baselineSummary(payload, cacheKeys),
                         state: stateSummary(nextState),
                     }),
                 }
@@ -1151,7 +1306,18 @@ export const handleReview = async ({
                 prompt: wrappedPrompt,
                 config,
                 schema,
-                spawn: deps.spawn,
+                // The shell's spawnTool resolves the binary by tool name
+                // from the config pinned at admission; tests inject a
+                // spawn of their own.
+                spawn:
+                    deps.spawn ??
+                    (deps.spawnTool
+                        ? (_binary, args, opts) =>
+                              deps.spawnTool(providerName, args, {
+                                  ...opts,
+                                  config: pinnedConfig,
+                              })
+                        : undefined),
             })
         } catch (err) {
             log.error(
@@ -1257,7 +1423,7 @@ export const handleReview = async ({
                       ...state,
                       codexRounds: state.codexRounds + 1,
                       attemptsSincePass: nextAttempt(state),
-                      lastBaseline: baselineSummary(payload, reviewConfigHash),
+                      lastBaseline: baselineSummary(payload, cacheKeys),
                       lastReviewedAt: now(),
                       lastResultStatus: "ESCALATE",
                       lastEscalateReason: codexResult.reason,
@@ -1307,7 +1473,7 @@ export const handleReview = async ({
                     notifyUser,
                     transientAuth,
                     context: contextSummary(context),
-                    baseline: baselineSummary(payload, reviewConfigHash),
+                    baseline: baselineSummary(payload, cacheKeys),
                     codex: codexSummary(codexResult, providerName),
                     state: stateSummary(nextState),
                 }),
@@ -1375,9 +1541,9 @@ export const handleReview = async ({
             )
         }
         const lastBaseline = cachePriorFree
-            ? baselineSummary(priorFreePayload, reviewConfigHash)
+            ? baselineSummary(priorFreePayload, cacheKeys)
             : {
-                  ...baselineSummary(payload, reviewConfigHash),
+                  ...baselineSummary(payload, cacheKeys),
                   ...(priorsCleared ? { fastPathEligible: false } : {}),
               }
 
@@ -1485,7 +1651,7 @@ export const handleReview = async ({
                 blockingFindings,
                 droppedFindings: dropped,
                 context: contextSummary(context),
-                baseline: baselineSummary(payload, reviewConfigHash),
+                baseline: baselineSummary(payload, cacheKeys),
                 codex: codexSummary(codexResult, providerName),
                 state: stateSummary(saved),
             },
@@ -1513,43 +1679,105 @@ export const handleReview = async ({
         force,
         startedAt: now(),
     })
-    try {
-        return await pipelinePromise
-    } finally {
-        // Clear the result-sharing slot whether the pipeline resolved or
-        // threw. A future identical request starts a fresh pipeline.
-        inflight.delete(inflightKey)
-        inflightMeta.delete(inflightKey)
+    // Clear the result-sharing slot once the pipeline settles, whether it
+    // resolved or threw — not when this request answers, which a deadline
+    // can make earlier. A future identical request starts a fresh one.
+    const forget = () => {
+        if (inflight.get(inflightKey) === pipelinePromise) {
+            inflight.delete(inflightKey)
+            inflightMeta.delete(inflightKey)
+        }
         // Only clear the chain tail if we're still it — a later request
         // may have already chained behind us and become the new tail.
         if (contextChains.get(context.key) === pipelinePromise) {
             contextChains.delete(context.key)
         }
     }
+    pipelinePromise.then(forget, forget)
+    if (deadline === null) return pipelinePromise
+    const outcome = await raceDeadline(pipelinePromise, deadline, now)
+    if (outcome !== TIMED_OUT) return outcome
+    if (!started && !(joinCounts.get(pipelinePromise) > 0)) {
+        // Still queued behind another review of this context, and nobody
+        // else waits on this one: leave the queue and never run. The next
+        // Stop hook asks again, usually finding that review's result.
+        abandoned = true
+        if (inflight.get(inflightKey) === pipelinePromise) {
+            inflight.delete(inflightKey)
+            inflightMeta.delete(inflightKey)
+        }
+        log.info({}, "deadline passed while queued — abandoned")
+        return deadlineExceeded(
+            "queued behind another review of this context until the deadline"
+        )
+    }
+    // The review has started: it finishes with its configured timeout and
+    // caches its result; the shell keeps this request admitted until then.
+    log.info({}, "deadline passed while reviewing — answering early")
+    return {
+        ...deadlineExceeded(
+            "the review is still running; its result will be cached"
+        ),
+        background: pipelinePromise,
+    }
 }
 
-// POST /review. `getOptions` is read per request ({ config, store,
-// archive, logger, deps, metrics, schema }).
-export const createReviewHandler = (getOptions) => async (req, res) => {
-    const {
-        config,
-        store,
-        archive = null,
-        logger = noopLogger,
-        deps,
-        metrics = null,
-        schema = null,
-    } = getOptions()
-    const result = await handleReview({
-        body: req.body,
-        config,
-        store,
-        archive,
-        logger,
-        deps,
-        schema,
-        requestId: req.requestId ?? null,
-    })
-    if (metrics) metrics.record(result.body)
-    res.status(result.httpStatus).json(result.body)
+// POST /review. `getOptions(request)` is read per request ({ config,
+// store, archive, logger, deps, metrics, schema }); `request` is what the
+// shell's admission pinned (its `config`).
+export const createReviewHandler =
+    (getOptions) => async (req, res, request) => {
+        const {
+            config,
+            store,
+            archive = null,
+            logger = noopLogger,
+            deps,
+            metrics = null,
+            schema = null,
+            versions = {},
+        } = getOptions(request)
+        const deadline = request?.deadline ?? null
+        const work = handleReview({
+            body: req.body,
+            config,
+            store,
+            archive,
+            logger,
+            deps,
+            schema,
+            ...versions,
+            deadline,
+            requestId: req.requestId ?? null,
+        })
+        // The deadline covers everything before the pipeline too (context
+        // resolution runs git): answer on time, and let the work finish.
+        let result
+        if (deadline === null) {
+            result = await work
+        } else {
+            const outcome = await raceDeadline(work, deadline, Date.now)
+            result =
+                outcome === TIMED_OUT
+                    ? {
+                          ...deadlineExceeded(
+                              "the request was still being prepared at its deadline"
+                          ),
+                          background: work,
+                      }
+                    : outcome
+        }
+        if (metrics) metrics.record(result.body)
+        res.status(result.httpStatus).json(result.body)
+        // Answered at the deadline with work still running: this request
+        // stays admitted (the shell releases it when we return) until all
+        // of it, including a review it started, is done.
+        await settleBackground(result.background)
+    }
+
+// Waits for work left running after a deadline answer: a pipeline, or a
+// whole handleReview whose own result may carry a pipeline in turn.
+const settleBackground = async (background) => {
+    const settled = await background?.catch(() => null)
+    if (settled?.background) await settleBackground(settled.background)
 }

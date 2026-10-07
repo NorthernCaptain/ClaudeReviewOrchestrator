@@ -35,6 +35,32 @@ const fakeCore = (tag) => ({
     },
 })
 
+// A stand-in reload controller: admits reviews and pins other calls to
+// whatever core is current, recording every ticket.
+const fakeCores = (initial) => {
+    const cores = {
+        core: initial,
+        tickets: [],
+        currentCore: () => cores.core,
+        make(kind) {
+            const ticket = {
+                kind,
+                core: cores.core,
+                config: kind === "review" ? { pinned: true } : undefined,
+                released: false,
+                release: () => {
+                    ticket.released = true
+                },
+            }
+            cores.tickets.push(ticket)
+            return ticket
+        },
+        admitReview: async () => cores.make("review"),
+        pin: () => cores.make("pin"),
+    }
+    return cores
+}
+
 const connect = async (server) => {
     const [clientT, serverT] = InMemoryTransport.createLinkedPair()
     await server.connect(serverT)
@@ -48,8 +74,7 @@ const connect = async (server) => {
 
 describe("buildMcpServer", () => {
     test("registers the current core's tool definitions", async () => {
-        const core = fakeCore("v1")
-        const server = buildMcpServer({ currentCore: () => core })
+        const server = buildMcpServer({ cores: fakeCores(fakeCore("v1")) })
         const client = await connect(server)
         const { tools } = await client.listTools()
         expect(tools.map((t) => [t.name, t.description]).sort()).toEqual([
@@ -61,16 +86,16 @@ describe("buildMcpServer", () => {
     })
 
     test("every call runs on the core current at that moment, with this session's server", async () => {
-        let current = fakeCore("v1")
-        const first = current
-        const server = buildMcpServer({ currentCore: () => current })
+        const cores = fakeCores(fakeCore("v1"))
+        const first = cores.core
+        const server = buildMcpServer({ cores })
         const client = await connect(server)
 
         const a = await client.callTool({
             name: "request_review",
             arguments: { cwd: "/repo" },
         })
-        current = fakeCore("v2")
+        cores.core = fakeCore("v2")
         const b = await client.callTool({
             name: "request_review",
             arguments: { cwd: "/repo" },
@@ -87,6 +112,13 @@ describe("buildMcpServer", () => {
         expect(call.args).toEqual({ cwd: "/repo" })
         expect(call.mcpServer).toBe(server)
         expect(call.requestId).toBeDefined()
+        // request_review is admitted with a pinned config; reset is pinned.
+        expect(call.request).toEqual({ config: { pinned: true } })
+        expect(cores.tickets.map((t) => [t.kind, t.released])).toEqual([
+            ["review", true],
+            ["review", true],
+            ["pin", true],
+        ])
         // Names and descriptions were fixed when the session started.
         const { tools } = await client.listTools()
         expect(tools.find((t) => t.name === "request_review").description).toBe(
@@ -108,7 +140,7 @@ describe("mountMcpRoute", () => {
         }
         const logger = { error: jest.fn() }
         const mcp = mountMcpRoute(app, {
-            currentCore: () => fakeCore("v1"),
+            cores: fakeCores(fakeCore("v1")),
             logger,
         })
         return { routes, mcp, logger }

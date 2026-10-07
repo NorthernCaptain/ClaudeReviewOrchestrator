@@ -130,6 +130,8 @@ export const handleStatus = ({
     startedAt,
     version = null,
     now = Date.now,
+    // The shell's own state: { shellVersion, coreVersion, … reload }.
+    shell = null,
 }) => {
     const uptimeMs = Math.max(0, now() - (startedAt ?? now()))
     const contexts = store?.list?.() ?? []
@@ -137,6 +139,7 @@ export const handleStatus = ({
     return {
         ok: true,
         version,
+        ...(shell ?? {}),
         startedAt: new Date(startedAt ?? now()).toISOString(),
         uptimeSeconds: Math.round(uptimeMs / 1000),
         contexts: contexts.map(summarizeContext),
@@ -191,8 +194,11 @@ export const summarizeConfig = (config, version = null) => {
 // GET /status. `getOptions` is read per request
 // ({ store, archive, config, startedAt, version, now }).
 export const createStatusHandler = (getOptions) => (_req, res) => {
-    const { store, archive, config, startedAt, version, now } = getOptions()
-    res.json(handleStatus({ store, archive, config, startedAt, version, now }))
+    const { store, archive, config, startedAt, version, now, shell } =
+        getOptions()
+    res.json(
+        handleStatus({ store, archive, config, startedAt, version, now, shell })
+    )
 }
 
 export const __test__ = {

@@ -19,15 +19,21 @@ import { VERSION } from "./version.js"
  * Build (but do not connect) an McpServer with the core's tools
  * registered. A tool's name, description and input schema are fixed for
  * the session's life (changing them needs a client reconnect); its
- * behaviour follows the current core.
+ * behaviour follows the current core. `cores` is the reload controller:
+ * request_review is admitted (counted and pinned to a core and a frozen
+ * config) before anything else; reset_review_context pins its core.
  */
-export const buildMcpServer = ({ currentCore }) => {
+export const buildMcpServer = ({ cores }) => {
     const server = new McpServer(
         { name: "review-orchestrator", version: VERSION },
         { capabilities: { tools: {} } }
     )
-    for (const def of currentCore().mcp.toolDefs) {
+    for (const def of cores.currentCore().mcp.toolDefs) {
         const method = MCP_TOOL_METHODS[def.name]
+        const admit =
+            def.name === "request_review"
+                ? () => cores.admitReview()
+                : () => cores.pin()
         server.registerTool(
             def.name,
             {
@@ -37,12 +43,19 @@ export const buildMcpServer = ({ currentCore }) => {
             },
             // The handler gets THIS session's server, so the roots check
             // asks this client (and on this call's own stream).
-            async (args, extra) =>
-                currentCore().mcp[method]({
-                    args,
-                    requestId: extra?.requestId,
-                    mcpServer: server,
-                })
+            async (args, extra) => {
+                const ticket = await admit()
+                try {
+                    return await ticket.core.mcp[method]({
+                        args,
+                        requestId: extra?.requestId,
+                        mcpServer: server,
+                        request: { config: ticket.config },
+                    })
+                } finally {
+                    ticket.release()
+                }
+            }
         )
     }
     return server

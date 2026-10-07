@@ -133,11 +133,15 @@ const persistAtomically = (filePath, contexts) => {
     renameSync(tmp, filePath)
 }
 
+// `idleResetMs` is a number or a function read on every lookup, so a
+// reloaded limits.idleResetMinutes takes effect at once.
 export const createStateStore = ({
     filePath = defaultStatePath(),
     now = Date.now,
     idleResetMs = 10 * 60 * 1000,
 } = {}) => {
+    const idleMs = () =>
+        typeof idleResetMs === "function" ? idleResetMs() : idleResetMs
     const contexts = loadFromDisk(filePath)
 
     const ensure = ({ key, repoRoot, branch }) => {
@@ -154,7 +158,7 @@ export const createStateStore = ({
         // See idleResetContext() for the rationale.
         if (
             state.lastReviewedAt > 0 &&
-            now() - state.lastReviewedAt > idleResetMs
+            now() - state.lastReviewedAt > idleMs()
         ) {
             contexts[key] = idleResetContext({ key, repoRoot, branch }, state)
             persistAtomically(filePath, contexts)

@@ -4,7 +4,7 @@
  */
 
 import { randomBytes } from "node:crypto"
-import { readFileSync } from "node:fs"
+import { readFileSync, rmSync } from "node:fs"
 import path from "node:path"
 import express from "express"
 import { VERSION } from "./version.js"
@@ -12,23 +12,33 @@ import { VERSION } from "./version.js"
 export { VERSION }
 import { authMiddleware } from "./auth.js"
 import {
+    captureCore,
     codexSchemaPathFor,
-    createCoreHolder,
     DEFAULT_CACHE_DIR,
+    DEFAULT_CORE_DIR,
+    DEFAULT_SNAPSHOT_ROOT,
     defaultConfigPath,
+    ephemeralCodexSchemaPath,
+    importCore,
     loadCoreModule,
     loadDefaultCore,
     prepareCore,
     pruneCodexSchemas,
+    pruneSnapshots,
     readConfigFile,
+    removeSnapshot,
+    shellVersionId,
 } from "./core-loader.js"
 import { mountMcpRoute } from "./mcp.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
+import { createConfigStore } from "./config-store.js"
+import { createReloadController, requiredHookWaitMs } from "./reload.js"
+import { MAX_FETCH_TIMEOUT_MS } from "../../hooks/stop-review.mjs"
 import { createMetrics } from "./metrics.js"
 import { logger } from "./logger.js"
 import { createHttpAccessLog, createHttpErrorHandler } from "./http-log.js"
-import { createGuardedSpawn, createTools } from "./tools.js"
+import { createTools } from "./tools.js"
 
 // Inline yin-yang favicon (v0.1.36). Colors match the dashboard's dark
 // slate palette so the tab icon reads as the same UI. Served from
@@ -60,9 +70,91 @@ export const loopbackOnly = (req, res, next) => {
     next()
 }
 
+// Where reload candidates come from: the core folder, captured and (when
+// its id differs from the running core's) written to a fresh snapshot and
+// imported, with a codex schema path of its own.
+export const createCandidateLoader =
+    ({
+        coreDir = DEFAULT_CORE_DIR,
+        snapshotRoot = DEFAULT_SNAPSHOT_ROOT,
+        codexSchemaPathOf = (version) => ephemeralCodexSchemaPath(version),
+        packageVersion = VERSION,
+    } = {}) =>
+    async (current) => {
+        const captured = captureCore({ coreDir, packageVersion })
+        if (captured.version === current.version) return { same: true }
+        const { module: mod, snapshotDir } = await importCore({
+            captured,
+            coreDir,
+            snapshotRoot,
+        })
+        return {
+            module: mod,
+            version: captured.version,
+            reviewVersion: captured.reviewVersion,
+            resources: captured.resources,
+            snapshotDir,
+            codexSchemaPath: codexSchemaPathOf(captured.version),
+        }
+    }
+
+const disposeCoreFiles = (record) => {
+    removeSnapshot(record.snapshotDir)
+    if (record.codexSchemaPath) rmSync(record.codexSchemaPath, { force: true })
+}
+
+// A Stop hook sends the wait limit it's using; MCP calls send none.
+const hookTimeoutOf = (body) => {
+    const t = body?.timeoutMs
+    return typeof t === "number" && Number.isFinite(t) && t > 0
+        ? Math.min(t, MAX_FETCH_TIMEOUT_MS)
+        : null
+}
+
+// The deadline bounds the response, never the review: arrival plus the
+// hook's limit, minus a response margin of min(5 s, limit / 10).
+export const requestDeadline = (arrival, timeoutMs) =>
+    timeoutMs === null
+        ? null
+        : arrival + timeoutMs - Math.min(5_000, timeoutMs / 10)
+
+// Absorbs request transit and parsing in the limit handshake.
+export const HANDSHAKE_TOLERANCE_MS = 2_000
+
+const quietEscalate = (code, reason, extra = {}) => ({
+    status: "ESCALATE",
+    findings: [],
+    blockingFindings: [],
+    droppedFindings: [],
+    code,
+    reason,
+    notifyUser: false,
+    ...extra,
+})
+
+const deadlineExceeded = (reason) => quietEscalate("DEADLINE_EXCEEDED", reason)
+
+const hookLimitStale = (requiredMs) =>
+    quietEscalate(
+        "HOOK_LIMIT_STALE",
+        "the reviewer timeout needs a longer hook wait — resend with hookTimeoutMs",
+        { hookTimeoutMs: requiredMs }
+    )
+
+// HTTP status for a reload that couldn't be prepared or applied: a busy
+// controller or a stale request is a conflict, bad code or config is
+// unprocessable, anything else is ours.
+const reloadErrorStatus = (err) =>
+    err?.httpStatus ??
+    (typeof err?.code === "string" &&
+    /^(CORE_|CONFIG_|RESTART_ONLY)/.test(err.code)
+        ? 422
+        : 500)
+
 // Every route below except /healthz and the favicon is a delegate: it
-// runs on the core current at that moment (hot-reload plan §5.1). The
-// shell owns paths, auth and the loopback guard; the core owns behaviour.
+// runs on the core current at that moment (hot-reload plan §5.1), pinned
+// for the request's life. The shell owns paths, auth, the loopback guard,
+// review admission and reloads; the core owns behaviour.
 export const createApp = ({
     config,
     store,
@@ -72,6 +164,12 @@ export const createApp = ({
     metrics = createMetrics(),
     configPath = defaultConfigPath(),
     core,
+    // What the startup loader knows about `core`: { reviewVersion,
+    // snapshotDir, codexSchemaPath }.
+    coreInfo = {},
+    startedAt = Date.now(),
+    shellVersion = shellVersionId(),
+    loadCandidate = createCandidateLoader(),
 }) => {
     // Shell-owned in-flight registries (hot-reload plan §5.5): duplicate
     // matching, per-context ordering and the dashboard's in-flight view
@@ -80,40 +178,127 @@ export const createApp = ({
     // git with the live limits.gitTimeoutSeconds, and a spawn that refuses
     // Node executables. Callers (tests) may still inject their own.
     const tools = createTools({
-        getGitTimeoutMs: () => (config.limits?.gitTimeoutSeconds ?? 30) * 1000,
+        getGitTimeoutMs: () =>
+            (configStore.current().limits?.gitTimeoutSeconds ?? 30) * 1000,
+        isIssuedConfig: (pinned) => reloads.isIssuedConfig(pinned),
     })
     const deps = {
         inflight: new Map(),
         contextChains: new Map(),
         inflightMeta: new Map(),
+        // Waiters per shared pipeline, for deadline abandonment. Shell-owned
+        // so every core instance sees the same counts.
+        joinCounts: new WeakMap(),
         git: tools.git,
-        spawn: createGuardedSpawn(),
+        spawnTool: tools.spawnTool,
         ...callerDeps,
     }
-    const live = Object.freeze({
-        config,
+    // The holder and the restart-only baseline hold the config in the
+    // core's normalized form (defaults filled, paths expanded), the form
+    // every reload and transaction produces, so comparisons see only real
+    // changes. main() passes it validated already; this is idempotent.
+    let normalized = config
+    try {
+        normalized = core.validateConfig(config)
+    } catch {
+        // an embedder's partial config: keep it as given
+    }
+    // The config holder outlives every core; every change to it is a
+    // transaction checked by the core current at that moment.
+    const configStore = createConfigStore({
         configPath,
-        store,
-        archive,
-        metrics,
-        logger: log,
-        registries: Object.freeze({
-            inflight: deps.inflight,
-            contextChains: deps.contextChains,
-            inflightMeta: deps.inflightMeta,
-        }),
-        deps,
+        initial: normalized,
+        checks: () => {
+            const current = reloads.currentCore()
+            return {
+                validate: current.validateConfig,
+                selfCheck: current.selfCheck,
+            }
+        },
+        fs: callerDeps.configFs,
     })
-    core.attach(live)
-    const cores = createCoreHolder(core)
-    const route = (pick) => (req, res, next) =>
-        pick(cores.current().routes)(req, res, next)
+    const registries = Object.freeze({
+        inflight: deps.inflight,
+        contextChains: deps.contextChains,
+        inflightMeta: deps.inflightMeta,
+        joinCounts: deps.joinCounts,
+    })
+    const shellStatus = () => {
+        const { coreVersion, ...reload } = reloads.status()
+        return { shellVersion, coreVersion, reload }
+    }
+    // What a core attaches: the same shell objects for every core, except
+    // the archive, which stamps each record with the core that wrote it.
+    const liveFor = (record) =>
+        Object.freeze({
+            get config() {
+                return configStore.current()
+            },
+            configTransaction: (delta) => configStore.mutate(delta),
+            store,
+            archive: archive && {
+                ...archive,
+                write: (args) =>
+                    archive.write({ ...args, coreVersion: record.version }),
+            },
+            metrics,
+            logger: log,
+            registries,
+            deps,
+            shellStatus,
+        })
+    const reloads = createReloadController({
+        initial: {
+            core,
+            validateConfig: core.validateConfig,
+            version: core.version,
+            reviewVersion: coreInfo.reviewVersion ?? null,
+            snapshotDir: coreInfo.snapshotDir ?? null,
+            codexSchemaPath: coreInfo.codexSchemaPath ?? null,
+        },
+        configStore,
+        startupConfig: normalized,
+        liveFor,
+        loadCandidate,
+        buildCore: (loaded, candidateConfig) =>
+            prepareCore({
+                loaded,
+                config: candidateConfig,
+                packageVersion: VERSION,
+                shellVersion,
+                startedAt,
+                codexSchemaPath: loaded.codexSchemaPath,
+            }),
+        disposeFiles: disposeCoreFiles,
+        runningReviews: () =>
+            [...registries.inflightMeta.values()].map((m) => ({
+                repo: m.repo,
+                branch: m.branch,
+                provider: m.provider,
+                startedAt: m.startedAt,
+            })),
+        onApplied: (applied) => {
+            const level = applied.logging?.level
+            if (level && log && "level" in log) log.level = level
+        },
+        logger: log,
+    })
+    // Non-review requests pin the current core for their whole life.
+    const route = (pick) => async (req, res, next) => {
+        const ticket = reloads.pin()
+        try {
+            await pick(ticket.core.routes)(req, res, next)
+        } finally {
+            ticket.release()
+        }
+    }
     const mutation = (key) => route((r) => r.dashboardMutations[key])
 
     const app = express()
     app.disable("x-powered-by")
-    app.locals.cores = cores
-    app.locals.live = live
+    app.locals.reloads = reloads
+    app.locals.live = liveFor({ version: core.version })
+    app.locals.configStore = configStore
 
     // Access log runs before body parsing so we see every incoming
     // request including ones rejected by JSON parsing or auth. It logs
@@ -123,7 +308,13 @@ export const createApp = ({
     app.use(express.json({ limit: "1mb" }))
 
     app.get("/healthz", (_req, res) => {
-        res.json({ ok: true })
+        const { coreVersion, pending } = reloads.status()
+        res.json({
+            ok: true,
+            shellVersion,
+            coreVersion,
+            reloadPending: pending !== null,
+        })
     })
 
     // Yin-yang favicon. Same body served for /favicon.svg AND
@@ -181,10 +372,46 @@ export const createApp = ({
     )
 
     app.use(authMiddleware({ token: config.authToken }))
-    app.post(
-        "/review",
-        route((r) => r.review)
-    )
+    // Reviews are admitted before anything else happens (hot-reload plan
+    // §5.5): counted toward "busy", pinned to the current core and to a
+    // frozen copy of the config, released when the work ends (which, for
+    // a request answered at its deadline, is after the answer).
+    app.post("/review", async (req, res) => {
+        const arrival = Date.now()
+        const timeoutMs = hookTimeoutOf(req.body)
+        const deadline = requestDeadline(arrival, timeoutMs)
+        let ticket
+        try {
+            ticket = await reloads.admitReview({ deadline })
+        } catch (err) {
+            if (err?.code !== "DEADLINE_EXCEEDED") throw err
+            res.json(
+                deadlineExceeded(
+                    "the request waited at entry until its deadline"
+                )
+            )
+            return
+        }
+        try {
+            // The limit handshake: a hook whose remaining wait can't cover
+            // the pinned config's reviewer timeout learns the limit it
+            // needs before any work starts. Never on a final attempt.
+            if (timeoutMs !== null && req.body?.finalAttempt !== true) {
+                const remainingMs = timeoutMs - (Date.now() - arrival)
+                const requiredMs = requiredHookWaitMs(ticket.config)
+                if (remainingMs < requiredMs - HANDSHAKE_TOLERANCE_MS) {
+                    res.status(409).json(hookLimitStale(requiredMs))
+                    return
+                }
+            }
+            await ticket.core.routes.review(req, res, {
+                config: ticket.config,
+                deadline,
+            })
+        } finally {
+            ticket.release()
+        }
+    })
     app.post(
         "/reset",
         route((r) => r.reset)
@@ -199,9 +426,22 @@ export const createApp = ({
     )
     // Capture the MCP route's closeAllSessions so shutdown can drain
     // long-poll GETs (otherwise server.close() never resolves).
-    app.locals.mcp = mountMcpRoute(app, {
-        currentCore: () => cores.current(),
-        logger: log,
+    app.locals.mcp = mountMcpRoute(app, { cores: reloads, logger: log })
+    // Explicit reloads only (hot-reload plan §5.9): { cancel, rollback, now }.
+    app.post("/admin/reload", async (req, res) => {
+        try {
+            res.json(await reloads.trigger(req.body ?? {}))
+        } catch (err) {
+            log.warn({ err: err.message, code: err.code }, "core reload failed")
+            res.status(reloadErrorStatus(err)).json({
+                ok: false,
+                error: err.message,
+                code: err.code ?? "RELOAD_FAILED",
+            })
+        }
+    })
+    app.get("/admin/reload", (_req, res) => {
+        res.json({ ok: true, ...shellStatus() })
     })
     app.get(
         "/status",
@@ -227,10 +467,13 @@ export const startServer = async ({
     startedAt = Date.now(),
     configPath = defaultConfigPath(),
     core = null,
+    coreInfo = {},
+    shellVersion = shellVersionId(),
+    loadCandidate = createCandidateLoader(),
 } = {}) => {
     const active =
         core ??
-        (await loadDefaultCore({ config, shellVersion: VERSION, startedAt }))
+        (await loadDefaultCore({ config, packageVersion: VERSION, startedAt }))
     return new Promise((resolve) => {
         const app = createApp({
             config,
@@ -240,6 +483,10 @@ export const startServer = async ({
             deps,
             configPath,
             core: active,
+            coreInfo,
+            startedAt,
+            shellVersion,
+            loadCandidate,
         })
         const server = app.listen(config.port, config.bind)
         let settled = false
@@ -491,20 +738,24 @@ const main = async () => {
         process.exitCode = 1
         return
     }
+    // Every other snapshot folder belongs to a core that no longer runs.
+    pruneSnapshots({ keep: loaded.snapshotDir })
+    const fail = (err, msg, extra = {}) => {
+        removeSnapshot(loaded.snapshotDir)
+        logger.error({ err: err.message, code: err.code, ...extra }, msg)
+        process.exitCode = 1
+    }
     let config
     try {
         config = loaded.module.validateConfig(readConfigFile({ configPath }))
     } catch (err) {
-        logger.error(
-            { err: err.message, code: err.code, configPath },
-            "failed to load config"
-        )
-        process.exitCode = 1
+        fail(err, "failed to load config", { configPath })
         return
     }
 
     const envProblem = checkReviewerEnv(config)
     if (envProblem) {
+        removeSnapshot(loaded.snapshotDir)
         logger.error(
             {
                 provider: config.reviewer?.provider,
@@ -516,8 +767,11 @@ const main = async () => {
         return
     }
 
+    // The idle interval follows the live config once the server runs (a
+    // reload can change it); until then, the startup value.
+    let liveConfig = () => config
     const store = createStateStore({
-        idleResetMs: config.limits.idleResetMinutes * 60 * 1000,
+        idleResetMs: () => liveConfig().limits.idleResetMinutes * 60 * 1000,
     })
     const archive = createArchive({
         reviewsDir: config.reviewsDir,
@@ -533,27 +787,27 @@ const main = async () => {
         )
     }
 
-    const codexSchemaPath = codexSchemaPathFor({
-        cacheDir: DEFAULT_CACHE_DIR,
-        version: loaded.version,
-        nonce: randomBytes(6).toString("hex"),
-    })
+    const shellVersion = shellVersionId()
+    const codexSchemaPathOf = (version) =>
+        codexSchemaPathFor({
+            cacheDir: DEFAULT_CACHE_DIR,
+            version,
+            nonce: randomBytes(6).toString("hex"),
+        })
+    const codexSchemaPath = codexSchemaPathOf(loaded.version)
     pruneCodexSchemas({ keep: codexSchemaPath })
     let core
     try {
         core = prepareCore({
             loaded,
             config,
-            shellVersion: VERSION,
+            packageVersion: VERSION,
+            shellVersion,
             startedAt,
             codexSchemaPath,
         })
     } catch (err) {
-        logger.error(
-            { err: err.message, code: err.code },
-            "the review core rejected this config"
-        )
-        process.exitCode = 1
+        fail(err, "the review core rejected this config")
         return
     }
     logger.info({ coreVersion: loaded.version }, "review core loaded")
@@ -565,12 +819,20 @@ const main = async () => {
         configPath,
         startedAt,
         core,
+        coreInfo: {
+            reviewVersion: loaded.reviewVersion,
+            snapshotDir: loaded.snapshotDir,
+            codexSchemaPath,
+        },
+        shellVersion,
+        loadCandidate: createCandidateLoader({ codexSchemaPathOf }),
     })
     if (!result.ok) {
         process.exitCode = 1
         return
     }
     const { server, sockets, app } = result
+    liveConfig = () => app.locals.configStore.current()
 
     // One-shot graceful shutdown. The second SIGINT/SIGTERM hard-exits
     // so a wedged close() never leaves the operator stuck — matches the

@@ -323,6 +323,25 @@ describe("buildRecord — attempt", () => {
     })
 })
 
+describe("buildRecord — coreVersion", () => {
+    test("records the core version the shell stamped, else null", () => {
+        const args = {
+            context: happyContext,
+            payload: happyPayload,
+            codexRaw: happyCodexRaw,
+            result: { status: "GOOD_TO_GO", findings: [] },
+            state: {},
+            trigger: "stop_hook",
+            priorFindingsFedIn: [],
+            timestampMs: Date.parse("2026-05-21T14:30:45Z"),
+        }
+        expect(
+            buildRecord({ ...args, coreVersion: "abc123" }).coreVersion
+        ).toBe("abc123")
+        expect(buildRecord(args).coreVersion).toBeNull()
+    })
+})
+
 describe("buildRecord — round/blockCount override", () => {
     test("explicit round/blockCount win over the state snapshot", () => {
         const rec = buildRecord({

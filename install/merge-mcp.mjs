@@ -13,6 +13,13 @@
 //   unchanged:<path>  — file existed; review entry already matched
 
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { MAX_FETCH_TIMEOUT_MS } from "../hooks/stop-review.mjs"
+
+// How long Claude Code waits on a silent request_review call. Claude Code
+// gives up on an MCP tool after 300 s by default, and a review can take as
+// long as the Stop hook's own ceiling, so this is the same 30 min the
+// installer gives the hook's harness.
+export const REVIEW_TOOL_TIMEOUT_MS = MAX_FETCH_TIMEOUT_MS + 60_000
 
 const isObj = (v) => v && typeof v === "object" && !Array.isArray(v)
 
@@ -48,6 +55,7 @@ export const mergeMcp = ({
         type: "http",
         url: `http://${bind}:${port}/mcp`,
         headersHelper: headersHelperPath,
+        timeout: REVIEW_TOOL_TIMEOUT_MS,
     }
 
     let root = {}

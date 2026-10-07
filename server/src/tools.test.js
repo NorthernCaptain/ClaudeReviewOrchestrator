@@ -17,7 +17,6 @@ import { execFile as nodeExecFile } from "node:child_process"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
-    createGuardedSpawn,
     createTools,
     DEFAULT_SEARCH_PATH,
     isGitTimeout,
@@ -176,6 +175,22 @@ describe("createTools — resolveBinary", () => {
         expect(() => tools.resolveBinary("constructor")).toThrow(
             expect.objectContaining({ code: "TOOL_NOT_ALLOWED" })
         )
+    })
+
+    test("with an issued-config check, only configs the shell pinned run a reviewer", () => {
+        const issued = new WeakSet()
+        const pinned = { codex: { binary: "/opt/codex" } }
+        issued.add(pinned)
+        const t = createTools({
+            nodeCheck: () => false,
+            locate: (b) => b,
+            isIssuedConfig: (c) => issued.has(c),
+        })
+        expect(t.resolveBinary("codex", pinned)).toBe("/opt/codex")
+        expect(() =>
+            t.resolveBinary("codex", { codex: { binary: "/opt/codex" } })
+        ).toThrow(expect.objectContaining({ code: "TOOL_CONFIG_NOT_ISSUED" }))
+        expect(t.resolveBinary("git")).toBe("git")
     })
 
     test("a reviewer binary that is node is refused", () => {
@@ -377,24 +392,6 @@ describe("createTools — spawnTool", () => {
             })
         ).toThrow(expect.objectContaining({ code: "TOOL_IS_NODE" }))
         expect(spawn).not.toHaveBeenCalled()
-    })
-})
-
-describe("createGuardedSpawn", () => {
-    test("execs the path it located from the child's cwd, and refuses node", () => {
-        const spawn = jest.fn(() => "child")
-        const guarded = createGuardedSpawn({ spawn })
-        const codex = executable("codex")
-        expect(guarded("./codex", ["a"], { cwd: dir })).toBe("child")
-        expect(spawn).toHaveBeenCalledWith(codex, ["a"], { cwd: dir })
-        symlinkSync(process.execPath, path.join(dir, "alias"))
-        expect(() => guarded("./alias", [], { cwd: dir })).toThrow(
-            expect.objectContaining({ code: "TOOL_IS_NODE" })
-        )
-        expect(() => guarded(process.execPath, [])).toThrow(
-            expect.objectContaining({ code: "TOOL_IS_NODE" })
-        )
-        expect(spawn).toHaveBeenCalledTimes(1)
     })
 })
 

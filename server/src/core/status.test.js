@@ -355,3 +355,26 @@ describe("createStatusHandler", () => {
         expect(bodies[0].config.authToken).not.toBe("secret")
     })
 })
+
+describe("handleStatus — shell state", () => {
+    test("merges the shell's versions and reload state into the body", () => {
+        const body = handleStatus({
+            store: { list: () => [] },
+            archive: null,
+            config: {},
+            startedAt: 0,
+            now: () => 0,
+            shell: {
+                shellVersion: "s1",
+                coreVersion: "c1",
+                reload: { pending: null, history: [] },
+            },
+        })
+        expect(body).toMatchObject({
+            ok: true,
+            shellVersion: "s1",
+            coreVersion: "c1",
+            reload: { pending: null },
+        })
+    })
+})

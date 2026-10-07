@@ -6,7 +6,12 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { validateConfig, __test__ } from "./config.js"
+import {
+    commitConfigChange,
+    configChangeBody,
+    validateConfig,
+    __test__,
+} from "./config.js"
 
 const { expandHome, ConfigSchema } = __test__
 
@@ -251,5 +256,87 @@ describe("validateConfig", () => {
             expect(err.message).toMatch(/port/)
             expect(err.issues.length).toBeGreaterThan(0)
         }
+    })
+})
+
+describe("port", () => {
+    test("accepts 0 (an OS-assigned port) and rejects out-of-range values", () => {
+        expect(validateConfig({ authToken: "t", port: 0 }).port).toBe(0)
+        expect(() => validateConfig({ authToken: "t", port: -1 })).toThrow()
+        expect(() => validateConfig({ authToken: "t", port: 65536 })).toThrow()
+    })
+})
+
+describe("commitConfigChange + configChangeBody", () => {
+    test("passes the delta to the transaction and shapes a success body", async () => {
+        const calls = []
+        const info = []
+        const result = await commitConfigChange({
+            configTransaction: async (delta) => {
+                calls.push(delta)
+                return { revision: 5, replaced: [{ key: "a", manualValue: 1 }] }
+            },
+            delta: [[["a"], 2]],
+            logger: { info: (...a) => info.push(a) },
+            what: "a",
+        })
+        expect(calls).toEqual([[[["a"], 2]]])
+        expect(info).toHaveLength(1)
+        expect(configChangeBody(result, { value: 2 })).toEqual({
+            ok: true,
+            value: 2,
+            persisted: true,
+            revision: 5,
+            replacedManualEdits: [{ key: "a", manualValue: 1 }],
+        })
+    })
+
+    test("a rejection becomes a ready response with its status and code", async () => {
+        const result = await commitConfigChange({
+            configTransaction: async () => {
+                throw Object.assign(new Error("nope"), {
+                    code: "X",
+                    httpStatus: 500,
+                })
+            },
+            delta: [],
+            what: "x",
+        })
+        expect(result).toEqual({
+            ok: false,
+            response: {
+                httpStatus: 500,
+                body: { ok: false, error: "nope", code: "X" },
+            },
+        })
+        const plain = await commitConfigChange({
+            configTransaction: async () => {
+                throw "boom"
+            },
+            delta: [],
+            what: "x",
+        })
+        expect(plain.response).toEqual({
+            httpStatus: 409,
+            body: { ok: false, error: "boom", code: "CONFIG_CHANGE_FAILED" },
+        })
+    })
+
+    test("no replaced edits means no replacedManualEdits field", () => {
+        expect(
+            configChangeBody({ revision: 1, replaced: [] }, { v: 1 })
+        ).toEqual({ ok: true, v: 1, persisted: true, revision: 1 })
+    })
+})
+
+describe("logging.level", () => {
+    test("is one of the logger's levels", () => {
+        expect(
+            validateConfig({ authToken: "t", logging: { level: "debug" } })
+                .logging.level
+        ).toBe("debug")
+        expect(() =>
+            validateConfig({ authToken: "t", logging: { level: "bogus" } })
+        ).toThrow(/logging\.level/)
     })
 })

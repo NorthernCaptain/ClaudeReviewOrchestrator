@@ -171,8 +171,12 @@ const buildRecord = ({
     round,
     attempt,
     blockCount,
+    coreVersion,
 }) => ({
     timestamp: new Date(timestampMs).toISOString(),
+    // The core version that ran the review, stamped by the shell so
+    // reviews before and after a reload can be compared.
+    coreVersion: coreVersion ?? null,
     context: {
         key: context.key,
         repo: context.repo,
@@ -274,6 +278,7 @@ export const createArchive = ({
         round,
         attempt,
         blockCount,
+        coreVersion,
     }) => {
         const ts = now()
         let folder
@@ -302,6 +307,7 @@ export const createArchive = ({
             round,
             attempt,
             blockCount,
+            coreVersion,
         })
 
         const md = renderMarkdown(record, blockingSeverities)

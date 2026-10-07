@@ -4,16 +4,20 @@
  */
 
 import { jest } from "@jest/globals"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
     handleReview,
     computeReviewConfigHash,
+    createReviewHandler,
+    computeExtrasHash,
+    computeReviewKey,
     defaultInflight,
     snapshotInFlight,
 } from "./review.js"
 import { ContextError } from "./context.js"
+import { createOutputSchema } from "./schema.js"
 import { createStateStore } from "../../state.js"
 
 const minimalConfig = () => ({
@@ -47,14 +51,23 @@ const happyContext = {
     key: "/repo|main",
 }
 
-// Helper for tests that seed lastBaseline. The unchanged-baseline check
-// now requires both progressHash AND reviewConfigHash to match — every
-// seed that wants to hit the unchanged branch must include the hash for
-// the config it's testing under.
+// The cache keys a real review under `cfg` would have stored (no extras,
+// no core versions, as these tests call handleReview without them).
+const cacheKeysFor = (cfg, provider = null) => ({
+    reviewConfigHash: computeReviewConfigHash(cfg, provider),
+    reviewKey: computeReviewKey({
+        config: cfg,
+        provider: provider ?? cfg.reviewer?.provider ?? "codex",
+    }),
+})
+
+// Helper for tests that seed lastBaseline. Every cache shortcut requires
+// the review key to match, so a seed that wants to hit the unchanged
+// branch carries the keys for the config it's testing under.
 const seededBaseline = (progressHash, cfg = minimalConfig()) => ({
     headSha: "abc1234",
     progressHash,
-    reviewConfigHash: computeReviewConfigHash(cfg),
+    ...cacheKeysFor(cfg),
 })
 
 const makePayload = (overrides = {}) => ({
@@ -1456,7 +1469,7 @@ describe("handleReview — reviewConfigHash invalidation", () => {
             lastBaseline: {
                 headSha: "abc1234",
                 progressHash: "g-hash-1",
-                reviewConfigHash: computeReviewConfigHash(merged),
+                ...cacheKeysFor(merged),
             },
             priorFindings: [],
             lastReviewedAt: 1,
@@ -2432,7 +2445,7 @@ describe("handleReview — provider change busts the cache (v0.1.23)", () => {
             lastBaseline: {
                 headSha: "abc",
                 progressHash: "p",
-                reviewConfigHash: computeReviewConfigHash(cfg),
+                ...cacheKeysFor(cfg),
                 files: {
                     modified: [{ path: "a.js" }],
                     untracked: [],
@@ -2490,7 +2503,7 @@ describe("handleReview — provider change busts the cache (v0.1.23)", () => {
             lastBaseline: {
                 headSha: "abc",
                 progressHash: "p",
-                reviewConfigHash: computeReviewConfigHash(cfg),
+                ...cacheKeysFor(cfg),
                 files: {
                     modified: [{ path: "a.js" }],
                     untracked: [],
@@ -2620,19 +2633,34 @@ describe("handleReview — in-flight dedup keys force/provider (v0.1.23)", () =>
     })
 
     test("two plain requests under the same provider DO share one pipeline (dedup intact)", async () => {
-        const inflight = new Map()
-        const sentinel = Promise.resolve({
-            httpStatus: 200,
-            body: { status: "SHARED_RESULT" },
-        })
-        inflight.set("/repo|main|force=false|provider=codex", sentinel)
-        const r = await handleReview({
-            body: { cwd: "/repo", trigger: "mcp_tool" },
-            config: minimalConfig(), // effective provider = codex
-            store,
-            deps: makeDeps({ inflight }),
-        })
-        expect(r.body.status).toBe("SHARED_RESULT")
+        let finish
+        const runSpy = jest.fn(
+            () =>
+                new Promise((resolve) => {
+                    finish = () =>
+                        resolve({
+                            status: "GOOD_TO_GO",
+                            findings: [],
+                            raw: { durationMs: 1, exitCode: 0 },
+                        })
+                })
+        )
+        const deps = makeDeps({ inflight: new Map(), runAndParse: runSpy })
+        const call = () =>
+            handleReview({
+                body: { cwd: "/repo", trigger: "mcp_tool" },
+                config: minimalConfig(), // effective provider = codex
+                store,
+                deps,
+            })
+        const a = call()
+        await new Promise((r) => setImmediate(r))
+        const b = call()
+        await new Promise((r) => setImmediate(r))
+        finish()
+        const [ra, rb] = await Promise.all([a, b])
+        expect(runSpy).toHaveBeenCalledTimes(1)
+        expect(rb).toBe(ra)
     })
 })
 
@@ -2739,7 +2767,7 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
     })
     afterEach(() => cleanupStore(store))
 
-    const seed = (overrides = {}) => {
+    const seed = (overrides = {}, cfg = minimalConfig()) => {
         store.save("/repo|main", {
             repoRoot: "/repo",
             branch: "main",
@@ -2747,9 +2775,9 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
             lastBaseline: {
                 headSha: "abc",
                 progressHash: "p",
-                // Must match the effective review policy hash for the
-                // fast path to fire (v0.1.23 — provider is part of it).
-                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                // Must match the request's review key for the fast path
+                // to fire (provider, effective config, code versions).
+                ...cacheKeysFor(cfg),
                 files: {
                     modified: [],
                     untracked: [],
@@ -2884,9 +2912,9 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
     })
 
     test("legacy payload.verifyCleanTree=false no longer skips the tree probe", async () => {
-        seed()
         const cfg = { ...minimalConfig() }
         cfg.payload = { ...(cfg.payload ?? {}), verifyCleanTree: false }
+        seed({}, cfg)
         const treeCleanSpy = jest.fn(() => false)
         const buildSpy = jest.fn(() => makePayload({ progressHash: "changed" }))
         await handleReview({
@@ -2951,7 +2979,7 @@ describe("handleReview — change-notification fast path (v0.1.11)", () => {
                 lastBaseline: {
                     headSha: "abc",
                     progressHash: "p",
-                    reviewConfigHash: computeReviewConfigHash(cfg),
+                    ...cacheKeysFor(cfg),
                     source,
                     baseSha,
                     files: {
@@ -3456,7 +3484,7 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
             lastBaseline: {
                 headSha: "abc1234",
                 progressHash: "p",
-                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                ...cacheKeysFor(minimalConfig()),
                 files: {
                     modified: [{ path: "a.js" }],
                     untracked: [],
@@ -3508,7 +3536,7 @@ describe("handleReview — ESCALATE notification gate (v0.1.14)", () => {
             lastBaseline: {
                 headSha: "abc1234",
                 progressHash: "p",
-                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                ...cacheKeysFor(minimalConfig()),
                 files: {
                     modified: [{ path: "a.js" }],
                     untracked: [],
@@ -4266,7 +4294,7 @@ describe("handleReview — NO_PROGRESS fall-through when priorFindings empty (v0
             lastBaseline: {
                 headSha: "abc",
                 progressHash: "p",
-                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                ...cacheKeysFor(minimalConfig()),
                 files: {
                     modified: [{ path: "a.js" }],
                     untracked: [],
@@ -4315,7 +4343,7 @@ describe("handleReview — NO_PROGRESS fall-through when priorFindings empty (v0
             lastBaseline: {
                 headSha: "abc1234",
                 progressHash: "p",
-                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                ...cacheKeysFor(minimalConfig()),
                 files: {
                     modified: [{ path: "a.js" }],
                     untracked: [],
@@ -4378,7 +4406,7 @@ describe("handleReview — MAX_BLOCKS recovery exemption for empty-cache (v0.1.3
             lastBaseline: {
                 headSha: "abc",
                 progressHash: "p",
-                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                ...cacheKeysFor(minimalConfig()),
                 files: {
                     modified: [{ path: "a.js" }],
                     untracked: [],
@@ -4425,7 +4453,7 @@ describe("handleReview — MAX_BLOCKS recovery exemption for empty-cache (v0.1.3
             lastBaseline: {
                 headSha: "abc",
                 progressHash: "p",
-                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+                ...cacheKeysFor(minimalConfig()),
                 files: {
                     modified: [{ path: "a.js" }],
                     untracked: [],
@@ -5842,5 +5870,520 @@ describe("handleReview — attempts since the last pass", () => {
         store.__dir = dir
         await reviewWith("GOOD_TO_GO")
         expect(lastArchived().attempt).toBe(3)
+    })
+})
+
+describe("handleReview — review key and caller extras (hot-reload plan §5.5)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const raw = { durationMs: 1, exitCode: 0, timedOut: false }
+    const pass = async () => ({ status: "GOOD_TO_GO", findings: [], raw })
+    const blocking = {
+        file: "a.js",
+        line: 1,
+        severity: "major",
+        category: "bug",
+        message: "m",
+    }
+    const fail = async () => ({ status: "ISSUES", findings: [blocking], raw })
+    const run = (
+        runAndParse,
+        { config = minimalConfig(), body = {}, ...rest } = {}
+    ) =>
+        handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool", ...body },
+            config,
+            store,
+            deps: makeDeps({ runAndParse }),
+            ...rest,
+        })
+
+    test("a reasoning-effort change (outside reviewConfigHash) runs a fresh review", async () => {
+        const spy = jest.fn(pass)
+        await run(spy)
+        const cfg = minimalConfig()
+        cfg.codex = { ...cfg.codex, reasoningEffort: "xhigh" }
+        expect(computeReviewConfigHash(cfg)).toBe(
+            computeReviewConfigHash(minimalConfig())
+        )
+        expect((await run(spy, { config: cfg })).body.status).toBe("GOOD_TO_GO")
+        expect((await run(spy, { config: cfg })).body.status).toBe("NO_CHANGES")
+        expect(spy).toHaveBeenCalledTimes(2)
+    })
+
+    test.each(["reviewVersion", "shellVersion"])(
+        "a different %s reviews the unchanged tree again; the same one short-circuits",
+        async (field) => {
+            const spy = jest.fn(pass)
+            await run(spy, { [field]: "a" })
+            expect((await run(spy, { [field]: "a" })).body.status).toBe(
+                "NO_CHANGES"
+            )
+            expect((await run(spy, { [field]: "b" })).body.status).toBe(
+                "GOOD_TO_GO"
+            )
+            expect(spy).toHaveBeenCalledTimes(2)
+        }
+    )
+
+    test("different provider overrides don't share a baseline", async () => {
+        const spy = jest.fn(pass)
+        await run(spy, { body: { provider: "codex" } })
+        await run(spy, { body: { provider: "claude" } })
+        await run(spy, { body: { provider: "codex" } })
+        expect(spy).toHaveBeenCalledTimes(3)
+    })
+
+    test("a baseline from before the review key never matches", async () => {
+        store.save(happyContext.key, {
+            ...happyContext,
+            lastResultStatus: "GOOD_TO_GO",
+            lastBaseline: {
+                headSha: "abc1234",
+                progressHash: "g-hash-1",
+                reviewConfigHash: computeReviewConfigHash(minimalConfig()),
+            },
+        })
+        const spy = jest.fn(pass)
+        expect((await run(spy)).body.status).toBe("GOOD_TO_GO")
+        expect(spy).toHaveBeenCalledTimes(1)
+        expect(store.get(happyContext).lastBaseline.reviewKey).toBe(
+            computeReviewKey({ config: minimalConfig(), provider: "codex" })
+        )
+    })
+
+    test("caller extras: the same extras short-circuit, other extras review", async () => {
+        const spy = jest.fn(pass)
+        await run(spy, { body: { extra_instructions: "focus on auth" } })
+        expect(
+            (await run(spy, { body: { extra_instructions: "focus on auth" } }))
+                .body.status
+        ).toBe("NO_CHANGES")
+        expect(
+            (await run(spy, { body: { extra_instructions: "perf only" } })).body
+                .status
+        ).toBe("GOOD_TO_GO")
+        expect(spy).toHaveBeenCalledTimes(2)
+        expect(computeExtrasHash("")).toBeNull()
+        expect(computeExtrasHash(undefined)).toBeNull()
+    })
+
+    test("a Stop hook after an MCP pass with extras gets NO_CHANGES; after ISSUES it reviews", async () => {
+        const spy = jest.fn(pass)
+        await run(spy, { body: { extra_instructions: "focus" } })
+        expect(
+            (await run(spy, { body: { trigger: "stop_hook" } })).body.status
+        ).toBe("NO_CHANGES")
+        expect(spy).toHaveBeenCalledTimes(1)
+
+        store.reset(happyContext)
+        const failing = jest.fn(fail)
+        await run(failing, { body: { extra_instructions: "focus" } })
+        const passing = jest.fn(pass)
+        expect(
+            (await run(passing, { body: { trigger: "stop_hook" } })).body.status
+        ).toBe("GOOD_TO_GO")
+        expect(passing).toHaveBeenCalledTimes(1)
+    })
+
+    const slow = () => {
+        const gates = []
+        const spy = jest.fn(
+            (args) =>
+                new Promise((resolve) => {
+                    gates.push(() =>
+                        resolve({
+                            status: "GOOD_TO_GO",
+                            findings: [],
+                            raw: { ...raw, model: args.config.codex.model },
+                        })
+                    )
+                })
+        )
+        return { spy, gates }
+    }
+    const tick = () => new Promise((r) => setImmediate(r))
+
+    test("calls with different extras don't join a running review; identical ones do", async () => {
+        const { spy, gates } = slow()
+        const deps = makeDeps({ runAndParse: spy, inflight: new Map() })
+        const call = (extras) =>
+            handleReview({
+                body: {
+                    cwd: "/repo",
+                    trigger: "mcp_tool",
+                    extra_instructions: extras,
+                },
+                config: minimalConfig(),
+                store,
+                deps,
+            })
+        const a = call("x")
+        await tick()
+        const same = call("x")
+        const other = call("y")
+        await tick()
+        expect(spy).toHaveBeenCalledTimes(1)
+        gates.shift()()
+        const [ra, rs] = await Promise.all([a, same])
+        expect(rs).toBe(ra)
+        // "y" queued behind "x" on the context chain, then ran its own.
+        await tick()
+        expect(spy).toHaveBeenCalledTimes(2)
+        gates.shift()()
+        expect((await other).body.status).toBe("GOOD_TO_GO")
+    })
+
+    test("a Stop hook doesn't join a running MCP review with extras; it queues, then gets NO_CHANGES", async () => {
+        const { spy, gates } = slow()
+        const deps = makeDeps({ runAndParse: spy, inflight: new Map() })
+        const mcp = handleReview({
+            body: {
+                cwd: "/repo",
+                trigger: "mcp_tool",
+                extra_instructions: "x",
+            },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        await tick()
+        const hook = handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        await tick()
+        gates.shift()()
+        expect((await mcp).body.status).toBe("GOOD_TO_GO")
+        expect((await hook).body.status).toBe("NO_CHANGES")
+        expect(spy).toHaveBeenCalledTimes(1)
+    })
+
+    test("a model change mid-review queues instead of joining, and runs with the new model", async () => {
+        const { spy, gates } = slow()
+        const deps = makeDeps({ runAndParse: spy, inflight: new Map() })
+        const call = (model) => {
+            const config = minimalConfig()
+            config.codex = { ...config.codex, model }
+            return handleReview({
+                body: { cwd: "/repo", trigger: "mcp_tool" },
+                config,
+                store,
+                deps,
+            })
+        }
+        const first = call("m1")
+        await tick()
+        const joined = call("m1")
+        const changed = call("m2")
+        await tick()
+        gates.shift()()
+        expect(await joined).toBe(await first)
+        await tick()
+        gates.shift()()
+        expect((await changed).body.status).toBe("GOOD_TO_GO")
+        expect(spy).toHaveBeenCalledTimes(2)
+        expect(spy.mock.calls[1][0].config.codex.model).toBe("m2")
+    })
+
+    test("a project-config edit mid-review queues the next request on the new settings", async () => {
+        const { spy, gates } = slow()
+        let projectConfig = null
+        const deps = makeDeps({
+            runAndParse: spy,
+            inflight: new Map(),
+            loadProjectConfig: () => projectConfig,
+        })
+        const call = () =>
+            handleReview({
+                body: { cwd: "/repo", trigger: "mcp_tool" },
+                config: minimalConfig(),
+                store,
+                deps,
+            })
+        const first = call()
+        await tick()
+        projectConfig = { blockingSeverities: ["blocker"] }
+        const second = call()
+        await tick()
+        gates.shift()()
+        await first
+        await tick()
+        expect(spy).toHaveBeenCalledTimes(2)
+        expect(spy.mock.calls[1][0].config.blockingSeverities).toEqual([
+            "blocker",
+        ])
+        gates.shift()()
+        await second
+    })
+
+    test("the reviewer runs through spawnTool with the config pinned at admission", async () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "review-spawn-"))
+        try {
+            const schema = createOutputSchema(
+                readFileSync(
+                    new URL("./codex-output.schema.json", import.meta.url)
+                ),
+                { strictPath: path.join(dir, "strict.json") }
+            )
+            const spawnTool = jest.fn(() => {
+                throw new Error("spawn refused in test")
+            })
+            const pinned = Object.freeze(minimalConfig())
+            const r = await handleReview({
+                body: { cwd: "/repo", trigger: "mcp_tool" },
+                config: pinned,
+                store,
+                schema,
+                deps: makeDeps({ runAndParse: undefined, spawnTool }),
+            })
+            expect(r.httpStatus).toBe(502)
+            expect(spawnTool).toHaveBeenCalledTimes(1)
+            const [name, , opts] = spawnTool.mock.calls[0]
+            expect(name).toBe("codex")
+            expect(opts.config).toBe(pinned)
+        } finally {
+            rmSync(dir, { recursive: true, force: true })
+        }
+    })
+})
+
+describe("handleReview — request deadlines (hot-reload plan §5.5)", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => cleanupStore(store))
+
+    const gated = () => {
+        const gates = []
+        const spy = jest.fn(
+            () =>
+                new Promise((resolve) => {
+                    gates.push(() =>
+                        resolve({
+                            status: "GOOD_TO_GO",
+                            findings: [],
+                            raw: { durationMs: 1, exitCode: 0 },
+                        })
+                    )
+                })
+        )
+        return { spy, gates }
+    }
+    const tick = () => new Promise((r) => setImmediate(r))
+    const soon = (ms = 30) => Date.now() + ms
+
+    test("a request queued behind same-context reviews answers at its deadline and never runs", async () => {
+        const { spy, gates } = gated()
+        let progress = 0
+        const deps = makeDeps({
+            runAndParse: spy,
+            inflight: new Map(),
+            contextChains: new Map(),
+            buildPayload: () => makePayload({ progressHash: `p${++progress}` }),
+        })
+        const call = (body, extra = {}) =>
+            handleReview({
+                body: { cwd: "/repo", trigger: "mcp_tool", ...body },
+                config: minimalConfig(),
+                store,
+                deps,
+                ...extra,
+            })
+        const first = call({ force: true })
+        await tick()
+        const second = call({ provider: "claude" })
+        await tick()
+        const hook = await call({ trigger: "stop_hook" }, { deadline: soon() })
+        expect(hook.body).toMatchObject({
+            status: "ESCALATE",
+            code: "DEADLINE_EXCEEDED",
+            notifyUser: false,
+        })
+        expect(hook.background).toBeUndefined()
+        expect(deps.inflight.size).toBe(2)
+        gates.shift()()
+        await first
+        await tick()
+        gates.shift()()
+        await second
+        await tick()
+        // The abandoned request never ran; the chain went on without it.
+        expect(spy).toHaveBeenCalledTimes(2)
+        expect(deps.contextChains.size).toBe(0)
+    })
+
+    test("a request joined to a slow review stops waiting at its deadline; the review goes on", async () => {
+        const { spy, gates } = gated()
+        const deps = makeDeps({ runAndParse: spy, inflight: new Map() })
+        const call = (extra = {}) =>
+            handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook" },
+                config: minimalConfig(),
+                store,
+                deps,
+                ...extra,
+            })
+        const owner = call()
+        await tick()
+        const joined = await call({ deadline: soon() })
+        expect(joined.body.code).toBe("DEADLINE_EXCEEDED")
+        gates.shift()()
+        expect((await owner).body.status).toBe("GOOD_TO_GO")
+        expect(store.get(happyContext).lastResultStatus).toBe("GOOD_TO_GO")
+    })
+
+    test("a request whose own review outlasts the deadline answers early; the review finishes and is cached", async () => {
+        const { spy, gates } = gated()
+        const deps = makeDeps({ runAndParse: spy, inflight: new Map() })
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+            deadline: soon(),
+        })
+        expect(r.body.code).toBe("DEADLINE_EXCEEDED")
+        expect(r.background).toBeInstanceOf(Promise)
+        // The deadline answer itself is never cached.
+        expect(store.get(happyContext).lastResultStatus).toBeNull()
+        gates.shift()()
+        expect((await r.background).body.status).toBe("GOOD_TO_GO")
+        const next = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        expect(next.body.status).toBe("NO_CHANGES")
+        expect(spy).toHaveBeenCalledTimes(1)
+    })
+
+    test("a deadline already past on arrival still starts the review when nothing is ahead of it", async () => {
+        const { spy, gates } = gated()
+        const r = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ runAndParse: spy, inflight: new Map() }),
+            deadline: Date.now() - 1,
+        })
+        expect(r.body.code).toBe("DEADLINE_EXCEEDED")
+        await tick()
+        expect(spy).toHaveBeenCalledTimes(1)
+        gates.shift()()
+        await r.background
+    })
+
+    test("a joiner without a deadline keeps a queued owner from being abandoned", async () => {
+        const { spy, gates } = gated()
+        let progress = 0
+        const deps = makeDeps({
+            runAndParse: spy,
+            inflight: new Map(),
+            buildPayload: () => makePayload({ progressHash: `p${++progress}` }),
+        })
+        const call = (body, extra = {}) =>
+            handleReview({
+                body: { cwd: "/repo", trigger: "stop_hook", ...body },
+                config: minimalConfig(),
+                store,
+                deps,
+                ...extra,
+            })
+        const ahead = call({ force: true, trigger: "mcp_tool" })
+        await tick()
+        const owner = call({}, { deadline: soon(60) })
+        await tick()
+        const joiner = call({})
+        expect((await owner).body.code).toBe("DEADLINE_EXCEEDED")
+        gates.shift()()
+        await ahead
+        await tick()
+        gates.shift()()
+        expect((await joiner).body.status).toBe("GOOD_TO_GO")
+        expect(spy).toHaveBeenCalledTimes(2)
+    })
+
+    test("the route handler answers, then waits for the background review before returning", async () => {
+        const { spy, gates } = gated()
+        const handler = createReviewHandler(() => ({
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ runAndParse: spy, inflight: new Map() }),
+        }))
+        const res = {
+            status(c) {
+                this.statusCode = c
+                return this
+            },
+            json(b) {
+                this.body = b
+                return this
+            },
+        }
+        let done = false
+        const handled = handler(
+            { body: { cwd: "/repo", trigger: "stop_hook" } },
+            res,
+            { config: minimalConfig(), deadline: soon() }
+        ).then(() => {
+            done = true
+        })
+        await new Promise((r) => setTimeout(r, 60))
+        expect(res.body.code).toBe("DEADLINE_EXCEEDED")
+        expect(done).toBe(false)
+        gates.shift()()
+        await handled
+        expect(done).toBe(true)
+    })
+
+    test("the deadline also covers context resolution: a slow git answers on time", async () => {
+        let finishResolve
+        const deps = makeDeps({
+            inflight: new Map(),
+            resolveContext: () =>
+                new Promise((resolve) => {
+                    finishResolve = () => resolve(happyContext)
+                }),
+        })
+        const handler = createReviewHandler(() => ({
+            config: minimalConfig(),
+            store,
+            deps,
+        }))
+        const res = {
+            status(c) {
+                this.statusCode = c
+                return this
+            },
+            json(b) {
+                this.body = b
+                return this
+            },
+        }
+        let done = false
+        const started = Date.now()
+        const handled = handler(
+            { body: { cwd: "/repo", trigger: "stop_hook" } },
+            res,
+            { config: minimalConfig(), deadline: Date.now() + 20 }
+        ).then(() => {
+            done = true
+        })
+        await new Promise((r) => setTimeout(r, 60))
+        expect(res.body).toMatchObject({ code: "DEADLINE_EXCEEDED" })
+        expect(Date.now() - started).toBeLessThan(1000)
+        expect(done).toBe(false)
+        finishResolve()
+        await handled
+        expect(done).toBe(true)
     })
 })

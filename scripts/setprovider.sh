@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # setprovider.sh — switch the reviewer provider on the running server.
 #
-# PUTs to /provider, which mutates the live in-memory config (the next
-# review uses the new provider immediately) and best-effort persists the
-# change to the on-disk config file so it survives a restart.
+# PUTs to /provider, which sets the provider in the live config and in
+# the config file together (one config transaction): the next review
+# uses it, and it survives a restart.
 #
 # Usage:
 #   scripts/setprovider.sh gemini

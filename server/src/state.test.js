@@ -399,3 +399,31 @@ describe("exclusions (v1.1)", () => {
         ])
     })
 })
+
+describe("createStateStore — live idle interval", () => {
+    test("a function interval is read on every lookup", () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "state-idle-"))
+        try {
+            let t = 1000
+            let minutes = 10
+            const store = createStateStore({
+                filePath: path.join(dir, "state.json"),
+                now: () => t,
+                idleResetMs: () => minutes * 60_000,
+            })
+            const ctx = { key: "/r|main", repoRoot: "/r", branch: "main" }
+            store.save(ctx.key, {
+                repoRoot: "/r",
+                branch: "main",
+                codexRounds: 3,
+                lastReviewedAt: 1000,
+            })
+            t += 2 * 60_000
+            expect(store.get(ctx).codexRounds).toBe(3)
+            minutes = 1
+            expect(store.get(ctx).codexRounds).toBe(0)
+        } finally {
+            rmSync(dir, { recursive: true, force: true })
+        }
+    })
+})

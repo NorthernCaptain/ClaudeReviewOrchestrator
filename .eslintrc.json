@@ -39,7 +39,10 @@
         "node/no-unpublished-require": "warn",
         "node/no-unsupported-features/es-syntax": [
             "error",
-            { "version": ">=24.0.0", "ignores": ["modules", "dynamicImport"] }
+            {
+                "version": ">=24.0.0",
+                "ignores": ["modules", "dynamicImport"]
+            }
         ],
         "@typescript-eslint/no-var-requires": "off",
         "@typescript-eslint/no-unused-vars": "off",
@@ -62,6 +65,187 @@
         "src/generated/*",
         "node_modules/*",
         "reviews/*",
-        "coverage/*"
+        "coverage/*",
+        "server/.core-versions/*"
+    ],
+    "overrides": [
+        {
+            "files": ["server/src/core/*.js"],
+            "rules": {
+                "no-restricted-imports": [
+                    "error",
+                    {
+                        "paths": [
+                            {
+                                "name": "module",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "node:module",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "vm",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "node:vm",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "worker_threads",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "node:worker_threads",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "child_process",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "node:child_process",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            }
+                        ]
+                    }
+                ],
+                "no-restricted-globals": [
+                    "error",
+                    "require",
+                    "eval",
+                    "Function"
+                ],
+                "no-restricted-syntax": [
+                    "error",
+                    {
+                        "selector": "ImportDeclaration[source.value=/^\\.\\.\\//]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ExportNamedDeclaration[source.value=/^\\.\\.\\//]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ExportAllDeclaration[source.value=/^\\.\\.\\//]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ImportDeclaration[source.value=/^(\\/|#|file:|review-orchestrator(\\/|$))/]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ExportNamedDeclaration[source.value=/^(\\/|#|file:|review-orchestrator(\\/|$))/]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ExportAllDeclaration[source.value=/^(\\/|#|file:|review-orchestrator(\\/|$))/]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ImportExpression",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "MemberExpression[object.type='MetaProperty'][property.name='resolve']",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "MemberExpression[object.name='process'][property.name='execPath']",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    }
+                ]
+            }
+        },
+        {
+            "files": ["server/src/core/review/**/*.js"],
+            "rules": {
+                "no-restricted-imports": [
+                    "error",
+                    {
+                        "paths": [
+                            {
+                                "name": "module",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "node:module",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "vm",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "node:vm",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "worker_threads",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "node:worker_threads",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "child_process",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            },
+                            {
+                                "name": "node:child_process",
+                                "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                            }
+                        ]
+                    }
+                ],
+                "no-restricted-globals": [
+                    "error",
+                    "require",
+                    "eval",
+                    "Function"
+                ],
+                "no-restricted-syntax": [
+                    "error",
+                    {
+                        "selector": "ImportDeclaration[source.value=/^\\.\\.\\/\\.\\.\\//]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ExportNamedDeclaration[source.value=/^\\.\\.\\/\\.\\.\\//]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ExportAllDeclaration[source.value=/^\\.\\.\\/\\.\\.\\//]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ImportDeclaration[source.value=/^(\\/|#|file:|review-orchestrator(\\/|$))/]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ExportNamedDeclaration[source.value=/^(\\/|#|file:|review-orchestrator(\\/|$))/]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ExportAllDeclaration[source.value=/^(\\/|#|file:|review-orchestrator(\\/|$))/]",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "ImportExpression",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "MemberExpression[object.type='MetaProperty'][property.name='resolve']",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    },
+                    {
+                        "selector": "MemberExpression[object.name='process'][property.name='execPath']",
+                        "message": "Core code must stay inside its snapshot (hot-reload plan §5.3)."
+                    }
+                ]
+            }
+        }
     ]
 }

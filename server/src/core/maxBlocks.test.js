@@ -9,120 +9,108 @@ import {
     MAX_MAX_BLOCKS,
 } from "./maxBlocks.js"
 
-const fakeFs = (initial) => {
-    let stored = initial
-    return {
-        readFileSync: () => stored,
-        writeFileSync: (_p, data) => {
-            stored = data
-        },
-        read: () => stored,
+// Records each delta and answers like the shell's config transaction.
+const fakeTransaction = (result = { revision: 4, replaced: [] }) => {
+    const tx = async (delta) => {
+        tx.calls.push(delta)
+        return result
     }
+    tx.calls = []
+    return tx
 }
 
-const cfg = (overrides = {}) => ({
-    limits: { maxBlocks: 6 },
-    reviewer: {},
-    ...overrides,
-})
+const cfg = () => ({ limits: { maxBlocks: 5 }, reviewer: {} })
 
 describe("handleSetMaxBlocks", () => {
-    test("400 when value is missing or non-numeric", () => {
-        const r1 = handleSetMaxBlocks({ body: {}, config: cfg() })
-        expect(r1.httpStatus).toBe(400)
-        expect(r1.body.ok).toBe(false)
-
-        const r2 = handleSetMaxBlocks({
-            body: { value: "x" },
-            config: cfg(),
-        })
-        expect(r2.httpStatus).toBe(400)
-    })
-
-    test("400 when value is out of range", () => {
-        const below = handleSetMaxBlocks({
-            body: { value: MIN_MAX_BLOCKS - 1 },
-            config: cfg(),
-        })
-        expect(below.httpStatus).toBe(400)
-        const above = handleSetMaxBlocks({
-            body: { value: MAX_MAX_BLOCKS + 1 },
-            config: cfg(),
-        })
-        expect(above.httpStatus).toBe(400)
-    })
-
-    test("mutates the live config and persists to disk", () => {
-        const config = cfg()
-        const fs = fakeFs(JSON.stringify({ limits: { maxBlocks: 6 } }, null, 2))
-        const r = handleSetMaxBlocks({
-            body: { value: 8 },
-            config,
-            configPath: "/tmp/whatever.json",
-            deps: { fs },
-        })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body).toEqual(
-            expect.objectContaining({
-                ok: true,
-                value: 8,
-                previous: 6,
-                persisted: true,
+    test("400 when value is missing or non-numeric, without a transaction", async () => {
+        const tx = fakeTransaction()
+        for (const body of [{}, { value: "x" }, { value: Infinity }]) {
+            const r = await handleSetMaxBlocks({
+                body,
+                config: cfg(),
+                configTransaction: tx,
             })
-        )
-        expect(config.limits.maxBlocks).toBe(8)
-        expect(JSON.parse(fs.read()).limits.maxBlocks).toBe(8)
-    })
-
-    test("truncates non-integer numeric input before applying", () => {
-        const config = cfg()
-        const fs = fakeFs(JSON.stringify({ limits: { maxBlocks: 6 } }, null, 2))
-        const r = handleSetMaxBlocks({
-            body: { value: 9.7 },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
-        })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body.value).toBe(9)
-        expect(config.limits.maxBlocks).toBe(9)
-    })
-
-    test("reports persistError when disk write fails (live still mutates)", () => {
-        const config = cfg()
-        const fs = {
-            readFileSync: () => JSON.stringify({ limits: { maxBlocks: 6 } }),
-            writeFileSync: () => {
-                throw new Error("EROFS")
-            },
+            expect(r.httpStatus).toBe(400)
+            expect(r.body.ok).toBe(false)
         }
-        let warnCalls = 0
-        const r = handleSetMaxBlocks({
-            body: { value: 10 },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
-            logger: { warn: () => warnCalls++, info: () => {} },
-        })
-        expect(r.httpStatus).toBe(200)
-        expect(r.body.ok).toBe(true)
-        expect(r.body.persisted).toBe(false)
-        expect(r.body.persistError).toContain("EROFS")
-        expect(config.limits.maxBlocks).toBe(10)
-        expect(warnCalls).toBe(1)
+        expect(tx.calls).toEqual([])
     })
 
-    test("creates limits block when it doesn't exist in the source config", () => {
-        const config = {}
-        const fs = fakeFs(JSON.stringify({}))
-        const r = handleSetMaxBlocks({
-            body: { value: 4 },
-            config,
-            configPath: "/x.json",
-            deps: { fs },
+    test("400 when value is out of range", async () => {
+        const tx = fakeTransaction()
+        for (const value of [MIN_MAX_BLOCKS - 1, MAX_MAX_BLOCKS + 1]) {
+            const r = await handleSetMaxBlocks({
+                body: { value },
+                config: cfg(),
+                configTransaction: tx,
+            })
+            expect(r.httpStatus).toBe(400)
+        }
+        expect(tx.calls).toEqual([])
+    })
+
+    test("commits limits.maxBlocks through the config transaction", async () => {
+        const tx = fakeTransaction()
+        const r = await handleSetMaxBlocks({
+            body: { value: 12 },
+            config: cfg(),
+            configTransaction: tx,
         })
-        expect(r.httpStatus).toBe(200)
-        expect(config.limits.maxBlocks).toBe(4)
-        expect(JSON.parse(fs.read()).limits.maxBlocks).toBe(4)
+        expect(tx.calls).toEqual([[[["limits", "maxBlocks"], 12]]])
+        expect(r).toEqual({
+            httpStatus: 200,
+            body: {
+                ok: true,
+                value: 12,
+                previous: 5,
+                persisted: true,
+                revision: 4,
+            },
+        })
+    })
+
+    test("truncates non-integer input; previous is null without a limits block", async () => {
+        const tx = fakeTransaction()
+        const r = await handleSetMaxBlocks({
+            body: { value: 7.9 },
+            config: {},
+            configTransaction: tx,
+        })
+        expect(r.body).toMatchObject({ value: 7, previous: null })
+    })
+
+    test("reports a manual edit the change replaced", async () => {
+        const replaced = [{ key: "limits.maxBlocks", manualValue: 9 }]
+        const r = await handleSetMaxBlocks({
+            body: { value: 3 },
+            config: cfg(),
+            configTransaction: fakeTransaction({ revision: 1, replaced }),
+        })
+        expect(r.body.replacedManualEdits).toEqual(replaced)
+    })
+
+    test("a rejected transaction is the response, with nothing changed", async () => {
+        const err = Object.assign(new Error("config.json isn't valid JSON"), {
+            code: "CONFIG_FILE_INVALID",
+            httpStatus: 409,
+        })
+        const warn = []
+        const r = await handleSetMaxBlocks({
+            body: { value: 3 },
+            config: cfg(),
+            configTransaction: async () => {
+                throw err
+            },
+            logger: { warn: (...a) => warn.push(a), info() {} },
+        })
+        expect(r).toEqual({
+            httpStatus: 409,
+            body: {
+                ok: false,
+                error: "config.json isn't valid JSON",
+                code: "CONFIG_FILE_INVALID",
+            },
+        })
+        expect(warn).toHaveLength(1)
     })
 })

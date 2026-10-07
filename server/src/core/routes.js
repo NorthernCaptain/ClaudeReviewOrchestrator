@@ -32,12 +32,12 @@ const respond = (handle) => async (req, res) => {
     res.status(result.httpStatus).json(result.body)
 }
 
-export const createUiEntry = ({ getLive, shellVersion, startedAt }) => {
+export const createUiEntry = ({ getLive, packageVersion, startedAt }) => {
     const options = () => {
         const live = getLive()
         return {
             config: live.config,
-            configPath: live.configPath,
+            configTransaction: live.configTransaction,
             store: live.store,
             archive: live.archive,
             logger: live.logger,
@@ -49,7 +49,7 @@ export const createUiEntry = ({ getLive, shellVersion, startedAt }) => {
         snapshotInFlight(Date.now, getLive().registries.inflightMeta)
     const configMutation = (handle) =>
         respond((req) => handle({ ...options(), body: req.body }))
-    const summarize = (config) => summarizeConfig(config, shellVersion)
+    const summarize = (config) => summarizeConfig(config, packageVersion)
 
     return {
         summarize,
@@ -60,12 +60,13 @@ export const createUiEntry = ({ getLive, shellVersion, startedAt }) => {
             status: createStatusHandler(() => ({
                 ...options(),
                 startedAt,
-                version: shellVersion,
+                version: packageVersion,
+                shell: getLive().shellStatus?.() ?? null,
             })),
             dashboardPage: createDashboardPageHandler(() => ({
                 ...options(),
                 summarize,
-                version: shellVersion,
+                version: packageVersion,
                 startedAt,
                 inFlight,
             })),
@@ -106,7 +107,7 @@ export const createUiEntry = ({ getLive, shellVersion, startedAt }) => {
         // Pure: the dashboard must render for this config.
         selfCheck: (config) => {
             renderDashboard({
-                version: shellVersion,
+                version: packageVersion,
                 config: summarize(config),
                 uptimeSeconds: 0,
                 startedAt: null,

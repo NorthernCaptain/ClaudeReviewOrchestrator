@@ -257,13 +257,31 @@ const buildHooks = async ({
             if (!cwd) return
 
             logLine("review-orchestrator: reviewing changes…")
-            const res = await postJson({
-                url: config.url,
-                token: config.token,
-                body: { cwd, session_id: sessionID, trigger: "stop_hook" },
-                timeoutMs: reviewTimeoutMs,
-                fetchImpl: httpFetch,
-            })
+            const body = { cwd, session_id: sessionID, trigger: "stop_hook" }
+            // The shared client retries a stale wait limit under one overall
+            // budget, like the Stop hooks; an older installed lib without
+            // it gets a single request.
+            const res = lib.postReview
+                ? await lib
+                      .postReview({
+                          fetchFn: httpFetch,
+                          url: config.url,
+                          token: config.token,
+                          requestBody: body,
+                          limitMs: reviewTimeoutMs,
+                      })
+                      .then((r) => ({
+                          httpStatus: r.httpStatus,
+                          body: r.body,
+                          error: r.fetchError,
+                      }))
+                : await postJson({
+                      url: config.url,
+                      token: config.token,
+                      body,
+                      timeoutMs: reviewTimeoutMs,
+                      fetchImpl: httpFetch,
+                  })
             const decision = lib.decideStopHookResponse({
                 reviewResponse: res.body,
                 fetchHttpStatus: res.httpStatus,

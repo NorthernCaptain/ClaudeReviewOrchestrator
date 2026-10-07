@@ -23,8 +23,9 @@ export const STATE_FORMAT = 1
 export { validateConfig }
 
 // Two-phase: createCore gets only inert staging inputs ({ resources,
-// version, shellVersion, startedAt, codexSchemaPath }) and touches no live
-// state; attach(live) is a pure reference assignment done by the shell.
+// version, reviewVersion, shellVersion, packageVersion, startedAt,
+// codexSchemaPath }) and touches no live state; attach(live) is a pure
+// reference assignment done by the shell.
 export const createCore = (staging) => {
     let live = null
     const getLive = () => {
@@ -34,11 +35,16 @@ export const createCore = (staging) => {
     const review = createReviewEntry({
         resources: staging.resources,
         codexSchemaPath: staging.codexSchemaPath,
+        versions: Object.freeze({
+            reviewVersion: staging.reviewVersion ?? null,
+            shellVersion: staging.shellVersion ?? null,
+            coreVersion: staging.version ?? null,
+        }),
         getLive,
     })
     const ui = createUiEntry({
         getLive,
-        shellVersion: staging.shellVersion,
+        packageVersion: staging.packageVersion,
         startedAt: staging.startedAt,
     })
     return Object.freeze({
@@ -53,6 +59,7 @@ export const createCore = (staging) => {
         }),
         resources: staging.resources,
         summarizeConfig: ui.summarize,
+        validateConfig,
         selfCheck: (config) => {
             review.selfCheck(config)
             ui.selfCheck(config)

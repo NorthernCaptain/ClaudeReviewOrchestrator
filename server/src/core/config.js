@@ -38,7 +38,9 @@ export const MAX_REVIEWER_TIMEOUT_SECONDS = 1680
 
 const ConfigSchema = z
     .object({
-        port: z.number().int().min(1).max(65535).default(7777),
+        // 0 asks the OS for a free port (tests, embedders); the hooks need a
+        // fixed one, so a daemon keeps the default.
+        port: z.number().int().min(0).max(65535).default(7777),
         bind: z.string().default("127.0.0.1"),
         authToken: z.string().min(1, "authToken is required"),
         allowedRoots: z
@@ -196,7 +198,29 @@ const ConfigSchema = z
         logging: z
             .object({
                 dir: z.string().default("~/.claude/logs"),
-                level: z.string().default("info"),
+                // Pino's levels: a reload applies it to the live logger.
+                level: z
+                    .enum([
+                        "fatal",
+                        "error",
+                        "warn",
+                        "info",
+                        "debug",
+                        "trace",
+                        "silent",
+                    ])
+                    .default("info"),
+            })
+            .default({}),
+        // Hot reload (hot-reload plan §5.5). A pending reload swaps when no
+        // review is running. After maxWaitMinutes, new review requests are
+        // held at entry so the running ones can drain; none is held longer
+        // than maxHoldSeconds (also clamped so the hooks' published wait
+        // stays under their 29 min cap).
+        reload: z
+            .object({
+                maxWaitMinutes: z.number().min(0).max(1440).default(5),
+                maxHoldSeconds: z.number().int().min(0).max(600).default(45),
             })
             .default({}),
         // Stop-hook configuration. fetchTimeoutSeconds is the cap the
@@ -261,3 +285,54 @@ export const validateConfig = (raw, { home = homedir() } = {}) => {
 }
 
 export const __test__ = { ConfigSchema, expandHome, DEFAULT_IGNORE_PATHS }
+
+// Runs a dashboard config change (a delta of [keyPath, value] pairs)
+// through the shell's config transaction. Resolves to { ok: true,
+// revision, replaced } or { ok: false, response } with the HTTP reply;
+// nothing is changed or written when it fails.
+export const commitConfigChange = async ({
+    configTransaction,
+    delta,
+    logger = null,
+    what,
+}) => {
+    try {
+        const result = await configTransaction(delta)
+        logger?.info?.(
+            { what, revision: result.revision, replaced: result.replaced },
+            "config changed"
+        )
+        return {
+            ok: true,
+            revision: result.revision,
+            replaced: result.replaced ?? [],
+        }
+    } catch (err) {
+        logger?.warn?.(
+            { what, err: err?.message, code: err?.code },
+            "config change rejected"
+        )
+        return {
+            ok: false,
+            response: {
+                httpStatus: err?.httpStatus ?? 409,
+                body: {
+                    ok: false,
+                    error: err?.message ?? String(err),
+                    code: err?.code ?? "CONFIG_CHANGE_FAILED",
+                },
+            },
+        }
+    }
+}
+
+// The success body every dashboard config change shares.
+export const configChangeBody = (result, fields) => ({
+    ok: true,
+    ...fields,
+    persisted: true,
+    revision: result.revision,
+    ...(result.replaced.length > 0
+        ? { replacedManualEdits: result.replaced }
+        : {}),
+})
