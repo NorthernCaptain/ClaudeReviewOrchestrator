@@ -350,7 +350,11 @@ export const createReloadController = ({
         dispatchWaiters()
     }
 
+    // Swaps and rollbacks applied since start; the history keeps only
+    // the last HISTORY_LIMIT outcomes.
+    let appliedCount = 0
     const record = (entry) => {
+        if (entry.ok) appliedCount++
         history.unshift({ at: now(), ...entry })
         history.length = Math.min(history.length, HISTORY_LIMIT)
     }
@@ -802,6 +806,7 @@ export const createReloadController = ({
         reviewVersion: current.reviewVersion ?? null,
         loadedAt: new Date(current.loadedAt).toISOString(),
         previousVersion: previous?.record.version ?? null,
+        appliedCount,
         activeReviews: active,
         pending: pending
             ? {

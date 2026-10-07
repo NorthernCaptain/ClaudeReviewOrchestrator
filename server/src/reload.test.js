@@ -1104,6 +1104,19 @@ describe("admission bookkeeping", () => {
         expect(ctl.status().activeReviews).toBe(0)
     })
 
+    test("appliedCount counts every applied swap and rollback, past the history's limit", async () => {
+        const { ctl } = setup()
+        for (let i = 0; i < HISTORY_LIMIT + 2; i++) {
+            editConfig((c) => {
+                c.limits.maxCodexRounds = 6 + i
+            })
+            await ctl.trigger()
+        }
+        await ctl.trigger({ rollback: true })
+        expect(ctl.status().history).toHaveLength(HISTORY_LIMIT)
+        expect(ctl.status().appliedCount).toBe(HISTORY_LIMIT + 3)
+    })
+
     test("history keeps the last 20 entries", async () => {
         const { ctl, willLoad } = setup()
         willLoad(Object.assign(new Error("x"), { code: "X" }))

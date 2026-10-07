@@ -10,7 +10,15 @@ import express from "express"
 import { VERSION } from "./version.js"
 
 export { VERSION }
-import { createAuth, createTokenState, DEFAULT_GRACE_HOURS } from "./auth.js"
+import {
+    createAuth,
+    createDashboardGuard,
+    createHostAllowlist,
+    createLocalOnly,
+    createTokenState,
+    DEFAULT_GRACE_HOURS,
+    noFraming,
+} from "./auth.js"
 import {
     captureCore,
     codexSchemaPathFor,
@@ -57,23 +65,6 @@ export const FAVICON_SVG =
     `<circle cx="32" cy="47" r="4" fill="#f1f5f9"/>` +
     `<circle cx="32" cy="17" r="4" fill="#0f172a"/>` +
     `</svg>`
-
-// Express middleware that rejects any peer that isn't on the loopback
-// interface (127.0.0.1, ::1, or the v4-in-v6 form). Belt for the
-// dashboard mutation routes (POST /dashboard/reset, PUT /dashboard/
-// provider) so the operator widening `bind` from 127.0.0.1 to 0.0.0.0
-// doesn't accidentally expose them to the network. Returns 403 with a
-// clear `error` field; never proxies the request through.
-export const loopbackOnly = (req, res, next) => {
-    const ip = req.ip || req.socket?.remoteAddress || ""
-    const ok = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1"
-    if (!ok) {
-        return res
-            .status(403)
-            .json({ ok: false, error: "loopback only", remote: ip })
-    }
-    next()
-}
 
 // Where reload candidates come from: the core folder, captured and (when
 // its id differs from the running core's) written to a fresh snapshot and
@@ -310,6 +301,9 @@ export const createApp = ({
         logger: log,
     })
     const auth = createAuth({ tokenState, instanceId })
+    // Per server start; the dashboard page embeds it and sends it back on
+    // every action (§5.8).
+    const dashboardCsrf = randomBytes(32).toString("base64url")
     const serverInfo = createServerInfo({
         path: serverInfoPath,
         instanceId,
@@ -352,6 +346,7 @@ export const createApp = ({
             registries,
             deps,
             shellStatus,
+            dashboard: Object.freeze({ csrfToken: dashboardCsrf }),
         })
     const reloads = createReloadController({
         initial: {
@@ -400,6 +395,27 @@ export const createApp = ({
         }
     }
     const mutation = (key) => route((r) => r.dashboardMutations[key])
+    // POST /admin/reload (signed) and /dashboard/reload (the page's
+    // buttons): { cancel, rollback, now }, each true or absent.
+    const triggerReload = async (req, res) => {
+        const body = req.body ?? {}
+        try {
+            res.json(
+                await reloads.trigger({
+                    cancel: body.cancel === true,
+                    rollback: body.rollback === true,
+                    now: body.now === true,
+                })
+            )
+        } catch (err) {
+            log.warn({ err: err.message, code: err.code }, "core reload failed")
+            res.status(reloadErrorStatus(err)).json({
+                ok: false,
+                error: err.message,
+                code: err.code ?? "RELOAD_FAILED",
+            })
+        }
+    }
 
     const app = express()
     app.disable("x-powered-by")
@@ -408,12 +424,34 @@ export const createApp = ({
     app.locals.configStore = configStore
     app.locals.serverInfo = serverInfo
     app.locals.instanceId = instanceId
+    app.locals.dashboardCsrf = dashboardCsrf
+    // Set by startServer once listening: the address the socket is bound
+    // to, which the dashboard's local-only guard accepts besides loopback.
+    app.locals.listenAddress = null
+    const localOnly = createLocalOnly({
+        listenAddress: () => app.locals.listenAddress,
+    })
+    const dashboardGuard = createDashboardGuard({
+        bind: normalized.bind,
+        csrfToken: dashboardCsrf,
+        listenAddress: () => app.locals.listenAddress,
+    })
+    const dashboardAction = [localOnly, dashboardGuard]
 
     // Access log runs before body parsing so we see every incoming
     // request including ones rejected by JSON parsing or auth. It logs
     // on response finish/close so the line carries the final status and
     // duration.
     app.use(createHttpAccessLog({ logger: log }))
+    // Before anything else answers: only our own host names (DNS
+    // rebinding), and never inside a frame.
+    app.use(
+        createHostAllowlist({
+            bind: normalized.bind,
+            listenAddress: () => app.locals.listenAddress,
+        })
+    )
+    app.use(noFraming)
     // The raw bytes are kept for request signatures.
     app.use(
         express.json({
@@ -468,34 +506,29 @@ export const createApp = ({
         route((r) => r.inflight)
     )
 
-    // Dashboard control endpoints (v0.1.35). Mounted BEFORE auth so the
-    // public dashboard page can use them without embedding the
-    // X-Review-Token, but explicitly guarded to loopback peers
-    // (v0.1.36) — these mutate live config / clear review state, so we
-    // can't rely on `bind: 127.0.0.1` alone as the trust boundary. If
-    // the operator ever widens the bind, these stay locked down. The
-    // canonical authed routes (POST /reset, PUT /provider) remain
-    // available for cross-host callers with a valid token.
-    app.post("/dashboard/reset", loopbackOnly, mutation("reset"))
-    app.put("/dashboard/provider", loopbackOnly, mutation("provider"))
+    // Dashboard actions. Mounted before auth (the page holds no API token)
+    // and guarded instead: local peers only, and the page's CSRF token,
+    // our own Origin and a JSON body on every request (§5.8).
+    app.post("/dashboard/reset", dashboardAction, mutation("reset"))
+    app.put("/dashboard/provider", dashboardAction, mutation("provider"))
     app.put(
         "/dashboard/reviewer-preset",
-        loopbackOnly,
+        dashboardAction,
         mutation("reviewerPreset")
     )
-    app.post("/dashboard/exclusions", loopbackOnly, mutation("exclusions"))
-    app.put("/dashboard/max-rounds", loopbackOnly, mutation("maxRounds"))
-    app.put("/dashboard/max-blocks", loopbackOnly, mutation("maxBlocks"))
+    app.post("/dashboard/exclusions", dashboardAction, mutation("exclusions"))
+    app.put("/dashboard/max-rounds", dashboardAction, mutation("maxRounds"))
+    app.put("/dashboard/max-blocks", dashboardAction, mutation("maxBlocks"))
     app.put(
         "/dashboard/blocking-severities",
-        loopbackOnly,
+        dashboardAction,
         mutation("blockingSeverities")
     )
+    app.post("/dashboard/reload", dashboardAction, triggerReload)
 
-    // GET / — public dashboard. Mounted BEFORE the auth middleware so
-    // it's reachable without the x-review-token. Safe because the
-    // server binds 127.0.0.1 by default — the trust boundary is the
-    // network bind, not an HTTP secret.
+    // GET / — the dashboard, reachable without a token. It embeds the
+    // CSRF token, which only our own host names can read: a rebinding
+    // origin is refused by the Host allowlist above.
     app.get(
         "/",
         route((r) => r.dashboardPage)
@@ -559,18 +592,7 @@ export const createApp = ({
     // long-poll GETs (otherwise server.close() never resolves).
     app.locals.mcp = mountMcpRoute(app, { cores: reloads, logger: log })
     // Explicit reloads only (hot-reload plan §5.9): { cancel, rollback, now }.
-    app.post("/admin/reload", async (req, res) => {
-        try {
-            res.json(await reloads.trigger(req.body ?? {}))
-        } catch (err) {
-            log.warn({ err: err.message, code: err.code }, "core reload failed")
-            res.status(reloadErrorStatus(err)).json({
-                ok: false,
-                error: err.message,
-                code: err.code ?? "RELOAD_FAILED",
-            })
-        }
-    })
+    app.post("/admin/reload", triggerReload)
     app.get("/admin/reload", (_req, res) => {
         res.json({ ok: true, ...shellStatus() })
     })
@@ -679,6 +701,7 @@ export const startServer = async ({
             // the operator can verify the daemon picked up the right
             // version + provider + timeouts without curling /status.
             log.info(active.summarizeConfig(config), "active config")
+            app.locals.listenAddress = addr.address
             app.locals.serverInfo.setAddress(addr)
             app.locals.configStore.syncCredentials()
             settle({ ok: true, server, address: addr, sockets, app })

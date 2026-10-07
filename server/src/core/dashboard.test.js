@@ -3,11 +3,16 @@
  * Author: Leo Khramov
  */
 
+import { jest } from "@jest/globals"
 import {
     renderDashboard,
     createDashboardPageHandler,
     escapeHtml,
     __test__,
+    DASHBOARD_API,
+    reloadStamp,
+    renderReloadPanel,
+    renderVersions,
 } from "./dashboard.js"
 
 const {
@@ -1324,8 +1329,8 @@ describe("live updates (v0.1.37)", () => {
             records: [],
         })
         expect(html).toContain('data-config-key="provider"')
-        expect(html).toContain('fetch("/dashboard/provider"')
-        expect(html).toContain('fetch("/dashboard/reviewer-preset"')
+        expect(html).toContain('send("PUT", "/dashboard/provider"')
+        expect(html).toContain('send("PUT", "/dashboard/reviewer-preset"')
         expect(html).toContain("refreshSections();")
     })
 
@@ -1793,5 +1798,358 @@ describe("exclusions data island is parseable JSON (v1.1.1)", () => {
         expect(parsed["/r|main"][0].message).toBe(
             "</script><script>alert(1)</script>"
         )
+    })
+})
+
+describe("reload controls, versions and page safety (hot-reload plan §5.8)", () => {
+    const shell = (reload = {}) => ({
+        shellVersion: "s1",
+        coreVersion: "c2",
+        reload: {
+            loadedAt: "2026-10-07T12:00:00.000Z",
+            previousVersion: null,
+            activeReviews: 0,
+            pending: null,
+            history: [],
+            ...reload,
+        },
+    })
+    const pending = (over = {}) => ({
+        kind: "reload",
+        to: "c3",
+        requestedAt: Date.parse("2026-10-07T12:00:00.000Z"),
+        configChanges: [],
+        swapping: false,
+        holding: false,
+        holdingSince: null,
+        heldNow: 0,
+        releasedAtDeadline: 0,
+        ...over,
+    })
+
+    test("the version line names shell, core, load time and applied reloads", () => {
+        const html = renderVersions(
+            shell({
+                history: [
+                    { at: 3, kind: "reload", ok: true },
+                    { at: 2, kind: "reload", ok: false, error: "old" },
+                    { at: 1, kind: "rollback", ok: true },
+                ],
+            })
+        )
+        expect(html).toContain("shell <code>s1</code>")
+        expect(html).toContain("core <code>c2</code> loaded")
+        expect(html).toContain("2 reloads")
+        // Only a failure that is the latest outcome is shown.
+        expect(html).not.toContain("failed")
+    })
+
+    test("the latest failed reload is shown, escaped", () => {
+        const html = renderVersions(
+            shell({
+                history: [
+                    { at: 1, kind: "reload", ok: false, error: "<bad> config" },
+                ],
+            })
+        )
+        expect(html).toContain("0 reloads")
+        expect(html).toContain("last reload failed: &lt;bad&gt; config")
+        expect(
+            renderVersions(shell({ history: [{ at: 1, ok: false }] }))
+        ).toContain("unknown error")
+        expect(renderVersions(null)).toBe(
+            '<div class="meta" id="versions"></div>'
+        )
+        expect(
+            renderVersions({ reload: { history: [{ at: 1, ok: true }] } })
+        ).toContain("· 1 reload</div>")
+    })
+
+    test("idle: only Reload, plus Roll back while a previous core is in memory", () => {
+        const idle = renderReloadPanel(shell())
+        expect(idle).toContain('data-reload-action="reload"')
+        expect(idle).not.toContain('data-reload-action="rollback"')
+        expect(idle).not.toContain('data-reload-action="now"')
+        const withPrevious = renderReloadPanel(shell({ previousVersion: "c1" }))
+        expect(withPrevious).toContain("roll back to c1")
+        expect(renderReloadPanel(null)).toBe("")
+    })
+
+    test("pending: cancel and apply now, who it waits for, and when holding starts", () => {
+        const html = renderReloadPanel(
+            shell({
+                activeReviews: 2,
+                pending: pending({ configChanges: ["limits.maxBlocks"] }),
+            }),
+            { maxWaitMinutes: 5 }
+        )
+        expect(html).toContain('data-reload-action="cancel"')
+        expect(html).toContain('data-reload-action="now"')
+        expect(html).toContain(
+            "Reload to <code>c3</code> pending — waiting for 2 reviews"
+        )
+        expect(html).toContain("config: limits.maxBlocks")
+        expect(html).toContain("new reviews will be held from 2026-10-07")
+    })
+
+    test("pending while holding, a rollback, and a swap in progress", () => {
+        const holding = renderReloadPanel(
+            shell({
+                activeReviews: 1,
+                pending: pending({
+                    kind: "rollback",
+                    holding: true,
+                    holdingSince: Date.parse("2026-10-07T12:05:00.000Z"),
+                    heldNow: 3,
+                    releasedAtDeadline: 1,
+                }),
+            })
+        )
+        expect(holding).toContain("Rollback to <code>c3</code>")
+        expect(holding).toContain("waiting for 1 review (see in flight)")
+        expect(holding).toContain("(3 held, 1 released at their hold deadline)")
+        const swapping = renderReloadPanel(
+            shell({ pending: pending({ swapping: true }) })
+        )
+        expect(swapping).toContain("swapping now")
+    })
+
+    test("the stamp changes with anything the panel shows", () => {
+        const base = reloadStamp(shell())
+        expect(reloadStamp(null)).toBe("")
+        for (const changed of [
+            shell({ previousVersion: "c1" }),
+            shell({ activeReviews: 1 }),
+            shell({ history: [{ at: 5, ok: true }] }),
+            shell({ pending: pending() }),
+            shell({ pending: pending({ holding: true }) }),
+            shell({
+                pending: pending({ configChanges: ["limits.maxBlocks"] }),
+            }),
+        ]) {
+            expect(reloadStamp(changed)).not.toBe(base)
+        }
+        // A replaced pending reload to the same core with other config.
+        expect(
+            reloadStamp(shell({ pending: pending({ configChanges: ["a"] }) }))
+        ).not.toBe(
+            reloadStamp(shell({ pending: pending({ configChanges: ["b"] }) }))
+        )
+    })
+
+    test("the page carries its token, API and core version, and the banners start hidden", () => {
+        const html = renderDashboard({
+            version: "x",
+            records: [],
+            shell: shell(),
+            csrfToken: 'tok"<',
+        })
+        expect(html).toContain('data-csrf="tok&quot;&lt;"')
+        expect(html).toContain(`data-api="${DASHBOARD_API}"`)
+        expect(html).toContain('data-core-version="c2"')
+        expect(html).toContain('id="stale-banner" class="banner" hidden')
+        expect(html).toContain('id="framed-banner" class="banner err" hidden')
+        expect(html).toContain('class="reload-panel"')
+    })
+
+    test("every action goes through send(), which adds the token, API and core version and refuses inside a frame", () => {
+        const html = renderDashboard({ version: "x", records: [] })
+        expect(html).not.toMatch(/fetch\("\/dashboard/)
+        expect(html).toContain('"x-dashboard-csrf": PAGE.csrf')
+        expect(html).toContain('"x-dashboard-api": PAGE.api')
+        expect(html).toContain("var FRAMED = window.top !== window.self;")
+        expect(html).toContain("if (FRAMED) lockFramed();")
+        expect(html).toContain('send("POST", "/dashboard/reload", body)')
+        expect(html).toContain("Running reviews finish on the old code.")
+    })
+
+    test("a new core shows the banner and stops section swaps; a new stamp refreshes", () => {
+        const html = renderDashboard({ version: "x", records: [] })
+        expect(html).toContain("version === PAGE.coreVersion")
+        expect(html).toContain("if (stale) return;")
+        expect(html).toContain(
+            "if (refreshing) { refreshAgain = true; return; }"
+        )
+        // The stamp moves only once the refreshed page is shown.
+        expect(html).toContain("if (shown !== null) lastStamp = shown;")
+        expect(html).not.toContain("lastStamp = j.reloadStamp")
+        expect(html).toContain("j.reloadStamp !== lastStamp")
+        expect(html).toContain('e.target.id === "stale-reload"')
+        // Identity is checked before the in-flight render can start a
+        // refresh, and again on the fetched page before anything is
+        // swapped in.
+        expect(html.indexOf("isOtherCore(j.coreVersion);")).toBeLessThan(
+            html.indexOf("renderInflight(j.inFlight);")
+        )
+        expect(html).toContain(
+            'isOtherCore(doc.body && doc.body.getAttribute("data-core-version"))'
+        )
+    })
+
+    test("the reload count is the controller's lifetime count, not the bounded history", () => {
+        expect(
+            renderVersions(
+                shell({ appliedCount: 42, history: [{ at: 1, ok: true }] })
+            )
+        ).toContain("42 reloads")
+    })
+
+    test("the inline script still parses", () => {
+        const html = renderDashboard({
+            version: "x",
+            records: [],
+            shell: shell({ pending: pending() }),
+        })
+        const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+        expect(scripts.length).toBeGreaterThan(0)
+        for (const [, code] of scripts) {
+            expect(() => new Function(code)).not.toThrow()
+        }
+    })
+})
+
+// Runs the page's inline script against a minimal fake DOM, driving the
+// /inflight poll by hand.
+describe("page script behaviour (fake DOM)", () => {
+    const boot = ({ stamp = "S1", core = "c1", framed = false } = {}) => {
+        const html = renderDashboard({ version: "x", records: [] })
+        const code = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+            .map((m) => m[1])
+            .join("\n")
+        const elements = {}
+        const el = (id) =>
+            (elements[id] ??= {
+                id,
+                hidden: true,
+                textContent: "",
+                className: "",
+                disabled: false,
+            })
+        const document = {
+            body: {
+                dataset: {
+                    csrf: "T",
+                    api: "1",
+                    coreVersion: core,
+                    reloadStamp: stamp,
+                },
+            },
+            getElementById: (id) =>
+                ["stale-banner", "stale-version", "framed-banner"].includes(id)
+                    ? el(id)
+                    : null,
+            querySelector: () => null,
+            querySelectorAll: () => [],
+            addEventListener: () => {},
+        }
+        const window = { addEventListener: () => {}, confirm: () => true }
+        window.top = framed ? {} : window
+        window.self = window
+        const intervals = []
+        const pages = []
+        const fetchMock = jest.fn((url) => {
+            if (url === "/inflight") return Promise.resolve(fetchMock.inflight)
+            const next = pages.shift()
+            return next instanceof Error
+                ? Promise.reject(next)
+                : Promise.resolve({ ok: true, text: async () => next })
+        })
+        class DOMParser {
+            parseFromString(text) {
+                const attrs = JSON.parse(text)
+                return {
+                    body: { getAttribute: (k) => attrs[k] ?? null },
+                    querySelector: () => null,
+                    getElementById: () => null,
+                }
+            }
+        }
+        new Function(
+            "document",
+            "window",
+            "fetch",
+            "DOMParser",
+            "location",
+            "history",
+            "setInterval",
+            "setTimeout",
+            "clearTimeout",
+            code
+        )(
+            document,
+            window,
+            fetchMock,
+            DOMParser,
+            { hash: "", pathname: "/", search: "", reload: jest.fn() },
+            { replaceState: () => {} },
+            (fn) => intervals.push(fn),
+            () => 0,
+            () => {}
+        )
+        const settle = () => new Promise((r) => setTimeout(r, 0))
+        return {
+            elements,
+            pages,
+            fetchMock,
+            poll: async (body) => {
+                fetchMock.inflight = { ok: true, json: async () => body }
+                intervals[1]()
+                for (let i = 0; i < 6; i++) await settle()
+            },
+            pageFetches: () =>
+                fetchMock.mock.calls.filter(([u]) => u === "/").length,
+        }
+    }
+    const inflight = (over) => ({
+        inFlight: [],
+        coreVersion: "c1",
+        reloadStamp: "S1",
+        ...over,
+    })
+
+    test("a new stamp refreshes; a failed refresh is retried on the next poll; a shown one isn't repeated", async () => {
+        const p = boot()
+        await p.poll(inflight())
+        expect(p.pageFetches()).toBe(0)
+        p.pages.push(new Error("offline"))
+        await p.poll(inflight({ reloadStamp: "S2" }))
+        expect(p.pageFetches()).toBe(1)
+        p.pages.push(
+            JSON.stringify({
+                "data-core-version": "c1",
+                "data-reload-stamp": "S2",
+            })
+        )
+        await p.poll(inflight({ reloadStamp: "S2" }))
+        expect(p.pageFetches()).toBe(2)
+        await p.poll(inflight({ reloadStamp: "S2" }))
+        expect(p.pageFetches()).toBe(2)
+    })
+
+    test("another core shows the banner and never fetches its page", async () => {
+        const p = boot()
+        await p.poll(inflight({ coreVersion: "c2", reloadStamp: "S9" }))
+        expect(p.elements["stale-banner"].hidden).toBe(false)
+        expect(p.elements["stale-version"].textContent).toBe("c2")
+        expect(p.pageFetches()).toBe(0)
+    })
+
+    test("a refreshed page from another core is not swapped in, and stops refreshing", async () => {
+        const p = boot()
+        p.pages.push(
+            JSON.stringify({
+                "data-core-version": "c2",
+                "data-reload-stamp": "S2",
+            })
+        )
+        await p.poll(inflight({ reloadStamp: "S2" }))
+        expect(p.elements["stale-banner"].hidden).toBe(false)
+        await p.poll(inflight({ reloadStamp: "S3" }))
+        expect(p.pageFetches()).toBe(1)
+    })
+
+    test("inside a frame the banner shows", () => {
+        const p = boot({ framed: true })
+        expect(p.elements["framed-banner"].hidden).toBe(false)
     })
 })

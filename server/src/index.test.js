@@ -6,6 +6,7 @@
 import { jest } from "@jest/globals"
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
+import http from "node:http"
 import {
     existsSync,
     mkdtempSync,
@@ -27,6 +28,7 @@ import {
     VERSION,
 } from "./index.js"
 import { loadDefaultCore } from "./core-loader.js"
+import { DASHBOARD_API } from "./core/dashboard.js"
 import { createStateStore } from "./state.js"
 import {
     challengeAt,
@@ -123,6 +125,28 @@ const signedFetch = async (
             instanceId,
         }),
         body: text || undefined,
+    })
+}
+
+// A dashboard action as the page sends it: the token read from the page,
+// our own Origin, the page's API version and a JSON body.
+const dashboardFetch = async (
+    url,
+    route,
+    { method = "POST", body = {}, headers = {} } = {}
+) => {
+    const page = await (await fetch(`${url}/`)).text()
+    const csrf = page.match(/data-csrf="([^"]*)"/)[1]
+    return fetch(`${url}${route}`, {
+        method,
+        headers: {
+            "content-type": "application/json",
+            origin: url,
+            "x-dashboard-csrf": csrf,
+            "x-dashboard-api": String(DASHBOARD_API),
+            ...headers,
+        },
+        body: JSON.stringify(body),
     })
 }
 
@@ -371,10 +395,9 @@ describe("createApp wiring", () => {
         const cfg = minimalConfig({ reviewer: { provider: "codex" } })
         const { url, app, readConfigFile, close } = await start(cfg)
         try {
-            const r = await fetch(`${url}/dashboard/provider`, {
+            const r = await dashboardFetch(url, "/dashboard/provider", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ provider: "gemini" }),
+                body: { provider: "gemini" },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
@@ -390,10 +413,9 @@ describe("createApp wiring", () => {
     test("PUT /dashboard/provider rejects an unknown provider with 400", async () => {
         const { url, close } = await start(minimalConfig())
         try {
-            const r = await fetch(`${url}/dashboard/provider`, {
+            const r = await dashboardFetch(url, "/dashboard/provider", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ provider: "bogus" }),
+                body: { provider: "bogus" },
             })
             expect(r.status).toBe(400)
             const body = await r.json()
@@ -407,10 +429,9 @@ describe("createApp wiring", () => {
         const cfg = minimalConfig({ reviewer: { provider: "codex" } })
         const { url, app, readConfigFile, close } = await start(cfg)
         try {
-            const r = await fetch(`${url}/dashboard/reviewer-preset`, {
+            const r = await dashboardFetch(url, "/dashboard/reviewer-preset", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ preset: "gpt-6-astra:medium" }),
+                body: { preset: "gpt-6-astra:medium" },
             })
             expect(r.status).toBe(200)
             expect(await r.json()).toMatchObject({
@@ -434,10 +455,9 @@ describe("createApp wiring", () => {
         cfg.limits.maxCodexRounds = 5
         const { url, app, readConfigFile, close } = await start(cfg)
         try {
-            const r = await fetch(`${url}/dashboard/max-rounds`, {
+            const r = await dashboardFetch(url, "/dashboard/max-rounds", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ value: 8 }),
+                body: { value: 8 },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
@@ -454,10 +474,9 @@ describe("createApp wiring", () => {
     test("PUT /dashboard/max-rounds rejects out-of-range with 400", async () => {
         const { url, close } = await start(minimalConfig())
         try {
-            const r = await fetch(`${url}/dashboard/max-rounds`, {
+            const r = await dashboardFetch(url, "/dashboard/max-rounds", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ value: 0 }),
+                body: { value: 0 },
             })
             expect(r.status).toBe(400)
             const body = await r.json()
@@ -489,10 +508,9 @@ describe("createApp wiring", () => {
                 blockCount: 3,
                 lastReviewedAt: 1,
             })
-            const r = await fetch(`${url}/dashboard/reset`, {
+            const r = await dashboardFetch(url, "/dashboard/reset", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ contextKey: "/repo|feature" }),
+                body: { contextKey: "/repo|feature" },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
@@ -516,10 +534,9 @@ describe("createApp wiring", () => {
     test("POST /dashboard/reset rejects missing contextKey with 400", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/dashboard/reset`, {
+            const r = await dashboardFetch(url, "/dashboard/reset", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({}),
+                body: {},
             })
             expect(r.status).toBe(400)
         } finally {
@@ -546,43 +563,6 @@ describe("createApp wiring", () => {
         }
     })
 
-    test("loopbackOnly: allows 127.0.0.1, ::1, ::ffff:127.0.0.1; rejects others 403", async () => {
-        const { loopbackOnly } = await import("./index.js")
-        const mkReq = (ip) => ({ ip, socket: { remoteAddress: ip } })
-        const mkRes = () => {
-            const res = { statusCode: 0, body: null }
-            res.status = (c) => {
-                res.statusCode = c
-                return res
-            }
-            res.json = (b) => {
-                res.body = b
-                return res
-            }
-            return res
-        }
-        for (const ip of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
-            const res = mkRes()
-            let nexted = false
-            loopbackOnly(mkReq(ip), res, () => {
-                nexted = true
-            })
-            expect(nexted).toBe(true)
-            expect(res.statusCode).toBe(0)
-        }
-        for (const ip of ["10.0.0.1", "192.168.1.5", "::ffff:10.0.0.1", ""]) {
-            const res = mkRes()
-            let nexted = false
-            loopbackOnly(mkReq(ip), res, () => {
-                nexted = true
-            })
-            expect(nexted).toBe(false)
-            expect(res.statusCode).toBe(403)
-            expect(res.body.ok).toBe(false)
-            expect(res.body.error).toMatch(/loopback only/i)
-        }
-    })
-
     test("POST /dashboard/exclusions adds + removes per context (v1.1)", async () => {
         const { url, store, close } = await start(minimalConfig(), happyDeps)
         try {
@@ -591,28 +571,26 @@ describe("createApp wiring", () => {
                 branch: "main",
                 lastReviewedAt: 1,
             })
-            const add = await fetch(`${url}/dashboard/exclusions`, {
+            const add = await dashboardFetch(url, "/dashboard/exclusions", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
+                body: {
                     contextKey: "/r|main",
                     file: "a.js",
                     message: "noise",
                     action: "add",
-                }),
+                },
             })
             expect(add.status).toBe(200)
             const addBody = await add.json()
             expect(addBody.exclusions).toHaveLength(1)
-            const remove = await fetch(`${url}/dashboard/exclusions`, {
+            const remove = await dashboardFetch(url, "/dashboard/exclusions", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
+                body: {
                     contextKey: "/r|main",
                     file: "a.js",
                     message: "noise",
                     action: "remove",
-                }),
+                },
             })
             expect(remove.status).toBe(200)
             const rmBody = await remove.json()
@@ -625,15 +603,14 @@ describe("createApp wiring", () => {
     test("POST /dashboard/exclusions rejects an unknown context with 404", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/dashboard/exclusions`, {
+            const r = await dashboardFetch(url, "/dashboard/exclusions", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
+                body: {
                     contextKey: "/nope|x",
                     file: "a",
                     message: "m",
                     action: "add",
-                }),
+                },
             })
             expect(r.status).toBe(404)
         } finally {
@@ -644,10 +621,9 @@ describe("createApp wiring", () => {
     test("POST /dashboard/reset rejects an unknown contextKey with 404", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/dashboard/reset`, {
+            const r = await dashboardFetch(url, "/dashboard/reset", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ contextKey: "/nope|x" }),
+                body: { contextKey: "/nope|x" },
             })
             expect(r.status).toBe(404)
         } finally {
@@ -1449,6 +1425,152 @@ describe("createServerInfo", () => {
             expect(t.info.remove()).toBe(false)
         } finally {
             t.cleanup()
+        }
+    })
+})
+
+describe("dashboard safety and reload controls over HTTP (§5.8)", () => {
+    // fetch can't set Host; node:http can.
+    const rawGet = (url, path, headers) =>
+        new Promise((resolve, reject) => {
+            const u = new URL(url)
+            const req = http.request(
+                {
+                    hostname: u.hostname,
+                    port: u.port,
+                    path,
+                    method: "GET",
+                    headers,
+                },
+                (res) => {
+                    let body = ""
+                    res.on("data", (c) => (body += c))
+                    res.on("end", () =>
+                        resolve({ status: res.statusCode, body })
+                    )
+                }
+            )
+            req.on("error", reject)
+            req.end()
+        })
+
+    test("a request naming another host (DNS rebinding) gets 421 on every route", async () => {
+        const { url, close } = await start(minimalConfig())
+        try {
+            for (const path of ["/", "/healthz", "/inflight", "/status"]) {
+                const r = await rawGet(url, path, {
+                    host: `evil.example:${new URL(url).port}`,
+                })
+                expect(r.status).toBe(421)
+                expect(JSON.parse(r.body).code).toBe("HOST_NOT_ALLOWED")
+            }
+            const ok = await rawGet(url, "/healthz", {
+                host: `localhost:${new URL(url).port}`,
+            })
+            expect(ok.status).toBe(200)
+        } finally {
+            await close()
+        }
+    })
+
+    test("the page can't be framed and embeds this start's token and versions", async () => {
+        const { url, app, close } = await start(minimalConfig())
+        try {
+            const r = await fetch(`${url}/`)
+            expect(r.headers.get("x-frame-options")).toBe("DENY")
+            expect(r.headers.get("content-security-policy")).toBe(
+                "frame-ancestors 'none'"
+            )
+            const html = await r.text()
+            expect(html).toContain(`data-csrf="${app.locals.dashboardCsrf}"`)
+            const { coreVersion } = await (
+                await fetch(`${url}/inflight`)
+            ).json()
+            expect(coreVersion).toMatch(/^[0-9a-f]{16}$/)
+            expect(html).toContain(`data-core-version="${coreVersion}"`)
+            expect(html).toContain('data-reload-action="reload"')
+        } finally {
+            await close()
+        }
+    })
+
+    test("an action without the page's token, from another origin, or not JSON is refused", async () => {
+        const { url, app, close } = await start(minimalConfig())
+        try {
+            const put = (headers, body = '{"value":7}') =>
+                fetch(`${url}/dashboard/max-rounds`, {
+                    method: "PUT",
+                    headers,
+                    body,
+                })
+            const csrf = app.locals.dashboardCsrf
+            let r = await put({
+                "content-type": "application/json",
+                origin: url,
+            })
+            expect(r.status).toBe(403)
+            expect((await r.json()).code).toBe("BAD_DASHBOARD_TOKEN")
+            r = await put({
+                "content-type": "application/json",
+                origin: "http://evil.example",
+                "x-dashboard-csrf": csrf,
+            })
+            expect((await r.json()).code).toBe("CROSS_ORIGIN")
+            r = await put({
+                "content-type": "text/plain",
+                origin: url,
+                "x-dashboard-csrf": csrf,
+            })
+            expect(r.status).toBe(415)
+            expect(app.locals.live.config.limits.maxCodexRounds).toBe(5)
+            // The same request done right goes through.
+            r = await dashboardFetch(url, "/dashboard/max-rounds", {
+                method: "PUT",
+                body: { value: 7 },
+            })
+            expect(r.status).toBe(200)
+        } finally {
+            await close()
+        }
+    })
+
+    test("a page from another dashboard API is told to reload", async () => {
+        const { url, close } = await start(minimalConfig())
+        try {
+            const r = await dashboardFetch(url, "/dashboard/max-rounds", {
+                method: "PUT",
+                body: { value: 7 },
+                headers: { "x-dashboard-api": "0" },
+            })
+            expect(r.status).toBe(409)
+            expect((await r.json()).code).toBe("PAGE_OUTDATED")
+        } finally {
+            await close()
+        }
+    })
+
+    test("the reload buttons drive the same controller as /admin/reload", async () => {
+        const { url, close } = await start(minimalConfig())
+        try {
+            let r = await dashboardFetch(url, "/dashboard/reload", {
+                body: {},
+            })
+            expect(await r.json()).toMatchObject({ ok: true, unchanged: true })
+            r = await dashboardFetch(url, "/dashboard/reload", {
+                body: { rollback: true },
+            })
+            expect(r.status).toBe(409)
+            expect(await r.json()).toMatchObject({
+                ok: false,
+                code: "NOTHING_TO_ROLL_BACK",
+            })
+            // Only literal true counts.
+            r = await dashboardFetch(url, "/dashboard/reload", {
+                body: { cancel: "yes" },
+            })
+            expect(await r.json()).toMatchObject({ unchanged: true })
+        } finally {
+            await close()
         }
     })
 })

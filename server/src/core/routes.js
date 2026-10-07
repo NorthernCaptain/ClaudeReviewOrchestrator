@@ -7,7 +7,12 @@
 // mutation handlers, reset and notify-change. Free to import the review
 // path; the review path never imports this.
 
-import { renderDashboard, createDashboardPageHandler } from "./dashboard.js"
+import {
+    createDashboardPageHandler,
+    DASHBOARD_API,
+    reloadStamp,
+    renderDashboard,
+} from "./dashboard.js"
 import { handleExclusionMutation } from "./exclusions.js"
 import { handleSetMaxBlocks } from "./maxBlocks.js"
 import { handleSetMaxRounds } from "./maxRounds.js"
@@ -30,6 +35,20 @@ import { createStatusHandler, summarizeConfig } from "./status.js"
 const respond = (handle) => async (req, res) => {
     const result = await handle(req)
     res.status(result.httpStatus).json(result.body)
+}
+
+// A dashboard action from a page rendered for another dashboard API (a
+// tab left open across a reload) is refused before it's interpreted.
+const currentPage = (handler) => (req, res, next) => {
+    if (req.get("x-dashboard-api") !== String(DASHBOARD_API)) {
+        res.status(409).json({
+            ok: false,
+            code: "PAGE_OUTDATED",
+            error: "page is outdated — reload",
+        })
+        return
+    }
+    return handler(req, res, next)
 }
 
 export const createUiEntry = ({ getLive, packageVersion, startedAt }) => {
@@ -69,31 +88,46 @@ export const createUiEntry = ({ getLive, packageVersion, startedAt }) => {
                 version: packageVersion,
                 startedAt,
                 inFlight,
+                shell: getLive().shellStatus?.() ?? null,
+                csrfToken: getLive().dashboard?.csrfToken ?? "",
             })),
+            // The page's 2 s poll: the running reviews, plus what tells an
+            // open tab that the core changed (a banner) or that its reload
+            // panel is out of date (a refresh).
             inflight: (_req, res) => {
-                const body = { ok: true, inFlight: inFlight() }
+                const shell = getLive().shellStatus?.() ?? null
+                const body = {
+                    ok: true,
+                    inFlight: inFlight(),
+                    coreVersion: shell?.coreVersion ?? null,
+                    reloadStamp: reloadStamp(shell),
+                }
                 res.setHeader("Cache-Control", "no-store")
                 res.json(body)
             },
-            dashboardMutations: {
-                reset: respond((req) =>
-                    handleDashboardReset({
-                        body: req.body,
-                        store: getLive().store,
-                    })
-                ),
-                provider: configMutation(handleSetProvider),
-                reviewerPreset: configMutation(handleSetReviewerPreset),
-                exclusions: respond((req) =>
-                    handleExclusionMutation({
-                        body: req.body,
-                        store: getLive().store,
-                    })
-                ),
-                maxRounds: configMutation(handleSetMaxRounds),
-                maxBlocks: configMutation(handleSetMaxBlocks),
-                blockingSeverities: configMutation(handleSetBlockingSeverities),
-            },
+            dashboardMutations: Object.fromEntries(
+                Object.entries({
+                    reset: respond((req) =>
+                        handleDashboardReset({
+                            body: req.body,
+                            store: getLive().store,
+                        })
+                    ),
+                    provider: configMutation(handleSetProvider),
+                    reviewerPreset: configMutation(handleSetReviewerPreset),
+                    exclusions: respond((req) =>
+                        handleExclusionMutation({
+                            body: req.body,
+                            store: getLive().store,
+                        })
+                    ),
+                    maxRounds: configMutation(handleSetMaxRounds),
+                    maxBlocks: configMutation(handleSetMaxBlocks),
+                    blockingSeverities: configMutation(
+                        handleSetBlockingSeverities
+                    ),
+                }).map(([key, handler]) => [key, currentPage(handler)])
+            ),
         },
         mcp: {
             toolDef: RESET_REVIEW_CONTEXT_TOOL,

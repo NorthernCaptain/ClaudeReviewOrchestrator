@@ -8,6 +8,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { createConfigStore } from "../config-store.js"
+import { DASHBOARD_API } from "./dashboard.js"
 import { createUiEntry } from "./routes.js"
 
 let dir
@@ -86,6 +87,15 @@ const makeLive = () => {
     }
 }
 
+// A dashboard action as the current page sends it.
+const pageReq = (body, api = String(DASHBOARD_API)) => ({
+    body,
+    get: (name) =>
+        name.toLowerCase() === "x-dashboard-api"
+            ? (api ?? undefined)
+            : undefined,
+})
+
 const entry = (live) =>
     createUiEntry({
         getLive: () => live,
@@ -98,7 +108,7 @@ describe("createUiEntry — dashboard mutations", () => {
         const live = makeLive()
         const res = mkRes()
         await entry(live).routes.dashboardMutations.reset(
-            { body: { contextKey: "/repo|main" } },
+            pageReq({ contextKey: "/repo|main" }),
             res
         )
         expect(res.statusCode).toBe(200)
@@ -135,7 +145,7 @@ describe("createUiEntry — dashboard mutations", () => {
         async (key, body, read, expected) => {
             const live = makeLive()
             const res = mkRes()
-            await entry(live).routes.dashboardMutations[key]({ body }, res)
+            await entry(live).routes.dashboardMutations[key](pageReq(body), res)
             expect(res.statusCode).toBe(200)
             expect(res.body.revision).toBe(1)
             expect(read(live.config)).toEqual(expected)
@@ -147,19 +157,44 @@ describe("createUiEntry — dashboard mutations", () => {
         const live = makeLive()
         const res = mkRes()
         await entry(live).routes.dashboardMutations.exclusions(
-            {
-                body: {
-                    contextKey: "/repo|main",
-                    action: "add",
-                    file: "a.js",
-                    message: "m",
-                },
-            },
+            pageReq({
+                contextKey: "/repo|main",
+                action: "add",
+                file: "a.js",
+                message: "m",
+            }),
             res
         )
         expect(res.statusCode).toBe(200)
         expect(live.store.save).toHaveBeenCalled()
     })
+
+    test.each([
+        ["another API version", "0"],
+        ["no API header", null],
+    ])(
+        "a page with %s is told to reload, and nothing changes",
+        async (_label, api) => {
+            const live = makeLive()
+            for (const key of Object.keys(
+                entry(live).routes.dashboardMutations
+            )) {
+                const res = mkRes()
+                await entry(live).routes.dashboardMutations[key](
+                    pageReq({ value: 7, contextKey: "/repo|main" }, api),
+                    res
+                )
+                expect(res.statusCode).toBe(409)
+                expect(res.body).toEqual({
+                    ok: false,
+                    code: "PAGE_OUTDATED",
+                    error: "page is outdated — reload",
+                })
+            }
+            expect(live.store.reset).not.toHaveBeenCalled()
+            expect(live.config.limits.maxCodexRounds).toBe(5)
+        }
+    )
 })
 
 describe("createUiEntry — pages and probes", () => {
@@ -199,6 +234,42 @@ describe("createUiEntry — pages and probes", () => {
         const res = mkRes()
         ui.routes.inflight({}, res)
         expect(res.body.inFlight).toHaveLength(1)
+    })
+
+    test("inflight carries the running core's version and the reload stamp", () => {
+        const shell = {
+            coreVersion: "c2",
+            reload: { previousVersion: "c1", activeReviews: 0, history: [] },
+        }
+        const res = mkRes()
+        entry({ ...makeLive(), shellStatus: () => shell }).routes.inflight(
+            {},
+            res
+        )
+        expect(res.body.coreVersion).toBe("c2")
+        expect(JSON.parse(res.body.reloadStamp)).toEqual([
+            "c2",
+            "c1",
+            0,
+            null,
+            null,
+        ])
+    })
+
+    test("the page embeds the shell's state and this start's dashboard token", () => {
+        const res = mkRes()
+        entry({
+            ...makeLive(),
+            dashboard: { csrfToken: "tok-123" },
+            shellStatus: () => ({
+                shellVersion: "s1",
+                coreVersion: "c1",
+                reload: { loadedAt: null, history: [] },
+            }),
+        }).routes.dashboardPage({}, res)
+        expect(res.body).toContain('data-csrf="tok-123"')
+        expect(res.body).toContain('data-core-version="c1"')
+        expect(res.body).toContain("shell <code>s1</code>")
     })
 
     test("selfCheck renders the dashboard for the candidate config", () => {

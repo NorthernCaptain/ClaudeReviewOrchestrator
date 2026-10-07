@@ -752,6 +752,101 @@ export const renderControls = (_currentProvider, contexts = []) => {
     )
 }
 
+// Bumped when a dashboard action's request or response shape changes: a
+// tab rendered by another core version then gets "page is outdated —
+// reload" instead of a confusing failure (hot-reload plan §5.8).
+export const DASHBOARD_API = 1
+
+// What the page compares on every /inflight poll to know its reload
+// panel and version line are out of date.
+export const reloadStamp = (shell) => {
+    const r = shell?.reload
+    if (!r) return ""
+    const p = r.pending
+    return JSON.stringify([
+        shell.coreVersion,
+        r.previousVersion,
+        r.activeReviews,
+        r.history?.[0]?.at ?? null,
+        p
+            ? [
+                  p.kind,
+                  p.to,
+                  p.requestedAt,
+                  p.configChanges ?? [],
+                  p.swapping,
+                  p.holding,
+                  p.heldNow,
+                  p.releasedAtDeadline,
+              ]
+            : null,
+    ])
+}
+
+// Header line: shell vX · core <id> loaded <time> · N reloads, and the
+// last reload's error when it failed.
+export const renderVersions = (shell) => {
+    if (!shell) return `<div class="meta" id="versions"></div>`
+    const r = shell.reload ?? {}
+    const history = r.history ?? []
+    const reloads = r.appliedCount ?? history.filter((h) => h.ok).length
+    const last = history[0]
+    const error =
+        last && !last.ok
+            ? `<span class="reload-error"> · last ${escapeHtml(last.kind ?? "reload")} failed: ${escapeHtml(last.error ?? last.code ?? "unknown error")}</span>`
+            : ""
+    return (
+        `<div class="meta" id="versions">` +
+        `shell <code>${escapeHtml(shell.shellVersion ?? "?")}</code> · ` +
+        `core <code>${escapeHtml(shell.coreVersion ?? "?")}</code> loaded ${escapeHtml(fmtTs(r.loadedAt))} · ` +
+        `${reloads} reload${reloads === 1 ? "" : "s"}${error}</div>`
+    )
+}
+
+// Reload controls (§5.8): reload, roll back while a previous core is in
+// memory, and cancel / apply now while a reload waits for the running
+// reviews.
+export const renderReloadPanel = (shell, { maxWaitMinutes = 5 } = {}) => {
+    const r = shell?.reload
+    if (!r) return ""
+    const p = r.pending
+    const button = (action, label, cls = "") =>
+        `<button class="btn${cls}" type="button" data-reload-action="${action}">${label}</button>`
+    const buttons =
+        button("reload", "⟳ reload core") +
+        (r.previousVersion
+            ? button(
+                  "rollback",
+                  `↶ roll back to ${escapeHtml(r.previousVersion)}`,
+                  " secondary"
+              )
+            : "") +
+        (p
+            ? button("cancel", "cancel pending", " secondary") +
+              button("now", "apply now", " warn")
+            : "")
+    let pending = ""
+    if (p) {
+        const n = r.activeReviews ?? 0
+        const changes = (p.configChanges ?? []).length
+            ? ` · config: ${escapeHtml(p.configChanges.join(", "))}`
+            : ""
+        const hold = p.holding
+            ? `holding new reviews since ${escapeHtml(fmtTs(p.holdingSince))} (${p.heldNow ?? 0} held, ${p.releasedAtDeadline ?? 0} released at their hold deadline)`
+            : `new reviews will be held from ${escapeHtml(fmtTs(p.requestedAt + maxWaitMinutes * 60_000))}`
+        pending =
+            `<div class="reload-pending">${p.kind === "rollback" ? "Rollback" : "Reload"} to <code>${escapeHtml(p.to)}</code> pending — ` +
+            `${p.swapping ? "swapping now" : `waiting for ${n} review${n === 1 ? "" : "s"} (see in flight)`}${changes} · ${hold}</div>`
+    }
+    return (
+        `<div class="reload-panel" aria-label="reload controls">` +
+        `<span class="ctl-label">core</span>${buttons}` +
+        `<span id="reload-status" class="status" role="status" aria-live="polite"></span>` +
+        pending +
+        `</div>`
+    )
+}
+
 // Dedicated exclusions panel (v1.1). Shows every excluded finding for
 // the dashboard's "current" context — by default the same context the
 // Reset selector pre-selects (most recent lastReviewedAt). The client
@@ -1284,6 +1379,27 @@ section.compact > h2 { margin-bottom: 8px; }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .controls .status.ok { color: #16a34a; }
 .controls .status.err { color: #c2410c; }
+/* Reload controls and banners (hot-reload plan §5.8). */
+.reload-panel { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.reload-panel .ctl-label { color: var(--muted); font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+.reload-panel .btn, .banner .btn { background: var(--accent); color: white;
+  border: 0; border-radius: 4px; padding: 4px 10px; font-size: 12px;
+  cursor: pointer; font-weight: 600; letter-spacing: 0.02em; }
+.reload-panel .btn.secondary { background: var(--bg); color: var(--fg);
+  border: 1px solid var(--border); }
+.reload-panel .btn.warn { background: #c2410c; }
+.reload-panel .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.reload-panel .status { font-size: 12px; color: var(--muted); margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.reload-panel .status.ok { color: #16a34a; }
+.reload-panel .status.err { color: #c2410c; }
+.reload-pending { flex-basis: 100%; font-size: 12px; color: var(--muted); }
+.reload-error { color: #c2410c; }
+.banner { background: var(--panel); border: 1px solid var(--accent);
+  border-radius: 6px; padding: 8px 12px; margin-bottom: 12px; font-size: 13px; }
+.banner.err { border-color: #c2410c; color: #c2410c; }
 /* Exclude / Include toggle on each finding (v1.1). */
 .excl-btn { float: right; background: var(--bg); color: var(--muted);
   border: 1px solid var(--border); border-radius: 3px;
@@ -1413,6 +1529,11 @@ export const renderDashboard = ({
     metrics = null,
     inFlight = [],
     contexts = [],
+    // The shell's state ({ shellVersion, coreVersion, reload }) and the
+    // per-server-start token every dashboard action sends back.
+    shell = null,
+    csrfToken = "",
+    maxWaitMinutes = 5,
 } = {}) => {
     // Assign a stable id per record so chart bars can deep-link to the
     // matching row in the reviews table. Index is the position in the
@@ -1485,11 +1606,14 @@ export const renderDashboard = ({
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>${CSS}</style>
 </head>
-<body>
+<body data-csrf="${escapeHtml(csrfToken)}" data-api="${DASHBOARD_API}" data-core-version="${escapeHtml(shell?.coreVersion ?? "")}" data-reload-stamp="${escapeHtml(reloadStamp(shell))}">
 <main>
+<div id="framed-banner" class="banner err" hidden>the dashboard can't be used inside a frame</div>
+<div id="stale-banner" class="banner" hidden>Dashboard updated to <code id="stale-version"></code> — <button id="stale-reload" class="btn" type="button">reload page</button></div>
 <header>
   <h1>review-orchestrator <span class="version">v${escapeHtml(version)}</span></h1>
   <div class="meta">started ${escapeHtml(startedAtStr)} · uptime ${escapeHtml(fmtUptime(uptimeSeconds))} · ${records.length} record${records.length === 1 ? "" : "s"} (${failures.length} failed)</div>
+  ${renderVersions(shell)}
 </header>
 
 <section aria-label="active config" class="compact">
@@ -1499,6 +1623,7 @@ export const renderDashboard = ({
     ${renderInFlight(inFlight)}
   </div>
   ${renderControls(config?.provider, contexts)}
+  ${renderReloadPanel(shell, { maxWaitMinutes })}
   ${renderExclusionsPanel(contexts)}
 </section>
 
@@ -1544,7 +1669,7 @@ export const renderDashboard = ({
   }
 </section>
 
-<footer>review-orchestrator · localhost only · no auth on this page</footer>
+<footer>review-orchestrator · local only · actions need this page's token</footer>
 </main>
 <script>
 // Open the target <details> when a chart bar is clicked and the URL
@@ -1624,6 +1749,34 @@ export const renderDashboard = ({
 //     refreshSections() which fetches GET / and swaps selected
 //     sections by aria-label, re-wiring controls after the swap.
 (function () {
+  /* ---------- page identity, frame guard, signed-off actions (§5.8) ---------- */
+  var PAGE = document.body.dataset;
+  var FRAMED = window.top !== window.self;
+  // Set once /inflight reports another core: the page stops swapping in
+  // sections rendered by it and offers a reload instead.
+  var stale = false;
+  var lastStamp = PAGE.reloadStamp || "";
+  function send(method, url, body) {
+    if (FRAMED) return Promise.reject(new Error("the dashboard can't be used inside a frame"));
+    return fetch(url, {
+      method: method,
+      headers: {
+        "content-type": "application/json",
+        "x-dashboard-csrf": PAGE.csrf || "",
+        "x-dashboard-api": PAGE.api || "",
+        "x-dashboard-core": PAGE.coreVersion || "",
+      },
+      body: JSON.stringify(body),
+    });
+  }
+  function lockFramed() {
+    var banner = document.getElementById("framed-banner");
+    if (banner) banner.hidden = false;
+    document.querySelectorAll("main button, main select").forEach(function (el) {
+      el.disabled = true;
+    });
+  }
+
   /* ---------- helpers ---------- */
   function fmtElapsed(ms) {
     var s = Math.max(0, Math.floor(ms / 1000));
@@ -1679,23 +1832,50 @@ export const renderDashboard = ({
     }
     lastInflightCount = list.length;
   }
+  // A page rendered by another core: show the banner, never mix its
+  // sections into this one.
+  function isOtherCore(version) {
+    if (!version || !PAGE.coreVersion || version === PAGE.coreVersion) return false;
+    stale = true;
+    var v = document.getElementById("stale-version");
+    if (v) v.textContent = version;
+    var b = document.getElementById("stale-banner");
+    if (b) b.hidden = false;
+    return true;
+  }
   function poll() {
     fetch("/inflight", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (j) { if (j && Array.isArray(j.inFlight)) renderInflight(j.inFlight); })
+      .then(function (j) {
+        if (!j) return;
+        // Core identity first, so nothing below refreshes from a new core.
+        isOtherCore(j.coreVersion);
+        if (Array.isArray(j.inFlight)) renderInflight(j.inFlight);
+        // lastStamp moves only when a refreshed page is shown, so a
+        // failed refresh is retried on the next poll.
+        if (!stale && typeof j.reloadStamp === "string" && j.reloadStamp !== lastStamp) {
+          refreshSections();
+        }
+      })
       .catch(function () {});
   }
 
   /* ---------- section refresh (fetches / and swaps in-place) ---------- */
   var refreshing = false;
+  // A refresh asked for while one runs: done once it ends, so the newer
+  // state isn't lost.
+  var refreshAgain = false;
   function refreshSections() {
-    if (refreshing) return;
+    if (stale) return;
+    if (refreshing) { refreshAgain = true; return; }
     refreshing = true;
     fetch("/", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.text() : null; })
       .then(function (text) {
-        if (!text) return;
+        if (!text || stale) return;
         var doc = new DOMParser().parseFromString(text, "text/html");
+        // The core may have changed while this page was fetched.
+        if (isOtherCore(doc.body && doc.body.getAttribute("data-core-version"))) return;
         // Stable sections that have no JS-attached listeners — swap
         // wholesale by aria-label.
         ["charts", "timeline", "reviews", "failed"].forEach(function (label) {
@@ -1729,9 +1909,27 @@ export const renderDashboard = ({
         var freshData = doc.getElementById("exclusions-data");
         var curData = document.getElementById("exclusions-data");
         if (freshData && curData) curData.replaceWith(freshData);
+        var freshVer = doc.getElementById("versions");
+        var curVer = document.getElementById("versions");
+        if (freshVer && curVer) curVer.replaceWith(freshVer);
+        var freshReload = doc.querySelector(".reload-panel");
+        var curReload = document.querySelector(".reload-panel");
+        if (freshReload && curReload) {
+          // Keep the last action's result across the swap.
+          var st = curReload.querySelector("#reload-status");
+          var nst = freshReload.querySelector("#reload-status");
+          if (st && nst) { nst.textContent = st.textContent; nst.className = st.className; }
+          curReload.replaceWith(freshReload);
+        }
+        if (FRAMED) lockFramed();
+        var shown = doc.body && doc.body.getAttribute("data-reload-stamp");
+        if (shown !== null) lastStamp = shown;
       })
       .catch(function () {})
-      .finally(function () { refreshing = false; });
+      .finally(function () {
+        refreshing = false;
+        if (refreshAgain) { refreshAgain = false; refreshSections(); }
+      });
   }
 
   /* ---------- controls: provider switcher + reset button ---------- */
@@ -1754,11 +1952,7 @@ export const renderDashboard = ({
     if (ps) {
       ps.addEventListener("change", function () {
         var picked = ps.value;
-        fetch("/dashboard/provider", {
-          method: "PUT",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ provider: picked }),
-        })
+        send("PUT", "/dashboard/provider", { provider: picked })
           .then(bodyToOk)
           .then(function (r) {
             if (r.ok) {
@@ -1780,11 +1974,7 @@ export const renderDashboard = ({
         var preset = ms.value;
         if (!preset) return;
         ms.disabled = true;
-        fetch("/dashboard/reviewer-preset", {
-          method: "PUT",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ preset: preset }),
-        })
+        send("PUT", "/dashboard/reviewer-preset", { preset: preset })
           .then(bodyToOk)
           .then(function (r) {
             if (r.ok) {
@@ -1809,11 +1999,7 @@ export const renderDashboard = ({
         var contextKey = rs.value;
         if (!contextKey) { setStatus("no context selected", false); return; }
         rb.disabled = true;
-        fetch("/dashboard/reset", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ contextKey: contextKey }),
-        })
+        send("POST", "/dashboard/reset", { contextKey: contextKey })
           .then(bodyToOk)
           .then(function (r) {
             if (r.ok) {
@@ -1861,11 +2047,7 @@ export const renderDashboard = ({
     var incEl = document.getElementById(step.inc);
     if (decEl) decEl.disabled = true;
     if (incEl) incEl.disabled = true;
-    fetch(step.endpoint, {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ value: next }),
-    })
+    send("PUT", step.endpoint, { value: next })
       .then(bodyToOk)
       .then(function (r) {
         if (r.ok) {
@@ -1893,11 +2075,7 @@ export const renderDashboard = ({
     if (!sel || sel.id !== "blocking-severities-select") return;
     var value = sel.value ? sel.value.split(",") : [];
     sel.disabled = true;
-    fetch("/dashboard/blocking-severities", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ value: value }),
-    })
+    send("PUT", "/dashboard/blocking-severities", { value: value })
       .then(bodyToOk)
       .then(function (r) {
         if (r.ok) {
@@ -2014,11 +2192,7 @@ export const renderDashboard = ({
       return;
     }
     btn.disabled = true;
-    fetch("/dashboard/exclusions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ contextKey: contextKey, file: file, message: message, action: action }),
-    })
+    send("POST", "/dashboard/exclusions", { contextKey: contextKey, file: file, message: message, action: action })
       .then(bodyToOk)
       .then(function (r) {
         if (r.ok) {
@@ -2037,7 +2211,53 @@ export const renderDashboard = ({
       .finally(function () { btn.disabled = false; });
   });
 
+  /* ---------- reload controls ---------- */
+  function setReloadStatus(msg, ok) {
+    var el = document.getElementById("reload-status");
+    if (!el) return;
+    el.textContent = msg;
+    el.className = "status " + (ok ? "ok" : "err");
+  }
+  function describeReload(j) {
+    if (j.ok === false) return "error: " + (j.error || "failed") + (j.code ? " (" + j.code + ")" : "");
+    if (j.unchanged) return "unchanged — nothing to reload" + (j.cancelledPending ? " (cancelled the pending one)" : "");
+    if (j.applied) {
+      var keys = j.configChanges || j.reverted || [];
+      return "applied: " + j.kind + " " + j.from + " → " + j.to + (keys.length ? " · config: " + keys.join(", ") : "");
+    }
+    if (j.scheduled) return "scheduled: " + j.kind + " to " + j.to + " — waiting for " + j.activeReviews + " review(s)";
+    if (j.cancelled === true) return "cancelled the pending " + j.kind;
+    if (j.cancelled === false) return j.reason || "nothing pending";
+    return "nothing to apply";
+  }
+  document.addEventListener("click", function (e) {
+    if (e.target && e.target.id === "stale-reload") { location.reload(); return; }
+    var btn = e.target && e.target.closest && e.target.closest("[data-reload-action]");
+    if (!btn) return;
+    var action = btn.getAttribute("data-reload-action");
+    var body = {};
+    if (action === "rollback") body.rollback = true;
+    else if (action === "cancel") body.cancel = true;
+    else if (action === "now") {
+      if (!window.confirm("Apply the pending reload now? Running reviews finish on the old code.")) return;
+      body.now = true;
+    }
+    btn.disabled = true;
+    setReloadStatus("working…", true);
+    send("POST", "/dashboard/reload", body)
+      .then(bodyToOk)
+      .then(function (r) { setReloadStatus(describeReload(r.j), r.ok && r.j.ok !== false); })
+      .catch(function (err) { setReloadStatus("error: " + err.message, false); })
+      .finally(function () {
+        btn.disabled = false;
+        // The poll decides: a new core shows the banner, anything else
+        // refreshes the panel.
+        poll();
+      });
+  });
+
   wireControls();
+  if (FRAMED) lockFramed();
   setInterval(tick, 1000);
   setInterval(poll, 2000);
 })();
@@ -2059,6 +2279,8 @@ export const createDashboardPageHandler = (getOptions) => (_req, res) => {
         startedAt,
         metrics = null,
         inFlight = null,
+        shell = null,
+        csrfToken = "",
     } = getOptions()
     const records = archive?.readRecent
         ? archive.readRecent({ limit: 200 })
@@ -2083,6 +2305,9 @@ export const createDashboardPageHandler = (getOptions) => (_req, res) => {
         inFlight:
             typeof inFlight === "function" ? inFlight() : (inFlight ?? []),
         contexts,
+        shell,
+        csrfToken,
+        maxWaitMinutes: config?.reload?.maxWaitMinutes ?? 5,
     })
     res.setHeader("Content-Type", "text/html; charset=utf-8")
     res.setHeader("Cache-Control", "no-store")

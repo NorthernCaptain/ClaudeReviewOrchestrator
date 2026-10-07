@@ -16,10 +16,15 @@
 //     other route takes only HMAC-signed requests bound to this server
 //     instance, with a timestamp window and a nonce cache, and its
 //     responses are signed with the token that verified the request.
+//
+// And the browser-facing guards (§5.8): a Host allowlist on every route
+// (DNS rebinding), "local" meaning loopback or the listening address, and
+// a CSRF token, an Origin check and a JSON body on every dashboard action.
 
 import { readFileSync } from "node:fs"
 import {
     challengeProof,
+    clientHostFromBind,
     HEADERS,
     requestSignature,
     responseSignature,
@@ -315,4 +320,162 @@ export const createAuth = ({
     }
 
     return { middleware, challenge, __nonces: nonces }
+}
+
+// ---- browser-facing guards (§5.8) -----------------------------------------
+
+const LOOPBACK_NAMES = ["127.0.0.1", "localhost", "[::1]"]
+const WILDCARDS = new Set(["", "0.0.0.0", "::"])
+
+// "host[:port]" as a URL would send it — lowercase, IPv6 compressed and
+// bracketed, IPv4 in dotted form — so two spellings of one address
+// compare equal. Null when it isn't a plain host[:port].
+export const canonicalHost = (value) => {
+    if (typeof value !== "string" || value.length === 0) return null
+    try {
+        const u = new URL(`http://${value}`)
+        if (u.username || u.password || u.pathname !== "/" || u.search) {
+            return null
+        }
+        return { hostname: u.hostname, port: Number(u.port || 80) }
+    } catch {
+        return null
+    }
+}
+
+// The names this server answers to, canonical: the loopback names, the
+// client host for `bind` (the hooks' rule: wildcards are loopback, a
+// specific address or hostname is itself), and the address it actually
+// listens on — what server.json advertises, which for a hostname bind is
+// the address it resolved to.
+export const allowedHostNames = (bind, listenAddress = null) => {
+    const names = [...LOOPBACK_NAMES, clientHostFromBind(bind)]
+    if (listenAddress && !WILDCARDS.has(listenAddress)) {
+        names.push(clientHostFromBind(listenAddress))
+    }
+    return new Set(names.map((n) => canonicalHost(n)?.hostname).filter(Boolean))
+}
+
+const hostMatches = (value, port, names) => {
+    const host = canonicalHost(value)
+    return host !== null && host.port === port && names.has(host.hostname)
+}
+
+// The allowed names once the listening address is known (it's fixed for
+// the server's life).
+const namesFor = ({ bind, listenAddress }) => {
+    let cached = null
+    return () => {
+        if (cached) return cached
+        const listening = listenAddress()
+        const names = allowedHostNames(bind, listening)
+        if (listening) cached = names
+        return names
+    }
+}
+
+const misdirected = (res) =>
+    res.status(421).json({
+        ok: false,
+        code: "HOST_NOT_ALLOWED",
+        error: "this server answers only to its own host names",
+    })
+
+// Before routing, on every route: a Host that isn't one of ours (a
+// rebinding domain resolving to this address) gets 421.
+export const createHostAllowlist = ({ bind, listenAddress = () => null }) => {
+    const names = namesFor({ bind, listenAddress })
+    return (req, res, next) => {
+        if (hostMatches(req.headers.host, req.socket.localPort, names())) {
+            next()
+            return
+        }
+        misdirected(res)
+    }
+}
+
+// "::ffff:10.0.0.5" → "10.0.0.5", "[::1]" → "::1".
+export const normalizeAddress = (address) => {
+    let a = String(address ?? "")
+        .replace(/^\[|\]$/g, "")
+        .toLowerCase()
+    if (a.startsWith("::ffff:") && a.includes(".")) a = a.slice(7)
+    return a
+}
+
+const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1"])
+
+// The dashboard's actions are local only: the peer is loopback, or is
+// exactly the address the server listens on (from the socket, never
+// DNS; a wildcard listen leaves loopback only).
+export const createLocalOnly =
+    ({ listenAddress }) =>
+    (req, res, next) => {
+        const remote = normalizeAddress(req.socket?.remoteAddress)
+        const listening = normalizeAddress(listenAddress())
+        if (
+            LOOPBACK_ADDRESSES.has(remote) ||
+            (!WILDCARDS.has(listening) && remote === listening)
+        ) {
+            next()
+            return
+        }
+        res.status(403).json({ ok: false, error: "local only", remote })
+    }
+
+const forbidden = (res, code, error) =>
+    res.status(403).json({ ok: false, code, error })
+
+// Every dashboard action: an Origin (when sent) that is exactly one of
+// ours, or else Sec-Fetch-Site: same-origin; the page's CSRF token; and a
+// JSON body. The Origin is checked even with Sec-Fetch-Site: after DNS
+// rebinding an attacker's origin is same-origin with itself.
+export const createDashboardGuard = ({
+    bind,
+    csrfToken,
+    listenAddress = () => null,
+}) => {
+    const names = namesFor({ bind, listenAddress })
+    return (req, res, next) => {
+        const origin = req.headers.origin
+        const port = req.socket.localPort
+        const fromUs =
+            origin === undefined
+                ? req.headers["sec-fetch-site"] === "same-origin"
+                : typeof origin === "string" &&
+                  origin.toLowerCase().startsWith("http://") &&
+                  hostMatches(origin.slice("http://".length), port, names())
+        if (!fromUs) {
+            forbidden(
+                res,
+                "CROSS_ORIGIN",
+                "dashboard actions are accepted only from the dashboard page"
+            )
+            return
+        }
+        if (!safeEqual(req.headers["x-dashboard-csrf"], csrfToken)) {
+            forbidden(
+                res,
+                "BAD_DASHBOARD_TOKEN",
+                "the page's dashboard token is missing or stale — reload the page"
+            )
+            return
+        }
+        if (!req.is("application/json")) {
+            res.status(415).json({
+                ok: false,
+                code: "JSON_REQUIRED",
+                error: "dashboard actions take a JSON body",
+            })
+            return
+        }
+        next()
+    }
+}
+
+// Every response: never rendered inside a frame (clickjacking).
+export const noFraming = (_req, res, next) => {
+    res.setHeader("X-Frame-Options", "DENY")
+    res.setHeader("Content-Security-Policy", "frame-ancestors 'none'")
+    next()
 }

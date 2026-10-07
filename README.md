@@ -133,7 +133,18 @@ started by launchd. Binds `127.0.0.1` only.
 | PUT    | `/provider` | yes  | Switch reviewer provider on the fly (live + persisted) | `scripts/setprovider.sh` |
 | GET    | `/status`   | yes  | Dump live contexts, version, redacted config  | Human        |
 | GET    | `/`         | **no**  | HTML dashboard (version, config, timeline, history) | Browser |
-| GET    | `/healthz`  | no   | Liveness check                                | launchd / hook fail-open |
+| POST/PUT | `/dashboard/*` | page token | Dashboard actions, incl. `/dashboard/reload` | The dashboard page |
+| POST   | `/admin/reload` | yes | Reload, roll back, cancel or apply now | `scripts/reload.sh` |
+| GET    | `/healthz`  | no   | Liveness check, and `?challenge=` for the hooks' address selection | launchd / hooks |
+
+Every route answers only to the server's own host names (the loopback
+names and the client host for `bind`); any other `Host` gets `421`, so a
+DNS-rebinding page can't reach it. Dashboard actions take no API token but
+are local only (loopback, or the exact address the server listens on) and
+need the page's per-start CSRF token (`X-Dashboard-Csrf`), our own
+`Origin` (or `Sec-Fetch-Site: same-origin` when no Origin is sent) and a
+JSON body. Every response refuses framing (`X-Frame-Options: DENY`,
+`frame-ancestors 'none'`).
 
 `/mcp` takes the `X-Review-Token` header (its clients send a static one).
 Every other auth-protected endpoint takes only **signed** requests made
@@ -1037,12 +1048,20 @@ scripts/reset-review.sh /path/to/repo   # a specific repo
 
 ### 7. Dashboard (`server/src/core/dashboard.js`, served at `GET /`)
 
-Self-contained HTML page, no external assets, no client-side framework. Three
-panels:
+Self-contained HTML page, no external assets, no client-side framework.
+Rendered by the core, so a reload changes the next page load. The header
+shows the shell and core versions, when the core was loaded, the number of
+reloads and the last reload error. An open tab whose core has been replaced
+shows "Dashboard updated to <id> — reload page" and stops refreshing its
+sections; it never reloads itself. Three panels:
 
 - **Active config:** version, provider, model, effort/mode, reviewer timeout,
   hook fetch timeout (shows `auto` when derived), round + block caps,
-  blocking severities, allowed roots count, port/bind.
+  blocking severities, allowed roots count, port/bind. Below it, the reload
+  controls: **reload core**, **roll back** (while a previous core is in
+  memory), and while a reload waits for running reviews, **cancel pending**
+  and **apply now** (confirmed first; running reviews finish on the old
+  code), with what it waits for and when new reviews start being held.
 - **Timeline chart:** inline SVG, one bar per archived review, oldest→newest,
   **linear** duration height with a min-px floor, color-coded by status
   (`ESCALATE` is red). Findings count labels above the bar when there's room.

@@ -17,8 +17,15 @@ import {
     sha256Hex,
 } from "../../hooks/signed-client.mjs"
 import {
+    allowedHostNames,
+    canonicalHost,
     createAuth,
+    createDashboardGuard,
+    createHostAllowlist,
+    createLocalOnly,
     createTokenState,
+    noFraming,
+    normalizeAddress,
     DEFAULT_GRACE_HOURS,
     graceUntil,
     NONCE_TTL_MS,
@@ -500,5 +507,226 @@ describe("createAuth over HTTP", () => {
             fetchFn: tamper,
         })
         expect(r.fetchError).toMatch(/unverified response/)
+    })
+})
+
+describe("browser-facing guards (§5.8)", () => {
+    const mkRes = () => {
+        const res = { statusCode: 0, body: null, headers: {} }
+        res.status = (c) => {
+            res.statusCode = c
+            return res
+        }
+        res.json = (b) => {
+            res.body = b
+            return res
+        }
+        res.setHeader = (k, v) => {
+            res.headers[k] = v
+        }
+        return res
+    }
+    const run = (mw, req) => {
+        const res = mkRes()
+        let passed = false
+        mw(req, res, () => {
+            passed = true
+        })
+        return { passed, res }
+    }
+
+    test("allowed host names: loopback plus the client host for bind", () => {
+        expect([...allowedHostNames("127.0.0.1")].sort()).toEqual([
+            "127.0.0.1",
+            "[::1]",
+            "localhost",
+        ])
+        expect(allowedHostNames("0.0.0.0").has("0.0.0.0")).toBe(false)
+        expect(allowedHostNames("10.0.0.5").has("10.0.0.5")).toBe(true)
+        expect(allowedHostNames("fe80::1").has("[fe80::1]")).toBe(true)
+        expect(allowedHostNames("MyHost.Local").has("myhost.local")).toBe(true)
+    })
+
+    test("hosts compare canonically: case, compressed IPv6, dotted IPv4; junk is no host", () => {
+        expect(canonicalHost("LocalHost:7777")).toEqual({
+            hostname: "localhost",
+            port: 7777,
+        })
+        expect(canonicalHost("[fe80:0:0:0:0:0:0:1]:1")).toEqual({
+            hostname: "[fe80::1]",
+            port: 1,
+        })
+        expect(canonicalHost("127.1")).toEqual({
+            hostname: "127.0.0.1",
+            port: 80,
+        })
+        for (const junk of ["a@b:1", "h:1/x", "h:1?q", "", undefined, "[::1"]) {
+            expect(canonicalHost(junk)).toBeNull()
+        }
+    })
+
+    test("the listening address counts too: a hostname bind accepts the address it resolved to", () => {
+        let listening = null
+        const mw = createHostAllowlist({
+            bind: "myhost.local",
+            listenAddress: () => listening,
+        })
+        const req = (host) => ({
+            headers: { host },
+            socket: { localPort: 7777 },
+        })
+        expect(run(mw, req("192.168.1.20:7777")).passed).toBe(false)
+        listening = "192.168.1.20"
+        expect(run(mw, req("192.168.1.20:7777")).passed).toBe(true)
+        expect(run(mw, req("myhost.local:7777")).passed).toBe(true)
+        // A wildcard listen adds nothing.
+        expect([...allowedHostNames("0.0.0.0", "0.0.0.0")]).toEqual([
+            "127.0.0.1",
+            "localhost",
+            "[::1]",
+        ])
+        // An expanded IPv6 bind accepts what clients send: the compressed form.
+        const v6 = createHostAllowlist({ bind: "fe80:0:0:0:0:0:0:1" })
+        expect(run(v6, req("[fe80::1]:7777")).passed).toBe(true)
+    })
+
+    test("the Host allowlist passes our names with the listening port, refuses the rest with 421", () => {
+        const mw = createHostAllowlist({ bind: "10.0.0.5" })
+        const req = (host, port = 7777) => ({
+            headers: { host },
+            socket: { localPort: port },
+        })
+        for (const host of [
+            "127.0.0.1:7777",
+            "LOCALHOST:7777",
+            "[::1]:7777",
+            "10.0.0.5:7777",
+        ]) {
+            expect(run(mw, req(host)).passed).toBe(true)
+        }
+        for (const host of [
+            "evil.example:7777",
+            "127.0.0.1:7778",
+            "127.0.0.1",
+            undefined,
+        ]) {
+            const r = run(mw, req(host))
+            expect(r.passed).toBe(false)
+            expect(r.res.statusCode).toBe(421)
+            expect(r.res.body.code).toBe("HOST_NOT_ALLOWED")
+        }
+        // Port 80 may be left out of Host.
+        expect(run(mw, req("localhost", 80)).passed).toBe(true)
+    })
+
+    test("addresses are normalized: IPv4-mapped, brackets, case", () => {
+        expect(normalizeAddress("::ffff:10.0.0.5")).toBe("10.0.0.5")
+        expect(normalizeAddress("[::1]")).toBe("::1")
+        expect(normalizeAddress("FE80::1")).toBe("fe80::1")
+        expect(normalizeAddress(undefined)).toBe("")
+    })
+
+    test("local means loopback, or exactly the listening address (never with a wildcard listen)", () => {
+        const peer = (remoteAddress) => ({ socket: { remoteAddress } })
+        const on = (listen) => createLocalOnly({ listenAddress: () => listen })
+        for (const ip of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
+            expect(run(on("0.0.0.0"), peer(ip)).passed).toBe(true)
+        }
+        expect(run(on("10.0.0.5"), peer("10.0.0.5")).passed).toBe(true)
+        expect(run(on("10.0.0.5"), peer("::ffff:10.0.0.5")).passed).toBe(true)
+        for (const [listen, ip] of [
+            ["10.0.0.5", "10.0.0.9"],
+            ["0.0.0.0", "10.0.0.5"],
+            ["::", "fe80::2"],
+            [null, "10.0.0.5"],
+            ["127.0.0.1", ""],
+        ]) {
+            const r = run(on(listen), peer(ip))
+            expect(r.passed).toBe(false)
+            expect(r.res.statusCode).toBe(403)
+            expect(r.res.body.error).toBe("local only")
+        }
+    })
+
+    describe("dashboard guard", () => {
+        const guard = createDashboardGuard({
+            bind: "127.0.0.1",
+            csrfToken: "T",
+        })
+        const req = (headers, json = true) => ({
+            headers: { "x-dashboard-csrf": "T", ...headers },
+            socket: { localPort: 7777 },
+            is: (type) => json && type === "application/json",
+        })
+
+        test("our Origin, the token and a JSON body pass", () => {
+            expect(
+                run(guard, req({ origin: "http://127.0.0.1:7777" })).passed
+            ).toBe(true)
+            expect(
+                run(guard, req({ origin: "http://localhost:7777" })).passed
+            ).toBe(true)
+            // No Origin at all: only a same-origin fetch.
+            expect(
+                run(guard, req({ "sec-fetch-site": "same-origin" })).passed
+            ).toBe(true)
+        })
+
+        test("another Origin is refused even when the browser says same-origin (DNS rebinding)", () => {
+            for (const origin of [
+                "http://evil.example:7777",
+                "https://127.0.0.1:7777",
+                "http://127.0.0.1:7778",
+                "null",
+            ]) {
+                const r = run(
+                    guard,
+                    req({ origin, "sec-fetch-site": "same-origin" })
+                )
+                expect(r.passed).toBe(false)
+                expect(r.res.statusCode).toBe(403)
+                expect(r.res.body.code).toBe("CROSS_ORIGIN")
+            }
+        })
+
+        test("no Origin and no same-origin fetch, a missing or stale token, a non-JSON body", () => {
+            let r = run(guard, req({ "sec-fetch-site": "cross-site" }))
+            expect(r.res.body.code).toBe("CROSS_ORIGIN")
+            r = run(guard, req({}))
+            expect(r.res.body.code).toBe("CROSS_ORIGIN")
+            r = run(
+                guard,
+                req({
+                    origin: "http://127.0.0.1:7777",
+                    "x-dashboard-csrf": "old",
+                })
+            )
+            expect(r.res).toMatchObject({
+                statusCode: 403,
+                body: { code: "BAD_DASHBOARD_TOKEN" },
+            })
+            r = run(
+                guard,
+                req({
+                    origin: "http://127.0.0.1:7777",
+                    "x-dashboard-csrf": undefined,
+                })
+            )
+            expect(r.res.body.code).toBe("BAD_DASHBOARD_TOKEN")
+            r = run(guard, req({ origin: "http://127.0.0.1:7777" }, false))
+            expect(r.res).toMatchObject({
+                statusCode: 415,
+                body: { code: "JSON_REQUIRED" },
+            })
+        })
+    })
+
+    test("every response refuses framing", () => {
+        const { passed, res } = run(noFraming, {})
+        expect(passed).toBe(true)
+        expect(res.headers).toEqual({
+            "X-Frame-Options": "DENY",
+            "Content-Security-Policy": "frame-ancestors 'none'",
+        })
     })
 })
