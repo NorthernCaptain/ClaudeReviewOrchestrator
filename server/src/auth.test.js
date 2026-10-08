@@ -5,7 +5,13 @@
 
 import { jest } from "@jest/globals"
 import express from "express"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import {
+    mkdtempSync,
+    rmSync,
+    statSync,
+    utimesSync,
+    writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
@@ -728,5 +734,60 @@ describe("browser-facing guards (§5.8)", () => {
             "X-Frame-Options": "DENY",
             "Content-Security-Policy": "frame-ancestors 'none'",
         })
+    })
+})
+
+describe("token state: restarts and in-place rewrites (§9 hooks and token)", () => {
+    test("a server started after a rotation (stopped during it) accepts only the new token", () => {
+        writeConfig("B", [rec("A", "B", "default", Date.now())])
+        // A fresh start reads only the file: nothing in memory knows A.
+        const state = createTokenState({ configPath, initialToken: "B" })
+        expect(state.refresh()).toEqual(["B"])
+        expect(state.status().previousTokenGrace).toBeNull()
+    })
+
+    test("a token rewritten in place with the old modification time is still picked up", () => {
+        writeConfig("A")
+        const state = createTokenState({ configPath, initialToken: "A" })
+        state.refresh()
+        const { atime, mtime } = statSync(configPath)
+        writeConfig("B")
+        utimesSync(configPath, atime, mtime)
+        expect(
+            Math.abs(statSync(configPath).mtimeMs - mtime.getTime())
+        ).toBeLessThan(1)
+        expect(state.refresh()[0]).toBe("B")
+    })
+})
+
+describe("dashboard guard with a non-loopback bind (§9 dashboard CSRF)", () => {
+    test("a page opened through the bind address can act; another machine's origin can't", () => {
+        const guard = createDashboardGuard({
+            bind: "10.0.0.5",
+            csrfToken: "T",
+            listenAddress: () => "10.0.0.5",
+        })
+        const req = (origin) => ({
+            headers: { origin, "x-dashboard-csrf": "T" },
+            socket: { localPort: 7777 },
+            is: () => true,
+        })
+        let passed = false
+        guard(req("http://10.0.0.5:7777"), {}, () => {
+            passed = true
+        })
+        expect(passed).toBe(true)
+        const res = {
+            status(c) {
+                this.code = c
+                return this
+            },
+            json(b) {
+                this.body = b
+            },
+        }
+        guard(req("http://10.0.0.9:7777"), res, () => {})
+        expect(res.code).toBe(403)
+        expect(res.body.code).toBe("CROSS_ORIGIN")
     })
 })

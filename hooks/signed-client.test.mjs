@@ -724,3 +724,36 @@ describe("CLI", () => {
         )
     })
 })
+
+describe("an impostor relay (§9 hooks and token)", () => {
+    test("a listener relaying every byte never sees the token, in any header, URL or body", async () => {
+        const live = fakeServer({
+            reply: () => ({ status: 200, body: { status: "GOOD_TO_GO" } }),
+        })
+        const seen = []
+        const relay = async (url, opts) => {
+            seen.push(url, JSON.stringify(opts.headers ?? {}), opts.body ?? "")
+            return live.fetchFn(url, opts)
+        }
+        const conn = await connect({
+            configPath: CONFIG,
+            credentialsPath: CACHE,
+            serverInfoPath: INFO,
+            read: reader({
+                [CONFIG]: { authToken: TOKEN, port: 7777 },
+                [INFO]: { port: 7777, bind: "127.0.0.1", instanceId: "inst-1" },
+            }),
+            sleep: async () => {},
+            fetchFn: relay,
+        })
+        await conn.request({
+            method: "POST",
+            path: "/review",
+            body: { cwd: "/r", note: "any body" },
+            timeoutMs: 1000,
+        })
+        await conn.request({ method: "GET", path: "/status", timeoutMs: 1000 })
+        expect(seen.length).toBeGreaterThan(4)
+        for (const s of seen) expect(s).not.toContain(TOKEN)
+    })
+})

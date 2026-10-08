@@ -3,6 +3,7 @@
  * Author: Leo Khramov
  */
 
+import { jest } from "@jest/globals"
 import { readFileSync } from "node:fs"
 
 const SCHEMA = readFileSync(
@@ -145,6 +146,35 @@ describe("createCore", () => {
         expect(() =>
             core.selfCheck({ reviewer: { provider: "nope" } })
         ).toThrow(/unknown reviewer.provider/)
+    })
+
+    test("selfCheck on the running core leaves live state as it was, and reads none of it", () => {
+        const core = createCore(staging())
+        const store = { list: () => [], save: jest.fn(), reset: jest.fn() }
+        const live = liveFor({ store })
+        core.attach(live)
+        live.registries.inflightMeta.set("k", { repo: "r" })
+        const before = JSON.stringify({
+            config: live.config,
+            meta: [...live.registries.inflightMeta],
+            inflight: live.registries.inflight.size,
+            chains: live.registries.contextChains.size,
+        })
+        const frozen = Object.freeze({ reviewer: { provider: "claude" } })
+        core.selfCheck(frozen)
+        expect(
+            JSON.stringify({
+                config: live.config,
+                meta: [...live.registries.inflightMeta],
+                inflight: live.registries.inflight.size,
+                chains: live.registries.contextChains.size,
+            })
+        ).toBe(before)
+        expect(store.save).not.toHaveBeenCalled()
+        expect(store.reset).not.toHaveBeenCalled()
+        // A candidate's selfCheck runs before attach, with nothing live.
+        const detached = createCore(staging())
+        expect(() => detached.selfCheck(frozen)).not.toThrow()
     })
 
     test("summarizeConfig carries the package version", () => {

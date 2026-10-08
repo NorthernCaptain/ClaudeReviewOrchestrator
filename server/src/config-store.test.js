@@ -8,6 +8,7 @@ import {
     mkdtempSync,
     readdirSync,
     readFileSync,
+    renameSync,
     rmSync,
     statSync,
     writeFileSync,
@@ -25,6 +26,7 @@ import {
     acquireConfigLock,
     ConfigLockError,
 } from "../../install/config-lock.mjs"
+import { rotateToken } from "../../install/rotate-token.mjs"
 
 let dir
 let configPath
@@ -547,5 +549,73 @@ describe("createConfigStore — the config lock and hook credentials", () => {
         store.commit({ ...base(), limits: { maxCodexRounds: 5, maxBlocks: 9 } })
         expect(seen).toEqual([9])
         expect(store.revision()).toBe(1)
+    })
+})
+
+describe("createConfigStore — writers racing and the documented limits (§9)", () => {
+    const backupsText = () =>
+        readdirSync(dir)
+            .filter((n) => n.startsWith("config.json.bak-"))
+            .map((n) => readFileSync(path.join(dir, n), "utf8"))
+
+    test("rotate-token running during a dashboard transaction waits for the lock; neither write is lost", async () => {
+        writeConfig(base())
+        let rotation = null
+        const realRead = (p, enc) => readFileSync(p, enc)
+        const { store } = makeStore(base(), {
+            fs: {
+                // The transaction's first read, inside the lock: start a
+                // rotation now, from "another writer".
+                readFileSync: (p, enc) => {
+                    if (!rotation) {
+                        rotation = rotateToken({
+                            configPath,
+                            credentialsPath: path.join(dir, "creds.json"),
+                        })
+                    }
+                    return realRead(p, enc)
+                },
+            },
+        })
+        await store.mutate([[["limits", "maxBlocks"], 2]])
+        const rotated = await rotation
+        expect(readConfig()).toMatchObject({
+            authToken: rotated.token,
+            limits: { maxBlocks: 2 },
+            auth: { rotations: [rotated.record] },
+        })
+    })
+
+    test("an editor save landing between the re-check and the rename is overwritten and in no backup (best effort, as documented)", async () => {
+        writeConfig(base())
+        const { store } = makeStore(base(), {
+            fs: {
+                renameSync: (from, to) => {
+                    writeConfig({ ...base(), editedByHand: true })
+                    renameSync(from, to)
+                },
+            },
+        })
+        await store.mutate([[["limits", "maxBlocks"], 2]])
+        expect(readConfig().editedByHand).toBeUndefined()
+        expect(backupsText().some((t) => t.includes("editedByHand"))).toBe(
+            false
+        )
+    })
+
+    test("the holder plus the delta failing (the file passing) is rejected, writing nothing", async () => {
+        writeConfig(base())
+        // The holder carries a value the self-check refuses.
+        const holder = {
+            ...base(),
+            limits: { maxCodexRounds: 13, maxBlocks: 6 },
+        }
+        const { store } = makeStore(holder)
+        await expect(
+            store.mutate([[["limits", "maxBlocks"], 2]])
+        ).rejects.toThrow(/unlucky/)
+        expect(readConfig()).toEqual(base())
+        expect(backupsText()).toEqual([])
+        expect(store.revision()).toBe(0)
     })
 })

@@ -140,6 +140,43 @@ const fakeTimers = () => {
     }
 }
 
+const settle = () => new Promise((r) => setImmediate(r))
+
+// A config lock (setup's withFileLock) whose next acquisition waits until
+// the function holdNext() returned is called.
+const gatedLock = () => {
+    let wait = null
+    return {
+        withFileLock: async (_path, fn) => {
+            const w = wait
+            wait = null
+            if (w) await w
+            return fn()
+        },
+        holdNext: () => {
+            let release
+            wait = new Promise((r) => {
+                release = r
+            })
+            return () => release()
+        },
+    }
+}
+
+// What a failing candidate must leave as it was.
+const runningState = ({ ctl, configStore }) => {
+    const s = ctl.__state()
+    return {
+        core: ctl.currentCore(),
+        config: configStore.current(),
+        revision: configStore.revision(),
+        file: readFileSync(configPath, "utf8"),
+        previous: s.previous,
+        active: s.active,
+        waiters: s.waiters.length,
+    }
+}
+
 const setup = ({
     initialConfig = base(),
     file = initialConfig,
@@ -169,6 +206,7 @@ const setup = ({
         ...(withFileLock ? { withFileLock } : {}),
     })
     const applied = []
+    const warn = jest.fn()
     ctl = createReloadController({
         initial: {
             core: v1,
@@ -188,7 +226,7 @@ const setup = ({
             disposed.push(record.snapshotDir ?? record.version),
         runningReviews: () => [{ repo: "r" }],
         onApplied: onApplied ?? ((c) => applied.push(c)),
-        logger: { info() {}, warn: jest.fn() },
+        logger: { info() {}, warn },
         now: timers.now,
         setTimer: timers.setTimer,
         clearTimer: timers.clearTimer,
@@ -201,6 +239,7 @@ const setup = ({
         configStore,
         disposed,
         applied,
+        warn,
         loadCandidate,
         willLoad: (value) => {
             next = value
@@ -466,6 +505,75 @@ describe("scheduling while reviews run", () => {
         expect(disposed).toEqual(["/snap/v2"])
     })
 
+    test("files reverted to A while B is pending with held requests: B is cancelled and disposed, the held requests run on A in order", async () => {
+        const { ctl, willLoad, timers, disposed } = setup()
+        const ticket = await ctl.admitReview()
+        const v2 = candidate("v2")
+        willLoad(v2)
+        await ctl.trigger()
+        timers.advance(5 * 60_000)
+        const order = []
+        const a = ctl.admitReview().then((t) => order.push(["a", t.version]))
+        const b = ctl.admitReview().then((t) => order.push(["b", t.version]))
+        expect(ctl.status().pending.heldNow).toBe(2)
+        willLoad({ same: true })
+        expect(await ctl.trigger()).toEqual({
+            ok: true,
+            unchanged: true,
+            cancelledPending: "v2",
+        })
+        await Promise.all([a, b])
+        expect(order).toEqual([
+            ["a", "v1"],
+            ["b", "v1"],
+        ])
+        expect(v2.core.dispose).toHaveBeenCalled()
+        expect(disposed).toEqual(["/snap/v2"])
+        expect(ctl.status()).toMatchObject({
+            coreVersion: "v1",
+            activeReviews: 3,
+            pending: null,
+        })
+        expect(ctl.status().history[0]).toMatchObject({
+            ok: false,
+            to: "v2",
+            error: "files match the running core",
+        })
+        expect(timers.pending()).toBe(0)
+        ticket.release()
+    })
+
+    test("a pending config-only reload whose edit is reverted is cancelled the same way, the running core untouched", async () => {
+        const { ctl, v1, timers, disposed, configStore } = setup()
+        const ticket = await ctl.admitReview()
+        const before = configStore.current()
+        editConfig((c) => {
+            c.limits.maxCodexRounds = 9
+        })
+        expect(await ctl.trigger()).toMatchObject({
+            scheduled: true,
+            to: "v1",
+            configChanges: ["limits.maxCodexRounds"],
+        })
+        timers.advance(5 * 60_000)
+        const held = ctl.admitReview()
+        editConfig((c) => {
+            c.limits.maxCodexRounds = 5
+        })
+        expect(await ctl.trigger()).toEqual({
+            ok: true,
+            unchanged: true,
+            cancelledPending: "v1",
+        })
+        const t = await held
+        expect(t.version).toBe("v1")
+        expect(t.config).toBe(before)
+        expect(ctl.status()).toMatchObject({ pending: null, activeReviews: 2 })
+        expect(v1.dispose).not.toHaveBeenCalled()
+        expect(disposed).toEqual([])
+        ticket.release()
+    })
+
     test("a failing second trigger leaves the validated pending reload in place", async () => {
         const { ctl, willLoad, timers } = setup()
         const t = await ctl.admitReview()
@@ -490,7 +598,6 @@ describe("swap-time checks", () => {
         await env.ctl.trigger()
         return { ...env, ticket }
     }
-    const settle = () => new Promise((r) => setImmediate(r))
 
     test("a config that turns invalid before the swap cancels it", async () => {
         const { ctl, ticket, disposed } = await pendingV2()
@@ -540,6 +647,66 @@ describe("swap-time checks", () => {
         )
     })
 
+    test("B pending with a held request, then a raised reviewer timeout: the swap is rejected, the held request runs on the running config, and triggering again publishes the larger wait", async () => {
+        const { ctl, ticket, timers, warn, configStore, willLoad } =
+            await pendingV2()
+        timers.advance(5 * 60_000)
+        const publishedWhileHeld = ctl.publishedHookTimeoutMs()
+        expect(publishedWhileHeld).toBe(660_000 + 45_000)
+        const held = ctl.admitReview()
+        editConfig((c) => {
+            c.limits.codexTimeoutSeconds = 620
+        })
+        ticket.release()
+        const t = await held
+        expect(t.version).toBe("v1")
+        expect(t.config.limits.codexTimeoutSeconds).toBe(600)
+        expect(requiredHookWaitMs(t.config)).toBeLessThanOrEqual(
+            publishedWhileHeld
+        )
+        expect(ctl.status().pending).toBeNull()
+        expect(ctl.status().history[0]).toMatchObject({
+            ok: false,
+            to: "v2",
+            error: expect.stringMatching(
+                /reviewer timeout raised after the reload was prepared/
+            ),
+        })
+        expect(warn).toHaveBeenCalledWith(
+            expect.objectContaining({ code: "HOOK_TIMEOUT_RAISED" }),
+            "core reload failed"
+        )
+        expect(ctl.publishedHookTimeoutMs()).toBe(660_000)
+
+        willLoad(candidate("v2"))
+        expect(await ctl.trigger()).toMatchObject({ scheduled: true, to: "v2" })
+        expect(ctl.publishedHookTimeoutMs()).toBe(680_000 + 45_000)
+        t.release()
+        await settle()
+        expect(ctl.status().coreVersion).toBe("v2")
+        expect(configStore.current().limits.codexTimeoutSeconds).toBe(620)
+    })
+
+    test("a live value that never reached config.json (a failed save) is listed in the swap result", async () => {
+        const { ctl, willLoad, configStore } = setup()
+        const live = configStore.current()
+        configStore.commit({
+            ...live,
+            limits: { ...live.limits, maxCodexRounds: 8 },
+        })
+        willLoad(candidate("v2"))
+        const r = await ctl.trigger()
+        expect(r).toMatchObject({
+            applied: true,
+            to: "v2",
+            configChanges: ["limits.maxCodexRounds"],
+        })
+        expect(configStore.current().limits.maxCodexRounds).toBe(5)
+        expect(ctl.status().history[0].configChanges).toEqual([
+            "limits.maxCodexRounds",
+        ])
+    })
+
     test("a dashboard edit and a manual edit made while waiting both apply", async () => {
         const { ctl, ticket, configStore } = await pendingV2()
         await configStore.mutate([[["limits", "maxCodexRounds"], 7]])
@@ -552,6 +719,7 @@ describe("swap-time checks", () => {
             limits: { maxCodexRounds: 7 },
             reviewer: { provider: "claude" },
         })
+        expect(ctl.status().coreVersion).toBe("v2")
     })
 
     test("a candidate whose attach throws leaves everything as it was", async () => {
@@ -631,6 +799,53 @@ describe("starvation guard", () => {
         expect((await held).version).toBe("v1")
     })
 
+    // The plan only says the hold is clamped when the hook limit is pinned;
+    // the implementation clamps it so pinned limit + hold stays within the
+    // hooks' 29 min cap, the pin replacing the reviewer timeout as the base.
+    test.each([
+        [
+            "near the hooks' cap: the hold shrinks to what's left",
+            1720,
+            600,
+            20_000,
+        ],
+        [
+            "below the reviewer timeout: the pin sets the base, so the full hold remains",
+            90,
+            1680,
+            45_000,
+        ],
+    ])(
+        "with hook.fetchTimeoutSeconds pinned %s",
+        async (_label, pinned, reviewerSeconds, hold) => {
+            const env = setup({
+                initialConfig: {
+                    ...base(),
+                    hook: { fetchTimeoutSeconds: pinned },
+                    limits: {
+                        maxCodexRounds: 5,
+                        codexTimeoutSeconds: reviewerSeconds,
+                    },
+                },
+            })
+            await env.ctl.admitReview()
+            env.willLoad(candidate("v2"))
+            await env.ctl.trigger()
+            expect(env.ctl.publishedHookTimeoutMs()).toBe(pinned * 1000 + hold)
+            env.timers.advance(5 * 60_000)
+            let released = null
+            env.ctl.admitReview().then((t) => {
+                released = t
+            })
+            env.timers.advance(hold - 1)
+            await settle()
+            expect(released).toBeNull()
+            env.timers.advance(1)
+            await settle()
+            expect(released.version).toBe("v1")
+        }
+    )
+
     test("cancel releases every held request onto the current core, in order", async () => {
         const { ctl, timers } = await pendingWithReview()
         timers.advance(5 * 60_000)
@@ -641,6 +856,59 @@ describe("starvation guard", () => {
         await Promise.all([a, b])
         expect(order).toEqual(["v1", "v1"])
         expect(timers.pending()).toBe(0)
+    })
+
+    test("a swap-time rejection releases every held request onto the current core, in order", async () => {
+        const { ctl, timers, ticket, disposed } = await pendingWithReview()
+        timers.advance(5 * 60_000)
+        const order = []
+        const a = ctl.admitReview().then((t) => order.push(["a", t.version]))
+        const b = ctl.admitReview().then((t) => order.push(["b", t.version]))
+        editConfig((c) => {
+            c.bind = "0.0.0.0"
+        })
+        ticket.release()
+        await Promise.all([a, b])
+        expect(order).toEqual([
+            ["a", "v1"],
+            ["b", "v1"],
+        ])
+        expect(ctl.status()).toMatchObject({
+            coreVersion: "v1",
+            activeReviews: 2,
+            pending: null,
+        })
+        expect(ctl.status().history[0]).toMatchObject({
+            ok: false,
+            error: expect.stringMatching(/bind/),
+        })
+        expect(disposed).toEqual(["/snap/v2"])
+        expect(timers.pending()).toBe(0)
+    })
+
+    test("a held request dispatched by a config swap runs on the new config", async () => {
+        const { ctl, timers, configStore } = setup()
+        const ticket = await ctl.admitReview()
+        editConfig((c) => {
+            c.limits.maxCodexRounds = 9
+            c.reviewer.provider = "claude"
+        })
+        await ctl.trigger()
+        timers.advance(5 * 60_000)
+        const held = ctl.admitReview()
+        ticket.release()
+        const t = await held
+        expect(t.version).toBe("v1")
+        expect(t.config).toBe(configStore.current())
+        expect(t.config).toMatchObject({
+            limits: { maxCodexRounds: 9 },
+            reviewer: { provider: "claude" },
+        })
+        expect(ctl.isIssuedConfig(t.config)).toBe(true)
+        expect(ticket.config).toMatchObject({
+            limits: { maxCodexRounds: 5 },
+            reviewer: { provider: "codex" },
+        })
     })
 
     test("a held request whose deadline passes first leaves with DEADLINE_EXCEEDED", async () => {
@@ -876,6 +1144,479 @@ describe("swap gate", () => {
             reason: "nothing pending; the last reload to v2 was applied",
         })
     })
+})
+
+describe("swap gate held by the config lock", () => {
+    const LIMITS_V1 = ["maxCodexRounds", "codexTimeoutSeconds"]
+
+    test("a replacement trigger arriving during a lock-gated swap waits for the gate, then reloads against the swapped-in core", async () => {
+        const lock = gatedLock()
+        const { ctl, willLoad, loadCandidate } = setup({
+            withFileLock: lock.withFileLock,
+        })
+        const ticket = await ctl.admitReview()
+        const v2 = candidate("v2")
+        willLoad(v2)
+        await ctl.trigger()
+        const unlock = lock.holdNext()
+        ticket.release()
+        await settle()
+        expect(ctl.status().pending).toMatchObject({ to: "v2", swapping: true })
+        willLoad(candidate("v3"))
+        const replacement = ctl.trigger()
+        await settle()
+        expect(loadCandidate).toHaveBeenCalledTimes(1)
+        unlock()
+        expect(await replacement).toMatchObject({
+            applied: true,
+            from: "v2",
+            to: "v3",
+        })
+        expect(loadCandidate).toHaveBeenCalledTimes(2)
+        expect(loadCandidate.mock.calls[1][0].version).toBe("v2")
+        expect(ctl.status().previousVersion).toBe("v2")
+        expect(v2.core.dispose).not.toHaveBeenCalled()
+        expect(ctl.status().history.slice(0, 2)).toMatchObject([
+            { ok: true, from: "v2", to: "v3" },
+            { ok: true, from: "v1", to: "v2" },
+        ])
+    })
+
+    test("the gated swap applies exactly the candidate captured at gate time and never disposes it, even with a replacement arriving mid-swap", async () => {
+        const lock = gatedLock()
+        const { ctl, willLoad, v1, disposed } = setup({
+            withFileLock: lock.withFileLock,
+        })
+        const running = await ctl.admitReview()
+        const v2 = candidate("v2")
+        willLoad(v2)
+        await ctl.trigger()
+        const unlock = lock.holdNext()
+        const swap = ctl.trigger({ now: true })
+        await settle()
+        const v3 = candidate("v3")
+        willLoad(v3)
+        const replacement = ctl.trigger()
+        await settle()
+        expect(ctl.status().pending).toMatchObject({ to: "v2", swapping: true })
+        expect(v2.core.attach).not.toHaveBeenCalled()
+        expect(v2.core.dispose).not.toHaveBeenCalled()
+        unlock()
+        expect(await swap).toMatchObject({
+            applied: true,
+            from: "v1",
+            to: "v2",
+        })
+        // The review still runs, so the replacement waits as a reload on v2.
+        expect(await replacement).toMatchObject({ scheduled: true, to: "v3" })
+        expect(ctl.currentCore()).toBe(v2.core)
+        expect(v2.core.attach).toHaveBeenCalledTimes(1)
+        expect(v3.core.attach).not.toHaveBeenCalled()
+        expect(v2.core.dispose).not.toHaveBeenCalled()
+        expect(disposed).toEqual([])
+        expect(running.core).toBe(v1)
+        running.release()
+        await settle()
+        expect(ctl.currentCore()).toBe(v3.core)
+        expect(v2.core.dispose).not.toHaveBeenCalled()
+        expect(disposed).toEqual(["/snap/v1"])
+    })
+
+    test("rollback at idle waits for a dashboard mutation holding the lock; a review arriving meanwhile waits at entry, then runs on the restored core", async () => {
+        const lock = gatedLock()
+        const { ctl, willLoad, configStore } = setup({
+            withFileLock: lock.withFileLock,
+        })
+        editConfig((c) => {
+            c.limits.maxCodexRounds = 9
+        })
+        willLoad(candidate("v2"))
+        await ctl.trigger()
+        const unlock = lock.holdNext()
+        const mutation = configStore.mutate([
+            [["reviewer", "provider"], "claude"],
+        ])
+        await settle()
+        const rollback = ctl.trigger({ rollback: true })
+        const review = ctl.admitReview()
+        expect(ctl.status()).toMatchObject({
+            coreVersion: "v2",
+            activeReviews: 0,
+            pending: { kind: "rollback", swapping: true },
+        })
+        unlock()
+        await mutation
+        expect(await rollback).toMatchObject({
+            applied: true,
+            kind: "rollback",
+            from: "v2",
+            to: "v1",
+            reverted: ["limits.maxCodexRounds"],
+        })
+        const t = await review
+        expect(t.version).toBe("v1")
+        expect(t.config).toMatchObject({
+            limits: { maxCodexRounds: 5 },
+            reviewer: { provider: "claude" },
+        })
+        expect(readConfig()).toMatchObject({
+            limits: { maxCodexRounds: 5 },
+            reviewer: { provider: "claude" },
+        })
+        expect(ctl.status().activeReviews).toBe(1)
+    })
+
+    test("the last review releasing while a dashboard mutation holds the lock: a review arriving meanwhile waits uncounted, the swap runs after the mutation, then the review runs on the new core", async () => {
+        const lock = gatedLock()
+        const { ctl, willLoad, configStore } = setup({
+            withFileLock: lock.withFileLock,
+        })
+        const ticket = await ctl.admitReview()
+        willLoad(candidate("v2"))
+        await ctl.trigger()
+        const unlock = lock.holdNext()
+        const mutation = configStore.mutate([[["limits", "maxCodexRounds"], 7]])
+        await settle()
+        ticket.release()
+        const review = ctl.admitReview()
+        expect(ctl.status()).toMatchObject({
+            coreVersion: "v1",
+            activeReviews: 0,
+            pending: { to: "v2", swapping: true },
+        })
+        unlock()
+        const t = await review
+        expect(t.version).toBe("v2")
+        // The swap read config.json after the mutation wrote it, and
+        // committed after it.
+        expect(t.config.limits.maxCodexRounds).toBe(7)
+        expect((await mutation).revision).toBe(configStore.revision() - 1)
+        expect(ctl.status()).toMatchObject({ activeReviews: 1, pending: null })
+    })
+
+    test("if that swap is then rejected, the waiting review runs on the current core and the pending reload is cancelled", async () => {
+        const lock = gatedLock()
+        const { ctl, willLoad, configStore, disposed } = setup({
+            withFileLock: lock.withFileLock,
+        })
+        const ticket = await ctl.admitReview()
+        // v2 refuses limits keys it doesn't know; the running v1 accepts
+        // them, so the mutation commits and the swap then fails.
+        const v2 = candidate("v2", {
+            validateConfig: schema({ known: LIMITS_V1 }),
+        })
+        willLoad(v2)
+        await ctl.trigger()
+        const unlock = lock.holdNext()
+        const mutation = configStore.mutate([[["limits", "newCap"], 3]])
+        await settle()
+        ticket.release()
+        const review = ctl.admitReview()
+        expect(ctl.status().activeReviews).toBe(0)
+        unlock()
+        const t = await review
+        expect(t.version).toBe("v1")
+        expect(t.config.limits.newCap).toBe(3)
+        await expect(mutation).resolves.toMatchObject({
+            config: { limits: { newCap: 3 } },
+        })
+        expect(ctl.status()).toMatchObject({
+            coreVersion: "v1",
+            activeReviews: 1,
+            pending: null,
+        })
+        expect(ctl.status().history[0]).toMatchObject({
+            ok: false,
+            to: "v2",
+            error: expect.stringMatching(/unknown newCap/),
+        })
+        expect(v2.core.attach).not.toHaveBeenCalled()
+        expect(v2.core.dispose).toHaveBeenCalled()
+        expect(disposed).toEqual(["/snap/v2"])
+    })
+
+    test("a dashboard mutation that starts during an idle swap commits on top of the new config, checked by the new schema", async () => {
+        const lock = gatedLock()
+        // The running v1 refuses limits.newCap; the v2 being swapped in
+        // accepts it.
+        const { ctl, willLoad, configStore } = setup({
+            withFileLock: lock.withFileLock,
+            v1Schema: schema({ known: LIMITS_V1 }),
+        })
+        editConfig((c) => {
+            c.limits.maxCodexRounds = 9
+        })
+        willLoad(candidate("v2"))
+        const unlock = lock.holdNext()
+        const swap = ctl.trigger()
+        await settle()
+        expect(ctl.status().pending).toMatchObject({ to: "v2", swapping: true })
+        const mutation = configStore.mutate([[["limits", "newCap"], 4]])
+        unlock()
+        expect(await swap).toMatchObject({ applied: true, to: "v2" })
+        await expect(mutation).resolves.toMatchObject({
+            revision: 2,
+            config: { limits: { maxCodexRounds: 9, newCap: 4 } },
+        })
+        expect(configStore.current().limits).toMatchObject({
+            maxCodexRounds: 9,
+            newCap: 4,
+        })
+        expect(readConfig().limits).toMatchObject({
+            maxCodexRounds: 9,
+            newCap: 4,
+        })
+    })
+
+    test("a dashboard mutation that starts during an idle swap and that the new schema rejects fails and writes nothing", async () => {
+        const lock = gatedLock()
+        const { ctl, willLoad, configStore } = setup({
+            withFileLock: lock.withFileLock,
+        })
+        const fileBefore = readFileSync(configPath, "utf8")
+        willLoad(
+            candidate("v2", { validateConfig: schema({ known: LIMITS_V1 }) })
+        )
+        const unlock = lock.holdNext()
+        const swap = ctl.trigger()
+        await settle()
+        const mutation = configStore.mutate([[["limits", "newCap"], 4]])
+        unlock()
+        expect(await swap).toMatchObject({ applied: true, to: "v2" })
+        // The plan has it fail with "config changed, reload the page"; the
+        // store rejects with the new core's validation error instead.
+        await expect(mutation).rejects.toMatchObject({
+            code: "CONFIG_INVALID",
+            message: expect.stringMatching(
+                /config change rejected: unknown newCap/
+            ),
+        })
+        expect(readFileSync(configPath, "utf8")).toBe(fileBefore)
+        expect(readdirSync(dir).filter((n) => n.includes(".bak-"))).toEqual([])
+        // Only the swap committed.
+        expect(configStore.revision()).toBe(1)
+        expect(configStore.current().limits.newCap).toBeUndefined()
+    })
+})
+
+describe("self-check coverage", () => {
+    const failsFor = (provider) => (config) => {
+        if (config.reviewer.provider === provider) {
+            throw new Error(`can't render ${provider}`)
+        }
+    }
+
+    test("a config-only reload whose config passes the schema but fails the self-check is rejected at preparation", async () => {
+        const { ctl, v1, configStore, disposed } = setup()
+        v1.selfCheck.mockImplementation(failsFor("unrenderable"))
+        const before = configStore.current()
+        editConfig((c) => {
+            c.reviewer.provider = "unrenderable"
+        })
+        await expect(ctl.trigger()).rejects.toThrow("can't render unrenderable")
+        expect(configStore.current()).toBe(before)
+        expect(ctl.status()).toMatchObject({
+            coreVersion: "v1",
+            previousVersion: null,
+            pending: null,
+        })
+        expect(ctl.status().history[0]).toMatchObject({
+            kind: "reload",
+            ok: false,
+            error: "can't render unrenderable",
+        })
+        expect(v1.dispose).not.toHaveBeenCalled()
+        expect(disposed).toEqual([])
+    })
+
+    test.each([
+        [
+            "a code reload",
+            (env) => {
+                const v2 = candidate("v2", {
+                    selfCheck: failsFor("unrenderable"),
+                })
+                env.willLoad(v2)
+                return v2.core
+            },
+        ],
+        [
+            "a config-only reload",
+            (env) => {
+                env.v1.selfCheck.mockImplementation(failsFor("unrenderable"))
+                editConfig((c) => {
+                    c.limits.maxCodexRounds = 9
+                })
+                return null
+            },
+        ],
+    ])(
+        "%s pending when config.json is edited to fail the self-check is cancelled at the swap, changing nothing",
+        async (_label, arrange) => {
+            const env = setup()
+            const { ctl, v1, configStore, disposed } = env
+            const ticket = await ctl.admitReview()
+            const candidateCore = arrange(env)
+            expect(await ctl.trigger()).toMatchObject({ scheduled: true })
+            const before = configStore.current()
+            editConfig((c) => {
+                c.reviewer.provider = "unrenderable"
+            })
+            ticket.release()
+            await settle()
+            expect(ctl.currentCore()).toBe(v1)
+            expect(configStore.current()).toBe(before)
+            expect(ctl.status()).toMatchObject({
+                pending: null,
+                previousVersion: null,
+            })
+            expect(ctl.status().history[0]).toMatchObject({
+                ok: false,
+                error: "can't render unrenderable",
+            })
+            expect(readConfig().reviewer.provider).toBe("unrenderable")
+            expect(v1.dispose).not.toHaveBeenCalled()
+            if (candidateCore) {
+                expect(candidateCore.attach).not.toHaveBeenCalled()
+                expect(candidateCore.dispose).toHaveBeenCalled()
+                expect(disposed).toEqual(["/snap/v2"])
+            } else {
+                expect(disposed).toEqual([])
+            }
+        }
+    )
+})
+
+describe("a failing candidate leaves the running state untouched", () => {
+    test.each([
+        [
+            "fails its self-check",
+            () =>
+                candidate("v2", {
+                    selfCheck: () => {
+                        throw new Error("can't render")
+                    },
+                }),
+            /can't render/,
+        ],
+        [
+            // The base file has limits.codexTimeoutSeconds, unknown to it.
+            "rejects the config",
+            () =>
+                candidate("v2", {
+                    validateConfig: schema({ known: ["maxCodexRounds"] }),
+                }),
+            /unknown codexTimeoutSeconds/,
+        ],
+    ])(
+        "at preparation: a candidate that %s is never attached and leaves the running core, config, admissions and file as they were",
+        async (_label, make, error) => {
+            const env = setup()
+            const { ctl, willLoad, disposed } = env
+            const ticket = await ctl.admitReview()
+            const v2 = make()
+            willLoad(v2)
+            const before = runningState(env)
+            await expect(ctl.trigger()).rejects.toThrow(error)
+            const after = runningState(env)
+            expect(after.core).toBe(before.core)
+            expect(after.config).toBe(before.config)
+            expect(after).toEqual(before)
+            expect(ctl.status().pending).toBeNull()
+            expect(v2.core.attach).not.toHaveBeenCalled()
+            expect(disposed).toEqual(["/snap/v2"])
+            ticket.release()
+        }
+    )
+
+    test.each([
+        [
+            "its attach throws",
+            (v2) => {
+                v2.core.attach.mockImplementation(() => {
+                    throw new Error("attach broke")
+                })
+            },
+            1,
+            /attach broke/,
+        ],
+        [
+            "it fails its self-check at the swap",
+            (v2) => {
+                v2.core.selfCheck.mockImplementation((config) => {
+                    if (config.reviewer.provider === "unrenderable") {
+                        throw new Error("can't render")
+                    }
+                })
+                editConfig((c) => {
+                    c.reviewer.provider = "unrenderable"
+                })
+            },
+            0,
+            /can't render/,
+        ],
+        [
+            "config.json turns invalid before the swap",
+            () => {
+                editConfig((c) => {
+                    delete c.limits.maxCodexRounds
+                })
+            },
+            0,
+            /maxCodexRounds required/,
+        ],
+        [
+            "a restart-only key changes before the swap",
+            () => {
+                editConfig((c) => {
+                    c.port = 8888
+                })
+            },
+            0,
+            /port can only change with a restart/,
+        ],
+    ])(
+        "at the swap: when %s, held requests run on the running core and nothing else changes",
+        async (_label, breakIt, attachCalls, error) => {
+            const env = setup()
+            const { ctl, willLoad, timers, v1, disposed } = env
+            const ticket = await ctl.admitReview()
+            const v2 = candidate("v2")
+            willLoad(v2)
+            await ctl.trigger()
+            timers.advance(5 * 60_000)
+            const order = []
+            const a = ctl.admitReview().then((t) => {
+                order.push(t)
+            })
+            const b = ctl.admitReview().then((t) => {
+                order.push(t)
+            })
+            breakIt(v2)
+            const before = runningState(env)
+            expect(before).toMatchObject({ active: 1, waiters: 2 })
+            ticket.release()
+            await Promise.all([a, b])
+            const after = runningState(env)
+            expect(after.core).toBe(v1)
+            expect(after.config).toBe(before.config)
+            expect(after).toEqual({ ...before, active: 2, waiters: 0 })
+            expect(order.map((t) => [t.version, t.config])).toEqual([
+                ["v1", before.config],
+                ["v1", before.config],
+            ])
+            expect(ctl.status().pending).toBeNull()
+            expect(ctl.status().history[0]).toMatchObject({
+                ok: false,
+                to: "v2",
+                error: expect.stringMatching(error),
+            })
+            expect(v2.core.attach).toHaveBeenCalledTimes(attachCalls)
+            expect(v2.core.dispose).toHaveBeenCalled()
+            expect(disposed).toEqual(["/snap/v2"])
+            expect(v1.dispose).not.toHaveBeenCalled()
+        }
+    )
 })
 
 describe("rollback", () => {
@@ -1243,6 +1984,7 @@ describe("the published hook wait and the config lock", () => {
         expect(ctl.status().history[0]).toMatchObject({
             ok: false,
             error: /locked by another writer/,
+            code: "CONFIG_LOCKED",
         })
         const ticket = await ctl.admitReview()
         expect(ticket.config.limits.codexTimeoutSeconds).toBe(900)

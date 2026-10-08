@@ -25,6 +25,13 @@ import {
     updateCodexEntry,
 } from "./rotate-token.mjs"
 import { BEGIN } from "./merge-codex-mcp.mjs"
+import {
+    challengeProof,
+    connect,
+    HEADERS,
+    responseSignature,
+    sha256Hex,
+} from "../hooks/signed-client.mjs"
 
 const sha256 = (t) => createHash("sha256").update(t).digest("hex")
 const AT = "2026-10-07T12:00:00.000Z"
@@ -368,6 +375,8 @@ describe("main", () => {
         expect(r.out).toMatch(/rotated: new token written/)
         expect(r.out).toMatch(`previous token accepted until ${AT}`)
         expect(r.out).toMatch(/until the grace ends/)
+        expect(r.out).toMatch(/Restart open Codex and opencode sessions/)
+        expect(r.out).toMatch(/Claude Code picks it up on its next MCP/)
     })
 
     test("--revoke-now reports the revocation", async () => {
@@ -435,5 +444,81 @@ describe("main", () => {
         expect(r.out).toMatch(/rotated: new token written/)
         r = await run(["--nope"])
         expect(r.code).toBe(2)
+    })
+})
+
+describe("nothing rotate-token sends carries a raw token (§9 hooks and token)", () => {
+    test("the confirmation is a signed request: neither the old nor the new token appears on the wire", async () => {
+        writeConfig({ authToken: "OLD-secret-token", port: 7788 })
+        const rotated = await rotateToken({
+            configPath,
+            credentialsPath,
+            generate: () => "NEW-secret-token",
+        })
+        const instanceId = "inst-1"
+        const wire = []
+        // A server holding the new token, behind a listener that records
+        // every byte sent to it.
+        const fetchFn = async (url, opts) => {
+            wire.push(url, JSON.stringify(opts.headers ?? {}), opts.body ?? "")
+            const u = new URL(url)
+            const send = (status, body, headers = {}) => {
+                const text = JSON.stringify(body)
+                return {
+                    status,
+                    text,
+                    bytes: Buffer.from(text),
+                    headers: { get: (k) => headers[k.toLowerCase()] ?? null },
+                }
+            }
+            if (u.pathname === "/healthz") {
+                const nonce = u.searchParams.get("challenge")
+                return send(200, {
+                    ok: true,
+                    service: "review-orchestrator",
+                    instanceId,
+                    proofs: [
+                        challengeProof({
+                            token: rotated.token,
+                            nonce,
+                            instanceId,
+                        }),
+                    ],
+                })
+            }
+            const body = {
+                auth: {
+                    currentTokenHash: sha256(rotated.token),
+                    previousTokenGrace: null,
+                },
+            }
+            return send(200, body, {
+                [HEADERS.responseSignature]: responseSignature({
+                    token: rotated.token,
+                    nonce: opts.headers[HEADERS.nonce],
+                    status: 200,
+                    bodyHash: sha256Hex(JSON.stringify(body)),
+                }),
+            })
+        }
+        const seen = await confirmWithServer({
+            configPath,
+            token: rotated.token,
+            revokeNow: true,
+            connectFn: (opts) =>
+                connect({
+                    ...opts,
+                    credentialsPath,
+                    serverInfoPath: path.join(dir, "server.json"),
+                    fetchFn,
+                    sleep: async () => {},
+                }),
+        })
+        expect(seen).toMatchObject({ running: true, ok: true })
+        expect(wire.length).toBeGreaterThan(2)
+        for (const s of wire) {
+            expect(s).not.toContain("OLD-secret-token")
+            expect(s).not.toContain("NEW-secret-token")
+        }
     })
 })

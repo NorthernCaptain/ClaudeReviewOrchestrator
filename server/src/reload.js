@@ -373,7 +373,7 @@ export const createReloadController = ({
 
     // Ends the pending reload without a swap: its distinct core goes, and
     // held requests run on the current core.
-    const dropPending = (reason) => {
+    const dropPending = (reason, code = null) => {
         const p = pending
         setPending(null)
         endHold()
@@ -385,6 +385,7 @@ export const createReloadController = ({
                 to: p.to,
                 ok: false,
                 error: reason,
+                ...(code ? { code } : {}),
             })
             maybeDispose(p.record)
         }
@@ -637,7 +638,8 @@ export const createReloadController = ({
         p.swapping = true
         const startedAt = now()
         const failed = (err) => {
-            if (pending === p) dropPending(err.message)
+            if (pending === p)
+                dropPending(err.message, err.code ?? "RELOAD_FAILED")
             logger?.warn?.(
                 { err: err.message, code: err.code },
                 "core reload failed"

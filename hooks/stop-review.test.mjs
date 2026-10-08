@@ -5,10 +5,12 @@
 
 import { jest } from "@jest/globals"
 import {
+    mkdirSync,
     mkdtempSync,
     readdirSync,
     readFileSync,
     rmSync,
+    statSync,
     writeFileSync,
 } from "node:fs"
 import http from "node:http"
@@ -29,6 +31,7 @@ import {
     stripControl,
     writeCallSnapshot,
 } from "./stop-review.mjs"
+import { connect as connectSigned } from "./signed-client.mjs"
 
 const makeTmpDir = () => mkdtempSync(path.join(tmpdir(), "stop-hook-"))
 
@@ -1759,5 +1762,46 @@ describe("main — the signed connection", () => {
         expect(JSON.parse(fetchFn.mock.calls[0][1].body).timeoutMs).toBe(
             160_000
         )
+    })
+})
+
+describe("main — the credentials cache is read-only for hooks (§9 hooks and token)", () => {
+    test("a run that falls back to the cache never writes it, or anything next to it", async () => {
+        const dir = makeTmpDir()
+        try {
+            const configPath = path.join(dir, "config.json")
+            const cacheDir = path.join(dir, "cache")
+            const credentialsPath = path.join(cacheDir, "hook-credentials.json")
+            writeFileSync(configPath, "{ half-written")
+            mkdirSync(cacheDir)
+            writeFileSync(
+                credentialsPath,
+                JSON.stringify({ token: "cached", port: 1, bind: "127.0.0.1" })
+            )
+            const before = statSync(credentialsPath).mtimeMs
+            await main({
+                stdin: stdinFromJSON({ cwd: "/repo", session_id: "s" }),
+                stdout: mkWritable(),
+                stderr: mkWritable(),
+                fetchFn: async () => {
+                    throw new Error("ECONNREFUSED")
+                },
+                connect: (opts) =>
+                    connectSigned({
+                        ...opts,
+                        configPath,
+                        credentialsPath,
+                        serverInfoPath: path.join(cacheDir, "server.json"),
+                        sleep: async () => {},
+                    }),
+                log: () => {},
+                snapshot: () => null,
+            })
+            expect(statSync(credentialsPath).mtimeMs).toBe(before)
+            expect(readdirSync(cacheDir)).toEqual(["hook-credentials.json"])
+            expect(readFileSync(configPath, "utf8")).toBe("{ half-written")
+        } finally {
+            rmSync(dir, { recursive: true, force: true })
+        }
     })
 })

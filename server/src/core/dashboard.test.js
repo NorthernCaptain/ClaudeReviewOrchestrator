@@ -2017,6 +2017,8 @@ describe("page script behaviour (fake DOM)", () => {
             .map((m) => m[1])
             .join("\n")
         const elements = {}
+        // Two action controls, as the page renders them: enabled.
+        const controls = [{ disabled: false }, { disabled: false }]
         const el = (id) =>
             (elements[id] ??= {
                 id,
@@ -2039,7 +2041,8 @@ describe("page script behaviour (fake DOM)", () => {
                     ? el(id)
                     : null,
             querySelector: () => null,
-            querySelectorAll: () => [],
+            querySelectorAll: (sel) =>
+                sel === "main button, main select" ? controls : [],
             addEventListener: () => {},
         }
         const window = { addEventListener: () => {}, confirm: () => true }
@@ -2089,6 +2092,7 @@ describe("page script behaviour (fake DOM)", () => {
         const settle = () => new Promise((r) => setTimeout(r, 0))
         return {
             elements,
+            controls,
             pages,
             fetchMock,
             poll: async (body) => {
@@ -2148,8 +2152,10 @@ describe("page script behaviour (fake DOM)", () => {
         expect(p.pageFetches()).toBe(1)
     })
 
-    test("inside a frame the banner shows", () => {
+    test("inside a frame the banner shows and every action control is disabled", () => {
         const p = boot({ framed: true })
         expect(p.elements["framed-banner"].hidden).toBe(false)
+        expect(p.controls.every((c) => c.disabled)).toBe(true)
+        expect(boot().controls.every((c) => !c.disabled)).toBe(true)
     })
 })

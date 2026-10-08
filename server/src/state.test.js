@@ -427,3 +427,70 @@ describe("createStateStore — live idle interval", () => {
         }
     })
 })
+
+// The state compatibility rule (hot-reload plan §5.5): two retained cores
+// share state.json, the newer one reads what the older wrote and, after a
+// rollback, the older one reads what the newer wrote. Within a
+// STATE_FORMAT changes are additive, and the shell never drops a field.
+describe("state round trip between two cores, both directions, across an idle reset", () => {
+    let dir, filePath
+    beforeEach(() => {
+        dir = mkdtempSync(path.join(tmpdir(), "state-roundtrip-"))
+        filePath = path.join(dir, "state.json")
+    })
+    afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+    // Core A knows the fields of today; core B adds an optional one. Each
+    // reads with defaults and saves with a spread, as the pipeline does.
+    const coreA = {
+        review: (store, ctx, at) => {
+            const s = store.get(ctx)
+            store.save(ctx.key, {
+                ...s,
+                codexRounds: (s.codexRounds ?? 0) + 1,
+                lastResultStatus: "ISSUES",
+                lastReviewedAt: at,
+            })
+        },
+    }
+    const coreB = {
+        review: (store, ctx, at) => {
+            const s = store.get(ctx)
+            store.save(ctx.key, {
+                ...s,
+                codexRounds: (s.codexRounds ?? 0) + 1,
+                reviewNotes: [...(s.reviewNotes ?? []), "b"],
+                lastResultStatus: "ISSUES",
+                lastReviewedAt: at,
+            })
+        },
+    }
+
+    test("A → B → idle reset → A (rollback) → restart → B keeps every field each wrote", () => {
+        let t = 1000
+        const open = () =>
+            createStateStore({ filePath, now: () => t, idleResetMs: 500 })
+        let store = open()
+        coreA.review(store, ctxKey, t)
+        coreB.review(store, ctxKey, t)
+        expect(store.peek(ctxKey.key).reviewNotes).toEqual(["b"])
+        // Idle: the loop counters go, B's field stays.
+        t = 5000
+        let s = store.get(ctxKey)
+        expect(s.codexRounds).toBe(0)
+        expect(s.reviewNotes).toEqual(["b"])
+        // Rolled back to A, which doesn't know reviewNotes and keeps it.
+        coreA.review(store, ctxKey, t)
+        expect(store.peek(ctxKey.key)).toMatchObject({
+            codexRounds: 1,
+            reviewNotes: ["b"],
+        })
+        // A restart reads it all from disk; B picks up where it left off.
+        store = open()
+        coreB.review(store, ctxKey, t)
+        s = store.peek(ctxKey.key)
+        expect(s.reviewNotes).toEqual(["b", "b"])
+        expect(s.codexRounds).toBe(2)
+        expect(s.lastResultStatus).toBe("ISSUES")
+    })
+})

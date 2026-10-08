@@ -201,6 +201,31 @@ describe("signed connections", () => {
         )
     })
 
+    test("a stale wait limit (409 HOOK_LIMIT_STALE) is resent with the limit the server asks for", async () => {
+        const replies = [
+            okResponse(
+                {
+                    status: "ESCALATE",
+                    code: "HOOK_LIMIT_STALE",
+                    hookTimeoutMs: 900_000,
+                },
+                409
+            ),
+            okResponse({ status: "GOOD_TO_GO", findings: [] }),
+        ]
+        const fetchImpl = jest.fn(async () => replies.shift())
+        const { hooks, client } = await build({ fetchImpl })
+        await idle(hooks)
+        const bodies = fetchImpl.mock.calls.map(([, init]) =>
+            JSON.parse(init.body)
+        )
+        expect(bodies.map((b) => b.timeoutMs)).toEqual([660_000, 900_000])
+        expect(client.calls.prompts).toEqual([])
+        expect(client.calls.toasts.at(-1)).toMatchObject({
+            message: "GOOD_TO_GO",
+        })
+    })
+
     test("cached credentials are reported, and the server's published wait is the limit", async () => {
         const fetchImpl = jest.fn(async () =>
             okResponse({ status: "GOOD_TO_GO", findings: [] })

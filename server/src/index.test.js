@@ -1344,6 +1344,61 @@ describe("hook connection: challenge, server.json, credentials, rotation", () =>
             await s.close()
         }
     })
+
+    test("a hand-edited token is noticed on the next request and the hooks' credentials cache follows it", async () => {
+        const s = await startWithFiles()
+        try {
+            const cfg = JSON.parse(readFileSync(s.configPath, "utf8"))
+            cfg.authToken = "hand-edited"
+            writeFileSync(s.configPath, JSON.stringify(cfg))
+            const conn = await s.connectNow()
+            expect(conn.creds.token).toBe("hand-edited")
+            expect(
+                (
+                    await conn.request({
+                        method: "GET",
+                        path: "/status",
+                        timeoutMs: 5000,
+                    })
+                ).httpStatus
+            ).toBe(200)
+            const cached = () =>
+                JSON.parse(readFileSync(s.credentialsPath, "utf8")).token
+            for (let i = 0; i < 100 && cached() !== "hand-edited"; i++) {
+                await new Promise((r) => setTimeout(r, 10))
+            }
+            expect(cached()).toBe("hand-edited")
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("server.json republishes the hook wait when a reload becomes pending and again when it applies", async () => {
+        const s = await startWithFiles()
+        try {
+            const wait = () =>
+                JSON.parse(readFileSync(s.serverInfoPath, "utf8")).hookTimeoutMs
+            expect(wait()).toBe(660_000)
+            const ticket = await s.app.locals.reloads.admitReview()
+            const cfg = JSON.parse(readFileSync(s.configPath, "utf8"))
+            cfg.reviewer = {
+                ...(cfg.reviewer ?? {}),
+                claude: { timeoutSeconds: 900 },
+            }
+            writeFileSync(s.configPath, JSON.stringify(cfg))
+            const r = await s.app.locals.reloads.trigger()
+            expect(r).toMatchObject({ scheduled: true })
+            // The larger wait plus the 45 s hold allowance.
+            expect(wait()).toBe(960_000 + 45_000)
+            ticket.release()
+            for (let i = 0; i < 100 && wait() !== 960_000; i++) {
+                await new Promise((res) => setTimeout(res, 10))
+            }
+            expect(wait()).toBe(960_000)
+        } finally {
+            await s.close()
+        }
+    })
 })
 
 describe("createServerInfo", () => {
@@ -1571,6 +1626,93 @@ describe("dashboard safety and reload controls over HTTP (§5.8)", () => {
             expect(await r.json()).toMatchObject({ unchanged: true })
         } finally {
             await close()
+        }
+    })
+})
+
+describe("dashboard guards across routes and restarts (§9 dashboard CSRF)", () => {
+    test("421 for a foreign Host covers the dashboard actions and /mcp too", async () => {
+        const { url, close } = await start(minimalConfig())
+        try {
+            const port = new URL(url).port
+            for (const [method, path] of [
+                ["POST", "/dashboard/reload"],
+                ["PUT", "/dashboard/max-rounds"],
+                ["POST", "/mcp"],
+            ]) {
+                const status = await new Promise((resolve, reject) => {
+                    const req = http.request(
+                        {
+                            hostname: "127.0.0.1",
+                            port,
+                            path,
+                            method,
+                            headers: {
+                                host: `evil.example:${port}`,
+                                "content-type": "application/json",
+                            },
+                        },
+                        (res) => {
+                            res.resume()
+                            resolve(res.statusCode)
+                        }
+                    )
+                    req.on("error", reject)
+                    req.end("{}")
+                })
+                expect(status).toBe(421)
+            }
+        } finally {
+            await close()
+        }
+    })
+
+    test("a cross-origin reload, rollback or cancel is refused and nothing reloads", async () => {
+        const { url, app, close } = await start(minimalConfig())
+        try {
+            for (const body of [{}, { rollback: true }, { cancel: true }]) {
+                const r = await fetch(`${url}/dashboard/reload`, {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json",
+                        origin: "http://evil.example",
+                        "x-dashboard-csrf": app.locals.dashboardCsrf,
+                    },
+                    body: JSON.stringify(body),
+                })
+                expect(r.status).toBe(403)
+            }
+            expect(app.locals.reloads.status()).toMatchObject({
+                appliedCount: 0,
+                history: [],
+            })
+        } finally {
+            await close()
+        }
+    })
+
+    test("every server start gets its own dashboard token", async () => {
+        const a = await start(minimalConfig())
+        const b = await start(minimalConfig())
+        try {
+            expect(a.app.locals.dashboardCsrf).toMatch(/^[A-Za-z0-9_-]{43}$/)
+            expect(a.app.locals.dashboardCsrf).not.toBe(
+                b.app.locals.dashboardCsrf
+            )
+            // A's token is no good on B.
+            const r = await fetch(`${b.url}/dashboard/reload`, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    origin: b.url,
+                    "x-dashboard-csrf": a.app.locals.dashboardCsrf,
+                },
+                body: "{}",
+            })
+            expect((await r.json()).code).toBe("BAD_DASHBOARD_TOKEN")
+        } finally {
+            await a.close()
+            await b.close()
         }
     })
 })

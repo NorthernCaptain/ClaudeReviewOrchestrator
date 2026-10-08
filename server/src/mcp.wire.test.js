@@ -4,14 +4,16 @@
  */
 
 import { jest } from "@jest/globals"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { pathToFileURL } from "node:url"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
 import { startServer } from "./index.js"
 import { createStateStore } from "./state.js"
+import { signedHeaders } from "../../hooks/signed-client.mjs"
 
 const minimalConfig = () => ({
     port: 0,
@@ -99,10 +101,14 @@ const startApp = async (opts = {}) => {
         deps,
         log: silentLog,
         configPath,
+        ...(opts.loadCandidate ? { loadCandidate: opts.loadCandidate } : {}),
     })
     if (!r.ok) throw r.error
+    const base = `http://127.0.0.1:${r.address.port}`
     return {
-        url: `http://127.0.0.1:${r.address.port}/mcp`,
+        url: `${base}/mcp`,
+        base,
+        configPath,
         close: () =>
             new Promise((res) => {
                 r.server.close(() => {
@@ -314,6 +320,133 @@ describe("/mcp HTTP wire — roots probe actually runs", () => {
             await client.close()
         } finally {
             await close()
+        }
+    })
+})
+
+// Hot-reload plan §9, "Admission", with a config-only reload: the stub
+// loader reports the core files unchanged, so nothing is captured or
+// snapshotted and the reload only swaps the config.
+describe("/mcp HTTP wire — admission across a config-only reload", () => {
+    const signedJson = async (base, route, { method = "GET", body } = {}) => {
+        const text = body ? JSON.stringify(body) : ""
+        const { instanceId } = await (await fetch(`${base}/healthz`)).json()
+        const res = await fetch(`${base}${route}`, {
+            method,
+            headers: signedHeaders({
+                token: "wire-secret",
+                method,
+                path: route,
+                text,
+                instanceId,
+            }),
+            body: text || undefined,
+        })
+        return res.json()
+    }
+
+    const until = async (fn, ms = 3000) => {
+        const end = Date.now() + ms
+        for (;;) {
+            const v = await fn()
+            if (v) return v
+            if (Date.now() > end) throw new Error("condition never held")
+            await new Promise((r) => setTimeout(r, 20))
+        }
+    }
+
+    test("a request_review parked in roots/list keeps a config-only reload pending and runs with the config it was admitted with", async () => {
+        const store = makeStore()
+        const repoRoot = realpathSync(store.__dir)
+        const rounds = []
+        const deps = {
+            ...happyDeps(),
+            resolveContext: () => ({
+                repo: "repo",
+                repoRoot,
+                branch: "main",
+                key: `${repoRoot}|main`,
+            }),
+            runAndParse: async ({ config }) => {
+                rounds.push(config.limits.maxCodexRounds)
+                return {
+                    status: "GOOD_TO_GO",
+                    findings: [],
+                    raw: { durationMs: 1, exitCode: 0, timedOut: false },
+                }
+            },
+        }
+        const app = await startApp({
+            store,
+            deps,
+            loadCandidate: async () => ({ same: true }),
+        })
+        let held = true
+        let unpark = null
+        let client = null
+        try {
+            client = await connectClient(app.url, {
+                clientCapabilities: { roots: {} },
+                rootsHandler: async () => {
+                    if (held) await new Promise((r) => (unpark = r))
+                    return { roots: [{ uri: pathToFileURL(repoRoot).href }] }
+                },
+            })
+            const parkedCall = client.callTool({
+                name: "request_review",
+                arguments: { cwd: repoRoot },
+            })
+            await until(() => unpark !== null)
+            expect(
+                (await signedJson(app.base, "/admin/reload")).reload
+                    .activeReviews
+            ).toBe(1)
+
+            const edited = minimalConfig()
+            edited.limits.maxCodexRounds = 9
+            writeFileSync(app.configPath, JSON.stringify(edited))
+            const reload = await signedJson(app.base, "/admin/reload", {
+                method: "POST",
+                body: {},
+            })
+            expect(reload).toMatchObject({
+                ok: true,
+                scheduled: true,
+                activeReviews: 1,
+                configChanges: ["limits.maxCodexRounds"],
+            })
+
+            held = false
+            unpark()
+            expect((await parkedCall).structuredContent.status).toBe(
+                "GOOD_TO_GO"
+            )
+            const status = await until(async () => {
+                const { reload: r } = await signedJson(
+                    app.base,
+                    "/admin/reload"
+                )
+                return r.pending === null && r
+            })
+            expect(status.history[0]).toMatchObject({
+                kind: "reload",
+                ok: true,
+                configChanges: ["limits.maxCodexRounds"],
+            })
+
+            const next = await client.callTool({
+                name: "request_review",
+                arguments: { cwd: repoRoot },
+            })
+            expect(next.structuredContent.status).toBe("GOOD_TO_GO")
+            expect(rounds).toEqual([5, 9])
+        } finally {
+            held = false
+            unpark?.()
+            await client?.close()
+            await app.close()
+            // startApp leaves a caller-supplied store's folder alone.
+            rmSync(store.__dir, { recursive: true, force: true })
         }
     })
 })
