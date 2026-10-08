@@ -6,7 +6,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { mergeMcp } from "./merge-mcp.mjs"
+import { mergeMcp, REVIEW_TOOL_TIMEOUT_MS } from "./merge-mcp.mjs"
 
 const makeTmp = () => mkdtempSync(path.join(tmpdir(), "merge-mcp-"))
 
@@ -31,7 +31,10 @@ describe("mergeMcp", () => {
             type: "http",
             url: "http://127.0.0.1:7777/mcp",
             headersHelper: HELPER,
+            // Longer than Claude Code's default 300 s MCP tool limit.
+            timeout: 1_800_000,
         })
+        expect(REVIEW_TOOL_TIMEOUT_MS).toBe(1_800_000)
     })
 
     test("adds review entry to an existing file without disturbing other servers", () => {
@@ -91,6 +94,7 @@ describe("mergeMcp", () => {
                     type: "http",
                     url: "http://127.0.0.1:7777/mcp",
                     headersHelper: HELPER,
+                    timeout: REVIEW_TOOL_TIMEOUT_MS,
                 },
             },
         }

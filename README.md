@@ -52,7 +52,7 @@ The convention in this repo is **one patch bump per change** so a quick
    ┌───────────────┐  HTTP  │  POST /mcp          (MCP transport)  │
    │  Claude CLI   │◄──────►│  POST /review       (Stop-hook API)  │
    │   (session)   │        │  POST /reset                         │
-   └───────┬───────┘        │  GET  /status   (X-Review-Token)     │
+   └───────┬───────┘        │  GET  /status   (signed)             │
            │                │  GET  /        (dashboard, NO auth)  │
            │ Stop event     │  GET  /healthz                       │
            ▼                │                                      │
@@ -95,8 +95,13 @@ Four components talk to one server:
 | PostToolUse hook | `~/.claude/hooks/notify-change.mjs` (configured in `~/.claude/settings.json`) |
 | Archived reviews | `<config.reviewsDir>/<repo>:<branch>/<ts>.{json,md}` |
 | Replay helper | `scripts/replay-review.sh [snapshot \| --cwd <path>]` |
-| Dashboard | `http://127.0.0.1:7777/` (no auth) |
+| Dashboard | `http://127.0.0.1:7777/` (local only; actions need the page's token) |
 | Healthz | `http://127.0.0.1:7777/healthz` |
+| Running server's address and hook wait | `~/.cache/review-orchestrator/server.json` |
+| Hooks' fallback credentials | `~/.cache/review-orchestrator/hook-credentials.json` |
+| Config backups and lock | `~/.config/review-orchestrator/config.json.bak-*` (last 10), `config.json.lock` |
+| Loaded core snapshots | `server/.core-versions/<id>-<nonce>/` |
+| Codex output schema copies | `~/.cache/review-orchestrator/codex-schemas/` |
 
 ### Why a server instead of two independent integrations
 
@@ -133,11 +138,26 @@ started by launchd. Binds `127.0.0.1` only.
 | PUT    | `/provider` | yes  | Switch reviewer provider on the fly (live + persisted) | `scripts/setprovider.sh` |
 | GET    | `/status`   | yes  | Dump live contexts, version, redacted config  | Human        |
 | GET    | `/`         | **no**  | HTML dashboard (version, config, timeline, history) | Browser |
-| GET    | `/healthz`  | no   | Liveness check                                | launchd / hook fail-open |
+| POST/PUT | `/dashboard/*` | page token | Dashboard actions, incl. `/dashboard/reload` | The dashboard page |
+| POST   | `/admin/reload` | yes | Reload, roll back, cancel or apply now | `scripts/reload.sh` |
+| GET    | `/healthz`  | no   | Liveness check, and `?challenge=` for the hooks' address selection | launchd / hooks |
 
-Auth-protected endpoints require the `X-Review-Token` header. `GET /` is
-deliberately public because the server binds `127.0.0.1` — the network bind
-is the trust boundary, not an HTTP secret.
+Every route answers only to the server's own host names (the loopback
+names and the client host for `bind`); any other `Host` gets `421`, so a
+DNS-rebinding page can't reach it. Dashboard actions take no API token but
+are local only (loopback, or the exact address the server listens on) and
+need the page's per-start CSRF token (`X-Dashboard-Csrf`), our own
+`Origin` (or `Sec-Fetch-Site: same-origin` when no Origin is sent) and a
+JSON body. Every response refuses framing (`X-Frame-Options: DENY`,
+`frame-ancestors 'none'`).
+
+`/mcp` takes the `X-Review-Token` header (its clients send a static one).
+Every other auth-protected endpoint takes only **signed** requests made
+through `hooks/signed-client.mjs`: an HMAC of the method, path, body,
+timestamp, nonce and server instance, keyed by the token, which is never
+sent; the response is signed back and verified. `X-Review-Token` on those
+routes is refused. `GET /` is deliberately public because the server binds
+`127.0.0.1` — the network bind is the trust boundary, not an HTTP secret.
 
 #### MCP tools exposed over `/mcp`
 
@@ -539,8 +559,8 @@ invalidate `promptHash`, ignore globs, truncation, and the
 prompt-injection delimiters. Owning the payload end-to-end is
 non-negotiable across all three providers.
 
-Argv per provider (see [`server/src/codex.js`](./server/src/codex.js),
-[`claude.js`](./server/src/claude.js), [`gemini.js`](./server/src/gemini.js)
+Argv per provider (see [`server/src/core/review/codex.js`](./server/src/core/review/codex.js),
+[`claude.js`](./server/src/core/review/claude.js), [`gemini.js`](./server/src/core/review/gemini.js)
 for the canonical builders):
 
 ```bash
@@ -575,7 +595,7 @@ Common ground:
   available.
 - The reviewer is read-only via per-CLI sandbox/permission flags +
   (for claude) an explicit `--disallowed-tools` block.
-- Output is JSON validated against `server/src/codex-output.schema.json`.
+- Output is JSON validated against `server/src/core/review/codex-output.schema.json`.
   Codex enforces the schema via `--output-schema`; claude via
   `--json-schema` (a sanitized subset — see "Reviewer providers"); gemini
   relies on the prompt directive plus our salvage parser + ajv
@@ -812,13 +832,20 @@ Hook responsibilities (kept minimal):
    `stop_hook_active` is intentionally ignored — the multi-round loop runs
    inside a single turn (see "Loop semantics" below). The server-side cap
    is one safety net; Claude Code's 8-block cap is the other.
-2. Read `authToken` directly from
-   `~/.config/review-orchestrator/config.json`. If the file is missing or
-   has no token → log, exit 0 (fail open). The hook does **not** depend on
-   the env var being inherited from Claude Code's launching shell.
-3. POST `http://127.0.0.1:7777/review` with header `X-Review-Token: <token>`
-   and body `{ cwd, session_id, trigger: "stop_hook" }`. Timeout is the
-   configured reviewer timeout + 60s (660s by default), capped at 1740s.
+2. Connect through `signed-client.mjs` (installed next to the hook): read
+   `authToken` from `~/.config/review-orchestrator/config.json` (retried
+   briefly when caught mid-edit, then
+   `~/.cache/review-orchestrator/hook-credentials.json`), and pick the
+   address — `~/.cache/review-orchestrator/server.json` when the server
+   there proves the token (`GET /healthz?challenge=`), else config.json's.
+   No token or no proving server → log, exit 0 (fail open). The hook does
+   **not** depend on the env var being inherited from Claude Code's
+   launching shell.
+3. POST `/review` as a signed request (the token itself is never sent)
+   with body `{ cwd, session_id, trigger: "stop_hook", timeoutMs }`, and
+   verify the signed response. The wait is the running server's published
+   `hookTimeoutMs` (server.json), else the configured reviewer timeout +
+   60s (660s by default), capped at 1740s.
 4. On HTTP error / connection refused → log to
    `~/.claude/logs/review-hook.log` and exit 0 (fail open).
 5. Map the response. Decision is driven by `result.status` (which the
@@ -909,7 +936,8 @@ session.
 ### 5b. Client CLIs (who calls the orchestrator)
 
 Three CLIs can drive the loop. All three hit the same `/review`, `/mcp` and
-`/notify-change` endpoints with the same `X-Review-Token`, and all three
+`/notify-change` endpoints with the same token (sent as `X-Review-Token`
+on `/mcp`, used to sign every other request), and all three
 send `trigger: "stop_hook"` for the end-of-turn review, so the server's
 round/block accounting, `NO_PROGRESS` detection and `MAX_BLOCKS` cap behave
 identically no matter who is calling.
@@ -959,7 +987,7 @@ The reviewer is pluggable. `config.reviewer.provider` picks one of:
 
 Each adapter implements the same `runAndParse({repoRoot, prompt, config})`
 contract and returns `{status, findings, raw, salvaged?}`. The schema
-([`server/src/codex-output.schema.json`](./server/src/codex-output.schema.json))
+([`server/src/core/review/codex-output.schema.json`](./server/src/core/review/codex-output.schema.json))
 is shared across providers; it allows exactly two status values — `GOOD_TO_GO`
 and `ISSUES`. Every other public status (`GOOD_TO_GO_WITH_NOTES`, `NO_CHANGES`,
 `NO_PROGRESS_WITH_OPEN_ISSUES`, `ESCALATE`) is **server-derived** from those
@@ -970,8 +998,8 @@ to the schema-valid pair before validation as defense in depth.
 The `claude` adapter cannot pass that schema over `--json-schema` verbatim:
 the CLI compiles it with its own draft-07 ajv (which has no `$schema`
 `2020-12` meta-schema) and then hands it to the API as a strict tool
-`input_schema` (which rejects a top-level `allOf`). `claudeSchemaText()` in
-[`claude.js`](./server/src/claude.js) strips `$schema`, `$id`, and the
+`input_schema` (which rejects a top-level `allOf`). `toClaudeSchema()` in
+[`schema.js`](./server/src/core/review/schema.js) strips `$schema`, `$id`, and the
 top-level `allOf` before inlining; the finding shape (`$defs`/`$ref`, enums,
 `["string","null"]`) survives intact. Since the stripped `allOf` was what
 tied `status` to `findings.length`, the adapter re-derives `status` from the
@@ -1023,14 +1051,22 @@ scripts/reset-review.sh                 # current repo+branch
 scripts/reset-review.sh /path/to/repo   # a specific repo
 ```
 
-### 7. Dashboard (`server/src/dashboard.js`, served at `GET /`)
+### 7. Dashboard (`server/src/core/dashboard.js`, served at `GET /`)
 
-Self-contained HTML page, no external assets, no client-side framework. Three
-panels:
+Self-contained HTML page, no external assets, no client-side framework.
+Rendered by the core, so a reload changes the next page load. The header
+shows the shell and core versions, when the core was loaded, the number of
+reloads and the last reload error. An open tab whose core has been replaced
+shows "Dashboard updated to <id> — reload page" and stops refreshing its
+sections; it never reloads itself. Three panels:
 
 - **Active config:** version, provider, model, effort/mode, reviewer timeout,
   hook fetch timeout (shows `auto` when derived), round + block caps,
-  blocking severities, allowed roots count, port/bind.
+  blocking severities, allowed roots count, port/bind. Below it, the reload
+  controls: **reload core**, **roll back** (while a previous core is in
+  memory), and while a reload waits for running reviews, **cancel pending**
+  and **apply now** (confirmed first; running reviews finish on the old
+  code), with what it waits for and when new reviews start being held.
 - **Timeline chart:** inline SVG, one bar per archived review, oldest→newest,
   **linear** duration height with a min-px floor, color-coded by status
   (`ESCALATE` is red). Findings count labels above the bar when there's room.
@@ -1266,7 +1302,7 @@ truly clean tree.
 }
 ```
 
-**Server endpoint** — `POST /notify-change` (auth via `X-Review-Token`).
+**Server endpoint** — `POST /notify-change` (signed request).
 Body: `{cwd, tool?, file?}`. Resolves the context, flips
 `state.dirtySinceLastReview = true`, stamps `state.lastChangeAt`,
 returns `{ok, context, dirty, lastChangeAt}`. Logged as
@@ -1381,8 +1417,95 @@ flag is part of `reviewConfigHash` so toggling it busts the cache cleanly.
 | Payload empty/binary-only | `ESCALATE: payload empty or fully binary` (unless `payload.fallbackToHead` is on and a base commit resolves). |
 | Repo not a git repo | `ESCALATE: not a git repository`. |
 | `cwd` outside `allowedRoots` | `ESCALATE: cwd not in allowed roots`. |
-| Missing/invalid `X-Review-Token` | HTTP 401, hook fails open. |
+| Bad signature, unknown instance, or a response that doesn't verify | HTTP 401 / unverified, hook fails open and says why. |
 | `provider: "gemini"` with no key + api-key auth selected | Server exits at startup with a clear error (pre-flight check). OAuth via `~/.gemini/` is accepted. |
+
+## Hot reload
+
+The server is split into a stable **shell** (`server/src/*.js`: HTTP, auth,
+MCP transport and sessions, state store, archive, the config holder and the
+reload controller) and a reloadable **core** (`server/src/core/`: the
+review pipeline, reviewer adapters, prompts, status, the dashboard and its
+handlers). A reload swaps the core and re-reads `config.json` without
+dropping MCP sessions or restarting launchd.
+
+**Triggering one** (explicit only; nothing watches files):
+
+```bash
+scripts/reload.sh             # reload now if idle, else schedule it
+scripts/reload.sh --wait      # ... and wait for a scheduled one to finish
+scripts/reload.sh --now       # apply now; running reviews finish on the old core
+scripts/reload.sh --rollback  # back to the previous core and config
+scripts/reload.sh --cancel    # drop a pending reload
+```
+
+The dashboard's **reload core**, **roll back**, **cancel pending** and
+**apply now** buttons do the same (`POST /dashboard/reload`), and so does a
+signed `POST /admin/reload`.
+
+**What a reload does:**
+
+1. The core folder is read, hashed and written to an immutable snapshot
+   (`server/.core-versions/<id>-<nonce>/`). Every file passes a containment
+   check: imports stay inside the snapshot, and no dynamic `import()`,
+   `require`, `eval`, `Function`, `vm`, `worker_threads` or
+   `child_process`. Files that match the running core are a config-only
+   reload; nothing new is imported.
+2. The candidate's `CORE_API` and `STATE_FORMAT` must match the shell's,
+   `config.json` must pass the candidate's own schema and self-check, and
+   no restart-only key (`port`, `bind`, `logging.dir`, `reviewsDir`,
+   `reviewsRetentionDays`) may have changed. Any failure leaves everything
+   as it was and is reported.
+3. The swap waits until no review is running. Reviews are pinned at
+   admission to their core and to a frozen copy of the config, so a
+   running review always finishes on what it started with. If the wait
+   passes `reload.maxWaitMinutes`, new review requests are held at entry
+   (each for at most `reload.maxHoldSeconds`) so the running ones can
+   drain. **Apply now** swaps without waiting.
+4. The swap re-reads `config.json` and re-checks it. The previous core
+   and config stay in memory for one **rollback**, which restores each
+   changed key unless it was edited after the reload (kept and reported).
+   It never restores `authToken` or `auth.rotations`.
+
+Cache shortcuts are keyed to the review code (`reviewVersion`), the shell
+version and the effective config, so a reload that changes how reviews are
+done never serves a verdict the old code produced.
+
+**Config edits.** Every reload re-reads `config.json`. Dashboard edits are
+transactions: a delta merged into a fresh read of the file, validated and
+self-checked, written atomically with a backup. All writers (the server,
+`install.sh`, `rotate-token.sh`) share an OS lock on `config.json.lock`.
+
+**What still needs a restart:**
+
+- Shell code (`server/src/*.js`), including auth, the MCP transport, the
+  state store, the archive and the reload controller.
+- A core↔shell contract change (`CORE_API`) or a persisted-state change
+  that isn't additive (`STATE_FORMAT`).
+- `node_modules` or Node upgrades.
+- The restart-only config keys above.
+- MCP tool names, descriptions or schemas (open sessions also need a
+  reconnect).
+
+The hooks, the opencode plugin and the scripts aren't server code: run
+`install.sh` to update the installed copies. When a shell change and a
+hook change go together, run `install.sh` and restart the server back to
+back.
+
+**How hooks and scripts reach the server.** They never send the token.
+`hooks/signed-client.mjs` reads it from `config.json` (retrying a file
+caught mid-edit, then falling back to `hook-credentials.json`). It picks
+the address from `server.json` when the server there proves it holds the
+token (`GET /healthz?challenge=`), else from `config.json`. Each request
+is HMAC-signed for that server instance and each response is signed back
+and verified. `server.json` also publishes how long a hook should wait,
+covering a pending reload's config too.
+
+**Rotating the token:** `scripts/rotate-token.sh` writes a new token and a
+rotation record under the config lock, updates Codex's MCP entry, and
+confirms with the server. The old token keeps working for
+`auth.previousTokenGraceHours` (default 24) so open Codex and opencode MCP
+sessions survive until restarted; `--revoke-now` ends it at once.
 
 ## Configuration
 
@@ -1432,7 +1555,8 @@ example below shows every supported key and the current default):
     "maxCodexOutputBytes": 1048576,
     "maxPayloadBytes": 262144,
     "maxFileBytes": 65536,
-    "maxFiles": 40
+    "maxFiles": 40,
+    "gitTimeoutSeconds": 30
   },
 
   "ignorePaths": [
@@ -1452,6 +1576,16 @@ example below shows every supported key and the current default):
 
   "hook": {
     "fetchTimeoutSeconds": null
+  },
+
+  "reload": {
+    "maxWaitMinutes": 5,
+    "maxHoldSeconds": 45
+  },
+
+  "auth": {
+    "previousTokenGraceHours": 24,
+    "rotations": []
   },
 
   "logging": {
@@ -1474,14 +1608,20 @@ example below shows every supported key and the current default):
 | `payload.verifyCleanTree` | `false` | Deprecated, ignored. The fast path always runs the tree probe when no change notification arrived. |
 | `hook.fetchTimeoutSeconds` | `null` (auto) | When null, the hook auto-derives from `max(reviewer.{provider}.timeoutSeconds, limits.codexTimeoutSeconds) + 60s`. Override to pin. |
 | `limits.idleResetMinutes` | `10` | Loop-counter idle reset interval. **Cache fields are preserved** across the reset and across server restarts (see "State persistence" above). |
+| `reload.maxWaitMinutes` | `5` | How long a pending reload waits for running reviews before new review requests are held at entry. |
+| `reload.maxHoldSeconds` | `45` | The longest a single request is held, clamped so the hooks' published wait stays under their 29 min cap. |
+| `auth.previousTokenGraceHours` | `24` | How long the token a rotation replaced keeps working. `auth.rotations` is written by `rotate-token.sh` (hashes only, last 10); don't edit it. |
+| `limits.gitTimeoutSeconds` | `30` | Hard timeout (1–600) for every git command a request runs. A stalled git is killed (SIGTERM, then SIGKILL after 2 s) and only that request fails, with `ESCALATE` code `GIT_TIMEOUT` (HTTP 503). Nothing is cached, so the next call retries. |
 
 ### Knobs that invalidate the cache when changed
 
-`reviewConfigHash` is computed from a subset of config and stored alongside
-the baseline. Flipping any of these on a server restart busts cached
-baselines without needing `/reset`: `blockingSeverities`, `ignorePaths`,
-`extraReviewerInstructions`, `limits.{maxPayloadBytes,maxFileBytes,maxFiles}`,
-`payload.fallbackToHead`.
+Every cache shortcut requires the stored `reviewKey` to match. It covers
+the effective provider (a per-call override included), the effective
+config's review settings (`codex`, `reviewer`, `limits`, `ignorePaths`,
+`blockingSeverities`, `extraReviewerInstructions`, `payload`, merged with
+`.review-orchestrator.json`), the review code (`reviewVersion`) and the
+shell version. Changing any of them, by an edit, a reload or a restart,
+busts cached baselines without needing `/reset`.
 
 ## Implementation plan
 

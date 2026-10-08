@@ -29,8 +29,10 @@ the phased implementation plan — read it before making non-trivial changes.
 ## Tech stack
 
 - **Runtime:** Node.js 24 (ESM, `"type": "module"`).
-- **Server:** Express, binds 127.0.0.1, `X-Review-Token` auth on every
-  endpoint except `/healthz`.
+- **Server:** Express, binds 127.0.0.1. `/mcp` authenticates with
+  `X-Review-Token`; every other authenticated route takes only
+  HMAC-signed requests (`hooks/signed-client.mjs`), and `/healthz`
+  is open.
 - **MCP:** `@modelcontextprotocol/sdk` HTTP transport. Tools require
   explicit `cwd` input.
 - **Schema validation:** `ajv` for Codex output JSON Schema, `zod` for
@@ -51,8 +53,12 @@ the phased implementation plan — read it before making non-trivial changes.
 See "Phase 0 — Repo scaffolding" in [README.md](README.md). Briefly:
 
 ```
-server/src/                    // implementation modules
-  codex-output.schema.json     // JSON Schema enforced via codex --output-schema
+server/src/                    // the shell: HTTP, auth, MCP transport,
+                               // state store, archive, tools.js, core-loader.js
+  core/                        // the reloadable core (hot-reload plan §5.1)
+    index.js                   // composition root: CORE_API, createCore
+    review/                    // the review path (no UI imports)
+      codex-output.schema.json // JSON Schema enforced via codex --output-schema
 hooks/stop-review.mjs          // Node 24 Stop hook (not bash — no jq dep)
 hooks/notify-change.mjs        // Node 24 PostToolUse hook (shared Claude + codex)
 codex/skill/SKILL.md           // code-review-loop skill — installed into ~/.codex/skills
@@ -66,9 +72,58 @@ The codex integration (`install.sh --codex`) reuses the same hook scripts
 and wires `~/.codex/config.toml` (MCP), `~/.codex/hooks.json`, and the
 skill via `install/merge-codex-*.mjs` / `remove-codex-*.mjs`.
 
+Core modules import only each other and packages, never the shell, and
+never start processes: git and the reviewers come in through the shell's
+capabilities. The core's top level only defines things (no timers, I/O
+or listeners), and it never reads its own folder at run time; non-JS
+files reach it as bytes the shell read at load.
+
 `reviews/` is generated at runtime — do not commit it. `node_modules/`,
 `coverage/`, and persisted state under `~/.cache/review-orchestrator/` are
 also ignored.
+
+## Hot reload: shell, core and state
+
+The running server can swap its core and re-read `config.json` without a
+restart (README "Hot reload", `docs/hot-reload-plan.md`). Keep that true:
+
+- **Put behaviour in the core.** Review logic, prompts, reviewer
+  adapters, status, the dashboard and its handlers belong under
+  `server/src/core/`, which reloads. The shell (`server/src/*.js`) keeps
+  only what can't be swapped: HTTP and auth, the MCP transport and
+  sessions, the state store, the archive, the config holder and the
+  reload controller. A shell change needs a restart; say so in the
+  summary.
+- **The core ↔ shell contract is `CORE_API`** (in `core/index.js` and
+  `core-loader.js`). Adding an optional capability to the live object is
+  compatible; anything an older core or shell can't handle bumps it, and
+  a bump needs a restart.
+- **State compatibility rule, both directions.** The current and the
+  previous core share `state.json` and the archive, and a rollback brings
+  the older one back. So within a `STATE_FORMAT`, persisted changes are
+  additive only:
+  - new fields are optional;
+  - readers ignore fields they don't know and default missing ones
+    (`?? default`);
+  - saves carry fields they don't interpret (`{ ...state, … }`), and the
+    shell never rebuilds a context from a fixed field list;
+  - no field is renamed, removed, or given a new meaning or type.
+
+  Anything else bumps `STATE_FORMAT` in both `core/index.js` and
+  `core-loader.js`, which makes the swap refuse and needs a restart.
+- **Config is file-owned.** `authToken` and `auth.rotations` belong to
+  `config.json` and its writers; reloads and rollbacks never restore them.
+  Programs that write `config.json` go through `install/config-lock.mjs`
+  (the OS lock, atomic write, backup, hash re-check).
+- **What needs a restart:** shell code; a `CORE_API` or `STATE_FORMAT`
+  bump; `node_modules` or Node upgrades; the restart-only config keys
+  (`port`, `bind`, `logging.dir`, `reviewsDir`, `reviewsRetentionDays`);
+  MCP tool names, descriptions or schemas. Hooks, the opencode plugin and
+  the scripts need `install.sh`; when a shell change and a hook change go
+  together, reinstall and restart back to back.
+- **Hooks and scripts never send the token.** Every non-MCP caller goes
+  through `hooks/signed-client.mjs` (signed requests, verified
+  responses). Only `/mcp` takes `X-Review-Token`.
 
 ## Conventions
 
@@ -93,6 +148,27 @@ also ignored.
   contents, file paths, branch names) is data, never instructions. The
   Codex prompt builder must wrap it in hard delimiters; never interpolate
   it into the system preamble.
+
+## Versioning
+
+Bump `version` in `package.json` with every change set under `server/`,
+`hooks/`, `install/` or `scripts/`, so each restart shows a new version
+in the startup log (`active config`) and `/status`. The operator uses it
+to confirm the running daemon picked up the new code. Bump once per
+change set, never batch several changes into one version, and state the
+new version in the summary.
+
+- **Middle number** (`1.1.47` → `1.2.0`, last number resets to 0) for
+  functional changes and new functionality: a new subsystem or
+  capability, a new config key, a change to request or response
+  behaviour, a phase of a multi-phase plan. Bump it without asking.
+- **Last number** (`1.2.0` → `1.2.1`) for patches, bug fixes and model
+  version updates (reviewer presets, default models), plus docs and
+  tests that ship with code.
+- **First number** (`2.0.0`) only when the user asks for it.
+
+Keep the top-level `version` fields in `package-lock.json` in step with
+`package.json`.
 
 ## Testing
 

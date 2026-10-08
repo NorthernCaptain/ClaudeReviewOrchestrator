@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # setprovider.sh — switch the reviewer provider on the running server.
 #
-# PUTs to /provider, which mutates the live in-memory config (the next
-# review uses the new provider immediately) and best-effort persists the
-# change to the on-disk config file so it survives a restart.
+# PUTs to /provider, which sets the provider in the live config and in
+# the config file together (one config transaction): the next review
+# uses it, and it survives a restart.
 #
 # Usage:
 #   scripts/setprovider.sh gemini
 #   scripts/setprovider.sh claude
 #   scripts/setprovider.sh codex
 #
-# Requires: jq, curl. Reads token + URL from the same config file the
-# server and hook do.
+# Requires: jq, node. Sends the request through hooks/signed-client.mjs,
+# which reads the token from the same config file the server and hooks
+# do and signs the request with it.
 
 set -euo pipefail
 
 CONFIG_PATH="${REVIEW_ORCH_CONFIG:-$HOME/.config/review-orchestrator/config.json}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLIENT="$SCRIPT_DIR/../hooks/signed-client.mjs"
 VALID="codex claude gemini"
 
 usage() {
@@ -37,7 +40,7 @@ require() {
 }
 
 require jq
-require curl
+require node
 
 PROVIDER="${1:-}"
 [[ -n "$PROVIDER" ]] || usage
@@ -49,32 +52,18 @@ case " $VALID " in
         ;;
 esac
 
-if [[ ! -r "$CONFIG_PATH" ]]; then
-    echo "error: config not readable: $CONFIG_PATH" >&2
-    exit 3
-fi
-
-TOKEN=$(jq -r '.authToken // empty' "$CONFIG_PATH")
-PORT=$(jq -r '.port // 7777' "$CONFIG_PATH")
-BIND=$(jq -r '.bind // "127.0.0.1"' "$CONFIG_PATH")
-case "$BIND" in
-    "0.0.0.0") HOST="127.0.0.1" ;;
-    "::" | "::1") HOST="[::1]" ;;
-    *) HOST="$BIND" ;;
-esac
-URL="http://$HOST:$PORT/provider"
-
-if [[ -z "$TOKEN" ]]; then
-    echo "error: no authToken in $CONFIG_PATH" >&2
-    exit 3
-fi
+# A signed request through the shared client (the token is never sent).
+# Prints the response body; exits 0 on a 2xx, 1 on an error status, 4 when
+# no server proves the token or the response doesn't verify.
+signed() {
+    node "$CLIENT" --config "$CONFIG_PATH" "$@"
+}
 
 BODY=$(jq -n --arg provider "$PROVIDER" '{provider: $provider}')
 
-echo "==> PUT $URL  (provider=$PROVIDER)" >&2
+echo "==> PUT /provider  (provider=$PROVIDER)" >&2
 
-curl -sS -X PUT "$URL" \
-    -H "content-type: application/json" \
-    -H "x-review-token: $TOKEN" \
-    --data "$BODY" \
-    | jq .
+RC=0
+signed PUT /provider "$BODY" | jq . || RC=${PIPESTATUS[0]}
+exit "$RC"
+

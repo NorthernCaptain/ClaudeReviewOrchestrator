@@ -82,4 +82,8 @@ this session** (the absolute path you'd see from `pwd`). The server uses
   - `reset-review.sh [path]` — clear loop counters for a repo+branch.
   - `replay-review.sh` — re-fire the last hook payload at the server
     for debugging.
+  - `reload.sh [--now|--rollback|--cancel] [--wait]` — reload the
+    review core and config without a restart.
+  - `rotate-token.sh [--revoke-now]` — rotate the auth token; the old
+    one stays valid for a grace period unless revoked.
 <!-- review-orchestrator:end -->

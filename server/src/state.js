@@ -75,7 +75,13 @@ const blankContext = ({ key, repoRoot, branch }) => ({
 //
 // lastReviewedAt is set to 0 so a follow-up get() doesn't trigger a
 // second idle reset until a real review writes a new value.
+// Spread first, so every field this list doesn't name, including any a
+// newer core persisted, survives (hot-reload plan §5.5: persisted state
+// changes are additive and must not be dropped by the shell). Only the
+// loop counters are cleared; the rest keep their defaults for contexts
+// that predate them.
 const idleResetContext = ({ key, repoRoot, branch }, existing) => ({
+    ...existing,
     key,
     repoRoot,
     branch,
@@ -127,11 +133,15 @@ const persistAtomically = (filePath, contexts) => {
     renameSync(tmp, filePath)
 }
 
+// `idleResetMs` is a number or a function read on every lookup, so a
+// reloaded limits.idleResetMinutes takes effect at once.
 export const createStateStore = ({
     filePath = defaultStatePath(),
     now = Date.now,
     idleResetMs = 10 * 60 * 1000,
 } = {}) => {
+    const idleMs = () =>
+        typeof idleResetMs === "function" ? idleResetMs() : idleResetMs
     const contexts = loadFromDisk(filePath)
 
     const ensure = ({ key, repoRoot, branch }) => {
@@ -148,7 +158,7 @@ export const createStateStore = ({
         // See idleResetContext() for the rationale.
         if (
             state.lastReviewedAt > 0 &&
-            now() - state.lastReviewedAt > idleResetMs
+            now() - state.lastReviewedAt > idleMs()
         ) {
             contexts[key] = idleResetContext({ key, repoRoot, branch }, state)
             persistAtomically(filePath, contexts)

@@ -186,6 +186,26 @@ describe("createStateStore — idle reset", () => {
         expect(s.attemptsSincePass).toBe(3)
     })
 
+    test("idle reset keeps fields it doesn't know about (additive state)", () => {
+        let t = 1000
+        const store = createStateStore({
+            filePath,
+            now: () => t,
+            idleResetMs: 500,
+        })
+        store.save(ctxKey.key, {
+            repoRoot: ctxKey.repoRoot,
+            branch: ctxKey.branch,
+            codexRounds: 2,
+            lastReviewedAt: 1000,
+            futureCoreField: { kept: true },
+        })
+        t = 2000
+        const s = store.get(ctxKey)
+        expect(s.codexRounds).toBe(0)
+        expect(s.futureCoreField).toEqual({ kept: true })
+    })
+
     test("idle reset is one-shot: a follow-up get() does not re-reset", () => {
         let t = 1000
         const store = createStateStore({
@@ -377,5 +397,100 @@ describe("exclusions (v1.1)", () => {
         expect(fresh.exclusions).toEqual([
             { file: "a.js", message: "noise", excludedAt: 7 },
         ])
+    })
+})
+
+describe("createStateStore — live idle interval", () => {
+    test("a function interval is read on every lookup", () => {
+        const dir = mkdtempSync(path.join(tmpdir(), "state-idle-"))
+        try {
+            let t = 1000
+            let minutes = 10
+            const store = createStateStore({
+                filePath: path.join(dir, "state.json"),
+                now: () => t,
+                idleResetMs: () => minutes * 60_000,
+            })
+            const ctx = { key: "/r|main", repoRoot: "/r", branch: "main" }
+            store.save(ctx.key, {
+                repoRoot: "/r",
+                branch: "main",
+                codexRounds: 3,
+                lastReviewedAt: 1000,
+            })
+            t += 2 * 60_000
+            expect(store.get(ctx).codexRounds).toBe(3)
+            minutes = 1
+            expect(store.get(ctx).codexRounds).toBe(0)
+        } finally {
+            rmSync(dir, { recursive: true, force: true })
+        }
+    })
+})
+
+// The state compatibility rule (hot-reload plan §5.5): two retained cores
+// share state.json, the newer one reads what the older wrote and, after a
+// rollback, the older one reads what the newer wrote. Within a
+// STATE_FORMAT changes are additive, and the shell never drops a field.
+describe("state round trip between two cores, both directions, across an idle reset", () => {
+    let dir, filePath
+    beforeEach(() => {
+        dir = mkdtempSync(path.join(tmpdir(), "state-roundtrip-"))
+        filePath = path.join(dir, "state.json")
+    })
+    afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+    // Core A knows the fields of today; core B adds an optional one. Each
+    // reads with defaults and saves with a spread, as the pipeline does.
+    const coreA = {
+        review: (store, ctx, at) => {
+            const s = store.get(ctx)
+            store.save(ctx.key, {
+                ...s,
+                codexRounds: (s.codexRounds ?? 0) + 1,
+                lastResultStatus: "ISSUES",
+                lastReviewedAt: at,
+            })
+        },
+    }
+    const coreB = {
+        review: (store, ctx, at) => {
+            const s = store.get(ctx)
+            store.save(ctx.key, {
+                ...s,
+                codexRounds: (s.codexRounds ?? 0) + 1,
+                reviewNotes: [...(s.reviewNotes ?? []), "b"],
+                lastResultStatus: "ISSUES",
+                lastReviewedAt: at,
+            })
+        },
+    }
+
+    test("A → B → idle reset → A (rollback) → restart → B keeps every field each wrote", () => {
+        let t = 1000
+        const open = () =>
+            createStateStore({ filePath, now: () => t, idleResetMs: 500 })
+        let store = open()
+        coreA.review(store, ctxKey, t)
+        coreB.review(store, ctxKey, t)
+        expect(store.peek(ctxKey.key).reviewNotes).toEqual(["b"])
+        // Idle: the loop counters go, B's field stays.
+        t = 5000
+        let s = store.get(ctxKey)
+        expect(s.codexRounds).toBe(0)
+        expect(s.reviewNotes).toEqual(["b"])
+        // Rolled back to A, which doesn't know reviewNotes and keeps it.
+        coreA.review(store, ctxKey, t)
+        expect(store.peek(ctxKey.key)).toMatchObject({
+            codexRounds: 1,
+            reviewNotes: ["b"],
+        })
+        // A restart reads it all from disk; B picks up where it left off.
+        store = open()
+        coreB.review(store, ctxKey, t)
+        s = store.peek(ctxKey.key)
+        expect(s.reviewNotes).toEqual(["b", "b"])
+        expect(s.codexRounds).toBe(2)
+        expect(s.lastResultStatus).toBe("ISSUES")
     })
 })

@@ -3,40 +3,56 @@
  * Author: Leo Khramov
  */
 
-import { readFileSync } from "node:fs"
+import { randomBytes, randomUUID } from "node:crypto"
+import { readFileSync, rmSync } from "node:fs"
 import path from "node:path"
 import express from "express"
-import { loadConfig, defaultConfigPath } from "./config.js"
 import { VERSION } from "./version.js"
 
 export { VERSION }
-import { authMiddleware } from "./auth.js"
-import { mountReviewRoute, snapshotInFlight } from "./review.js"
-import { mountResetRoute } from "./reset.js"
-import { mountMcpRoute } from "./mcp.js"
-import { mountStatusRoute } from "./status.js"
-import { mountDashboardRoute } from "./dashboard.js"
-import { mountNotifyChangeRoute } from "./notify-change.js"
 import {
-    mountProviderRoute,
-    handleSetProvider,
-    handleSetReviewerPreset,
-} from "./provider.js"
-import { handleExclusionMutation } from "./exclusions.js"
-import { handleSetMaxRounds } from "./maxRounds.js"
-import { handleSetMaxBlocks } from "./maxBlocks.js"
-import { handleSetBlockingSeverities } from "./blockingSeverities.js"
+    createAuth,
+    createDashboardGuard,
+    createHostAllowlist,
+    createLocalOnly,
+    createTokenState,
+    DEFAULT_GRACE_HOURS,
+    noFraming,
+} from "./auth.js"
+import {
+    captureCore,
+    codexSchemaPathFor,
+    DEFAULT_CACHE_DIR,
+    DEFAULT_CORE_DIR,
+    DEFAULT_SNAPSHOT_ROOT,
+    defaultConfigPath,
+    ephemeralCodexSchemaPath,
+    importCore,
+    loadCoreModule,
+    loadDefaultCore,
+    prepareCore,
+    pruneCodexSchemas,
+    pruneSnapshots,
+    readConfigFile,
+    removeSnapshot,
+    shellVersionId,
+} from "./core-loader.js"
+import { mountMcpRoute } from "./mcp.js"
 import { createStateStore } from "./state.js"
 import { createArchive } from "./archive.js"
+import { createConfigStore } from "./config-store.js"
+import { createReloadController, requiredHookWaitMs } from "./reload.js"
+import { MAX_FETCH_TIMEOUT_MS } from "../../hooks/stop-review.mjs"
+import { defaultServerInfoPath, SERVICE } from "../../hooks/signed-client.mjs"
+import {
+    defaultCredentialsPath,
+    writeFileAtomic,
+} from "../../install/config-lock.mjs"
 import { createMetrics } from "./metrics.js"
 import { logger } from "./logger.js"
 import { createHttpAccessLog, createHttpErrorHandler } from "./http-log.js"
+import { createTools } from "./tools.js"
 
-// Build the structured "ready" log line emitted right after the server
-// starts accepting connections. Includes the version and the
-// non-sensitive subset of config the operator needs to verify the
-// daemon picked up the right knobs after a config change. Pure
-// function — exported for unit testing.
 // Inline yin-yang favicon (v0.1.36). Colors match the dashboard's dark
 // slate palette so the tab icon reads as the same UI. Served from
 // /favicon.svg and /favicon.ico (browsers auto-request the latter when
@@ -50,85 +66,423 @@ export const FAVICON_SVG =
     `<circle cx="32" cy="17" r="4" fill="#0f172a"/>` +
     `</svg>`
 
-// Express middleware that rejects any peer that isn't on the loopback
-// interface (127.0.0.1, ::1, or the v4-in-v6 form). Belt for the
-// dashboard mutation routes (POST /dashboard/reset, PUT /dashboard/
-// provider) so the operator widening `bind` from 127.0.0.1 to 0.0.0.0
-// doesn't accidentally expose them to the network. Returns 403 with a
-// clear `error` field; never proxies the request through.
-export const loopbackOnly = (req, res, next) => {
-    const ip = req.ip || req.socket?.remoteAddress || ""
-    const ok = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1"
-    if (!ok) {
-        return res
-            .status(403)
-            .json({ ok: false, error: "loopback only", remote: ip })
+// Where reload candidates come from: the core folder, captured and (when
+// its id differs from the running core's) written to a fresh snapshot and
+// imported, with a codex schema path of its own.
+export const createCandidateLoader =
+    ({
+        coreDir = DEFAULT_CORE_DIR,
+        snapshotRoot = DEFAULT_SNAPSHOT_ROOT,
+        codexSchemaPathOf = (version) => ephemeralCodexSchemaPath(version),
+        packageVersion = VERSION,
+    } = {}) =>
+    async (current) => {
+        const captured = captureCore({ coreDir, packageVersion })
+        if (captured.version === current.version) return { same: true }
+        const { module: mod, snapshotDir } = await importCore({
+            captured,
+            coreDir,
+            snapshotRoot,
+        })
+        return {
+            module: mod,
+            version: captured.version,
+            reviewVersion: captured.reviewVersion,
+            resources: captured.resources,
+            snapshotDir,
+            codexSchemaPath: codexSchemaPathOf(captured.version),
+        }
     }
-    next()
+
+const disposeCoreFiles = (record) => {
+    removeSnapshot(record.snapshotDir)
+    if (record.codexSchemaPath) rmSync(record.codexSchemaPath, { force: true })
 }
 
-export const summarizeStartup = (config, version = VERSION) => {
-    const provider = config?.reviewer?.provider ?? "codex"
-    const providerCfg =
-        provider === "claude"
-            ? config?.reviewer?.claude
-            : provider === "gemini"
-              ? config?.reviewer?.gemini
-              : config?.codex
-    const effortOrMode =
-        provider === "claude"
-            ? (providerCfg?.effort ?? null)
-            : provider === "gemini"
-              ? (providerCfg?.approvalMode ?? null)
-              : (providerCfg?.reasoningEffort ?? null)
-    const hookCfg = config?.hook?.fetchTimeoutSeconds
+// A Stop hook sends the wait limit it's using; MCP calls send none.
+const hookTimeoutOf = (body) => {
+    const t = body?.timeoutMs
+    return typeof t === "number" && Number.isFinite(t) && t > 0
+        ? Math.min(t, MAX_FETCH_TIMEOUT_MS)
+        : null
+}
+
+// The deadline bounds the response, never the review: arrival plus the
+// hook's limit, minus a response margin of min(5 s, limit / 10).
+export const requestDeadline = (arrival, timeoutMs) =>
+    timeoutMs === null
+        ? null
+        : arrival + timeoutMs - Math.min(5_000, timeoutMs / 10)
+
+// Absorbs request transit and parsing in the limit handshake.
+export const HANDSHAKE_TOLERANCE_MS = 2_000
+
+const quietEscalate = (code, reason, extra = {}) => ({
+    status: "ESCALATE",
+    findings: [],
+    blockingFindings: [],
+    droppedFindings: [],
+    code,
+    reason,
+    notifyUser: false,
+    ...extra,
+})
+
+const deadlineExceeded = (reason) => quietEscalate("DEADLINE_EXCEEDED", reason)
+
+const hookLimitStale = (requiredMs) =>
+    quietEscalate(
+        "HOOK_LIMIT_STALE",
+        "the reviewer timeout needs a longer hook wait — resend with hookTimeoutMs",
+        { hookTimeoutMs: requiredMs }
+    )
+
+// HTTP status for a reload that couldn't be prepared or applied: a busy
+// controller or a stale request is a conflict, bad code or config is
+// unprocessable, anything else is ours.
+const reloadErrorStatus = (err) =>
+    err?.httpStatus ??
+    (typeof err?.code === "string" &&
+    /^(CORE_|CONFIG_|RESTART_ONLY)/.test(err.code)
+        ? 422
+        : 500)
+
+// ~/.cache/review-orchestrator/server.json (hot-reload plan §5.7): where
+// the running server listens and how long a hook should wait, for the
+// hooks' address selection. Written once listening, rewritten whenever the
+// published wait changes, removed on graceful shutdown.
+export const createServerInfo = ({
+    path: filePath,
+    instanceId,
+    startedAt,
+    hookTimeoutMs,
+    logger: log = null,
+    write = writeFileAtomic,
+    read = readFileSync,
+    remove = rmSync,
+    pid = process.pid,
+}) => {
+    let address = null
+    let written = null
+    const refresh = () => {
+        if (!filePath || !address) return false
+        const text =
+            JSON.stringify(
+                {
+                    pid,
+                    port: address.port,
+                    bind: address.address,
+                    startedAt: new Date(startedAt).toISOString(),
+                    instanceId,
+                    hookTimeoutMs: hookTimeoutMs(),
+                },
+                null,
+                2
+            ) + "\n"
+        if (text === written) return false
+        try {
+            write(filePath, text)
+            written = text
+            return true
+        } catch (err) {
+            log?.warn?.({ err: err.message }, "failed to write server.json")
+            return false
+        }
+    }
     return {
-        version,
-        port: config?.port,
-        bind: config?.bind,
-        provider,
-        model: providerCfg?.model ?? null,
-        effortOrMode,
-        reviewerTimeoutSeconds:
-            providerCfg?.timeoutSeconds ??
-            config?.limits?.codexTimeoutSeconds ??
-            null,
-        hookFetchTimeoutSeconds:
-            // null in config → auto-derive in stop-review.mjs; surface
-            // that intent here rather than papering over it with a
-            // recomputed number that may drift if logic changes.
-            hookCfg === undefined ? null : hookCfg,
-        maxCodexRounds: config?.limits?.maxCodexRounds ?? null,
-        maxBlocks: config?.limits?.maxBlocks ?? null,
-        allowedRootsCount: Array.isArray(config?.allowedRoots)
-            ? config.allowedRoots.length
-            : 0,
-        blockingSeverities: config?.blockingSeverities ?? [],
+        setAddress: (value) => {
+            address = value
+            return refresh()
+        },
+        refresh,
+        // Only while it's still ours: a newer instance may have replaced it.
+        remove: () => {
+            if (!filePath || written === null) return false
+            try {
+                if (
+                    JSON.parse(read(filePath, "utf8"))?.instanceId !==
+                    instanceId
+                )
+                    return false
+                remove(filePath, { force: true })
+                return true
+            } catch {
+                return false
+            }
+        },
     }
 }
 
+// Every route below except /healthz and the favicon is a delegate: it
+// runs on the core current at that moment (hot-reload plan §5.1), pinned
+// for the request's life. The shell owns paths, auth, the loopback guard,
+// review admission and reloads; the core owns behaviour.
 export const createApp = ({
     config,
     store,
     archive = null,
     logger: log = logger,
-    deps = {},
-    startedAt = Date.now(),
+    deps: callerDeps = {},
     metrics = createMetrics(),
     configPath = defaultConfigPath(),
+    core,
+    // What the startup loader knows about `core`: { reviewVersion,
+    // snapshotDir, codexSchemaPath }.
+    coreInfo = {},
+    startedAt = Date.now(),
+    shellVersion = shellVersionId(),
+    loadCandidate = createCandidateLoader(),
+    // Random per start: signed requests name the instance they're for.
+    instanceId = randomUUID(),
+    // Where hook-credentials.json and server.json go; null writes neither
+    // (tests, embedders).
+    credentialsPath = null,
+    serverInfoPath = null,
 }) => {
+    // Shell-owned in-flight registries (hot-reload plan §5.5): duplicate
+    // matching, per-context ordering and the dashboard's in-flight view
+    // live here, outside any reloadable module, so they survive a swap.
+    // Every git and reviewer process goes through the shell's tools: async
+    // git with the live limits.gitTimeoutSeconds, and a spawn that refuses
+    // Node executables. Callers (tests) may still inject their own.
+    const tools = createTools({
+        getGitTimeoutMs: () =>
+            (configStore.current().limits?.gitTimeoutSeconds ?? 30) * 1000,
+        isIssuedConfig: (pinned) => reloads.isIssuedConfig(pinned),
+    })
+    const deps = {
+        inflight: new Map(),
+        contextChains: new Map(),
+        inflightMeta: new Map(),
+        // Waiters per shared pipeline, for deadline abandonment. Shell-owned
+        // so every core instance sees the same counts.
+        joinCounts: new WeakMap(),
+        git: tools.git,
+        spawnTool: tools.spawnTool,
+        ...callerDeps,
+    }
+    // The holder and the restart-only baseline hold the config in the
+    // core's normalized form (defaults filled, paths expanded), the form
+    // every reload and transaction produces, so comparisons see only real
+    // changes. main() passes it validated already; this is idempotent.
+    let normalized = config
+    try {
+        normalized = core.validateConfig(config)
+    } catch {
+        // an embedder's partial config: keep it as given
+    }
+    // The config holder outlives every core; every change to it is a
+    // transaction checked by the core current at that moment.
+    const configStore = createConfigStore({
+        configPath,
+        initial: normalized,
+        checks: () => {
+            const current = reloads.currentCore()
+            return {
+                validate: current.validateConfig,
+                selfCheck: current.selfCheck,
+            }
+        },
+        fs: callerDeps.configFs,
+        credentialsPath,
+        onCommit: () => serverInfo.refresh(),
+    })
+    // The token is read from config.json per request (§5.7); a change
+    // refreshes the hooks' credentials cache.
+    const tokenState = createTokenState({
+        configPath,
+        initialToken: config.authToken,
+        graceHours: () =>
+            configStore.current().auth?.previousTokenGraceHours ??
+            DEFAULT_GRACE_HOURS,
+        onChange: () => {
+            configStore.syncCredentials()
+        },
+        logger: log,
+    })
+    const auth = createAuth({ tokenState, instanceId })
+    // Per server start; the dashboard page embeds it and sends it back on
+    // every action (§5.8).
+    const dashboardCsrf = randomBytes(32).toString("base64url")
+    const serverInfo = createServerInfo({
+        path: serverInfoPath,
+        instanceId,
+        startedAt,
+        hookTimeoutMs: () => reloads.publishedHookTimeoutMs(),
+        logger: log,
+    })
+    const registries = Object.freeze({
+        inflight: deps.inflight,
+        contextChains: deps.contextChains,
+        inflightMeta: deps.inflightMeta,
+        joinCounts: deps.joinCounts,
+    })
+    const shellStatus = () => {
+        const { coreVersion, ...reload } = reloads.status()
+        return {
+            shellVersion,
+            coreVersion,
+            instanceId,
+            reload,
+            auth: tokenState.status(),
+        }
+    }
+    // What a core attaches: the same shell objects for every core, except
+    // the archive, which stamps each record with the core that wrote it.
+    const liveFor = (record) =>
+        Object.freeze({
+            get config() {
+                return configStore.current()
+            },
+            configTransaction: (delta) => configStore.mutate(delta),
+            store,
+            archive: archive && {
+                ...archive,
+                write: (args) =>
+                    archive.write({ ...args, coreVersion: record.version }),
+            },
+            metrics,
+            logger: log,
+            registries,
+            deps,
+            shellStatus,
+            dashboard: Object.freeze({ csrfToken: dashboardCsrf }),
+        })
+    const reloads = createReloadController({
+        initial: {
+            core,
+            validateConfig: core.validateConfig,
+            version: core.version,
+            reviewVersion: coreInfo.reviewVersion ?? null,
+            snapshotDir: coreInfo.snapshotDir ?? null,
+            codexSchemaPath: coreInfo.codexSchemaPath ?? null,
+        },
+        configStore,
+        startupConfig: normalized,
+        liveFor,
+        loadCandidate,
+        buildCore: (loaded, candidateConfig) =>
+            prepareCore({
+                loaded,
+                config: candidateConfig,
+                packageVersion: VERSION,
+                shellVersion,
+                startedAt,
+                codexSchemaPath: loaded.codexSchemaPath,
+            }),
+        disposeFiles: disposeCoreFiles,
+        runningReviews: () =>
+            [...registries.inflightMeta.values()].map((m) => ({
+                repo: m.repo,
+                branch: m.branch,
+                provider: m.provider,
+                startedAt: m.startedAt,
+            })),
+        onApplied: (applied) => {
+            const level = applied.logging?.level
+            if (level && log && "level" in log) log.level = level
+        },
+        onPendingChange: () => serverInfo.refresh(),
+        logger: log,
+    })
+    // Non-review requests pin the current core for their whole life.
+    const route = (pick) => async (req, res, next) => {
+        const ticket = reloads.pin()
+        try {
+            await pick(ticket.core.routes)(req, res, next)
+        } finally {
+            ticket.release()
+        }
+    }
+    const mutation = (key) => route((r) => r.dashboardMutations[key])
+    // POST /admin/reload (signed) and /dashboard/reload (the page's
+    // buttons): { cancel, rollback, now }, each true or absent.
+    const triggerReload = async (req, res) => {
+        const body = req.body ?? {}
+        try {
+            res.json(
+                await reloads.trigger({
+                    cancel: body.cancel === true,
+                    rollback: body.rollback === true,
+                    now: body.now === true,
+                })
+            )
+        } catch (err) {
+            log.warn({ err: err.message, code: err.code }, "core reload failed")
+            res.status(reloadErrorStatus(err)).json({
+                ok: false,
+                error: err.message,
+                code: err.code ?? "RELOAD_FAILED",
+            })
+        }
+    }
+
     const app = express()
     app.disable("x-powered-by")
+    app.locals.reloads = reloads
+    app.locals.live = liveFor({ version: core.version })
+    app.locals.configStore = configStore
+    app.locals.serverInfo = serverInfo
+    app.locals.instanceId = instanceId
+    app.locals.dashboardCsrf = dashboardCsrf
+    // Set by startServer once listening: the address the socket is bound
+    // to, which the dashboard's local-only guard accepts besides loopback.
+    app.locals.listenAddress = null
+    const localOnly = createLocalOnly({
+        listenAddress: () => app.locals.listenAddress,
+    })
+    const dashboardGuard = createDashboardGuard({
+        bind: normalized.bind,
+        csrfToken: dashboardCsrf,
+        listenAddress: () => app.locals.listenAddress,
+    })
+    const dashboardAction = [localOnly, dashboardGuard]
 
     // Access log runs before body parsing so we see every incoming
     // request including ones rejected by JSON parsing or auth. It logs
     // on response finish/close so the line carries the final status and
     // duration.
     app.use(createHttpAccessLog({ logger: log }))
-    app.use(express.json({ limit: "1mb" }))
+    // Before anything else answers: only our own host names (DNS
+    // rebinding), and never inside a frame.
+    app.use(
+        createHostAllowlist({
+            bind: normalized.bind,
+            listenAddress: () => app.locals.listenAddress,
+        })
+    )
+    app.use(noFraming)
+    // The raw bytes are kept for request signatures.
+    app.use(
+        express.json({
+            limit: "1mb",
+            verify: (req, _res, buf) => {
+                req.rawBody = buf
+            },
+        })
+    )
 
-    app.get("/healthz", (_req, res) => {
-        res.json({ ok: true })
+    // Unauthenticated. With ?challenge=<nonce>, proves the token (after the
+    // same refresh an authenticated request does) for address selection.
+    app.get("/healthz", (req, res) => {
+        const answer = auth.challenge(req.query.challenge)
+        if (answer.error) {
+            res.status(400).json({
+                ok: false,
+                service: SERVICE,
+                error: answer.error,
+            })
+            return
+        }
+        const { coreVersion, pending } = reloads.status()
+        res.json({
+            ok: true,
+            service: SERVICE,
+            ...answer,
+            shellVersion,
+            coreVersion,
+            reloadPending: pending !== null,
+        })
     })
 
     // Yin-yang favicon. Same body served for /favicon.svg AND
@@ -147,171 +501,105 @@ export const createApp = ({
     // before auth) because the dashboard page polls it without a token,
     // same trust boundary as GET /. Exposes only repo/branch/elapsed,
     // no diff or finding content.
-    app.get("/inflight", (_req, res) => {
-        res.setHeader("Cache-Control", "no-store")
-        res.json({ ok: true, inFlight: snapshotInFlight(Date.now) })
-    })
+    app.get(
+        "/inflight",
+        route((r) => r.inflight)
+    )
 
-    // Dashboard control endpoints (v0.1.35). Mounted BEFORE auth so the
-    // public dashboard page can use them without embedding the
-    // X-Review-Token, but explicitly guarded to loopback peers
-    // (v0.1.36) — these mutate live config / clear review state, so we
-    // can't rely on `bind: 127.0.0.1` alone as the trust boundary. If
-    // the operator ever widens the bind, these stay locked down. The
-    // canonical authed routes (POST /reset, PUT /provider) remain
-    // available for cross-host callers with a valid token.
-    // Dashboard reset: takes `{ contextKey }` (preferred) — the
-    // store key already encodes (repoRoot, branch), so unlike `cwd`
-    // it can't be ambiguous when a repo has multiple branches in the
-    // store. Validates against store.list() before touching state.
-    app.post("/dashboard/reset", loopbackOnly, (req, res) => {
-        const contextKey = req.body?.contextKey
-        if (typeof contextKey !== "string" || contextKey.length === 0) {
-            return res
-                .status(400)
-                .json({ ok: false, error: "contextKey is required" })
+    // Dashboard actions. Mounted before auth (the page holds no API token)
+    // and guarded instead: local peers only, and the page's CSRF token,
+    // our own Origin and a JSON body on every request (§5.8).
+    app.post("/dashboard/reset", dashboardAction, mutation("reset"))
+    app.put("/dashboard/provider", dashboardAction, mutation("provider"))
+    app.put(
+        "/dashboard/reviewer-preset",
+        dashboardAction,
+        mutation("reviewerPreset")
+    )
+    app.post("/dashboard/exclusions", dashboardAction, mutation("exclusions"))
+    app.put("/dashboard/max-rounds", dashboardAction, mutation("maxRounds"))
+    app.put("/dashboard/max-blocks", dashboardAction, mutation("maxBlocks"))
+    app.put(
+        "/dashboard/blocking-severities",
+        dashboardAction,
+        mutation("blockingSeverities")
+    )
+    app.post("/dashboard/reload", dashboardAction, triggerReload)
+
+    // GET / — the dashboard, reachable without a token. It embeds the
+    // CSRF token, which only our own host names can read: a rebinding
+    // origin is refused by the Host allowlist above.
+    app.get(
+        "/",
+        route((r) => r.dashboardPage)
+    )
+
+    // /mcp takes X-Review-Token; every route below it only signed requests.
+    app.use(auth.middleware)
+    // Reviews are admitted before anything else happens (hot-reload plan
+    // §5.5): counted toward "busy", pinned to the current core and to a
+    // frozen copy of the config, released when the work ends (which, for
+    // a request answered at its deadline, is after the answer).
+    app.post("/review", async (req, res) => {
+        const arrival = Date.now()
+        const timeoutMs = hookTimeoutOf(req.body)
+        const deadline = requestDeadline(arrival, timeoutMs)
+        let ticket
+        try {
+            ticket = await reloads.admitReview({ deadline })
+        } catch (err) {
+            if (err?.code !== "DEADLINE_EXCEEDED") throw err
+            res.json(
+                deadlineExceeded(
+                    "the request waited at entry until its deadline"
+                )
+            )
+            return
         }
-        const known = (store?.list?.() ?? []).find((c) => c.key === contextKey)
-        if (!known) {
-            return res.status(404).json({
-                ok: false,
-                error: `unknown context: ${contextKey}`,
+        try {
+            // The limit handshake: a hook whose remaining wait can't cover
+            // the pinned config's reviewer timeout learns the limit it
+            // needs before any work starts. Never on a final attempt.
+            if (timeoutMs !== null && req.body?.finalAttempt !== true) {
+                const remainingMs = timeoutMs - (Date.now() - arrival)
+                const requiredMs = requiredHookWaitMs(ticket.config)
+                if (remainingMs < requiredMs - HANDSHAKE_TOLERANCE_MS) {
+                    res.status(409).json(hookLimitStale(requiredMs))
+                    return
+                }
+            }
+            await ticket.core.routes.review(req, res, {
+                config: ticket.config,
+                deadline,
             })
+        } finally {
+            ticket.release()
         }
-        const fresh = store.reset({
-            key: known.key,
-            repoRoot: known.repoRoot,
-            branch: known.branch,
-        })
-        res.json({
-            ok: true,
-            context: {
-                repo: known.repo ?? known.repoRoot?.split("/").pop() ?? null,
-                repoRoot: known.repoRoot,
-                branch: known.branch,
-                key: known.key,
-            },
-            state: {
-                codexRounds: fresh.codexRounds,
-                blockCount: fresh.blockCount,
-                lastResultStatus: fresh.lastResultStatus,
-            },
-        })
     })
-    app.put("/dashboard/provider", loopbackOnly, (req, res) => {
-        const result = handleSetProvider({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-    app.put("/dashboard/reviewer-preset", loopbackOnly, (req, res) => {
-        const result = handleSetReviewerPreset({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // Per-context exclusion mutations (v1.1). Loopback-only; same trust
-    // boundary as the other dashboard mutation routes.
-    app.post("/dashboard/exclusions", loopbackOnly, (req, res) => {
-        const result = handleExclusionMutation({ body: req.body, store })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // Adjust the codex-rounds cap from the dashboard (v1.1.8). Live +
-    // best-effort persisted, same loopback trust boundary as the rest
-    // of the dashboard mutation surface.
-    app.put("/dashboard/max-rounds", loopbackOnly, (req, res) => {
-        const result = handleSetMaxRounds({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // Adjust the block cap from the dashboard (v1.1.19). Live +
-    // best-effort persisted, same loopback trust boundary.
-    app.put("/dashboard/max-blocks", loopbackOnly, (req, res) => {
-        const result = handleSetMaxBlocks({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // Pick which severities count as blocking from the dashboard
-    // (v1.1.13). Live + best-effort persisted, same loopback trust
-    // boundary as the rest of the dashboard mutation surface.
-    app.put("/dashboard/blocking-severities", loopbackOnly, (req, res) => {
-        const result = handleSetBlockingSeverities({
-            body: req.body,
-            config,
-            configPath,
-            logger: log,
-            deps,
-        })
-        res.status(result.httpStatus).json(result.body)
-    })
-
-    // GET / — public dashboard. Mounted BEFORE the auth middleware so
-    // it's reachable without the x-review-token. Safe because the
-    // server binds 127.0.0.1 by default — the trust boundary is the
-    // network bind, not an HTTP secret.
-    mountDashboardRoute(app, {
-        archive,
-        config,
-        store,
-        summarize: summarizeStartup,
-        version: VERSION,
-        startedAt,
-        metrics,
-        inFlight: () => snapshotInFlight(Date.now),
-    })
-
-    app.use(authMiddleware({ token: config.authToken }))
-    mountReviewRoute(app, {
-        config,
-        store,
-        archive,
-        logger: log,
-        deps,
-        metrics,
-    })
-    mountResetRoute(app, { config, store, deps })
-    mountNotifyChangeRoute(app, { config, store, logger: log, deps })
-    mountProviderRoute(app, { config, configPath, logger: log, deps })
+    app.post(
+        "/reset",
+        route((r) => r.reset)
+    )
+    app.post(
+        "/notify-change",
+        route((r) => r.notifyChange)
+    )
+    app.put(
+        "/provider",
+        route((r) => r.provider)
+    )
     // Capture the MCP route's closeAllSessions so shutdown can drain
     // long-poll GETs (otherwise server.close() never resolves).
-    const mcp = mountMcpRoute(app, {
-        config,
-        store,
-        archive,
-        logger: log,
-        deps,
-        metrics,
+    app.locals.mcp = mountMcpRoute(app, { cores: reloads, logger: log })
+    // Explicit reloads only (hot-reload plan §5.9): { cancel, rollback, now }.
+    app.post("/admin/reload", triggerReload)
+    app.get("/admin/reload", (_req, res) => {
+        res.json({ ok: true, ...shellStatus() })
     })
-    app.locals.mcp = mcp
-    mountStatusRoute(app, {
-        config,
-        store,
-        archive,
-        startedAt,
-        version: VERSION,
-    })
+    app.get(
+        "/status",
+        route((r) => r.status)
+    )
 
     // Last middleware: catches errors from next(err) / async route
     // handlers. Logs with stack and returns a sanitized 500 to the
@@ -321,7 +609,9 @@ export const createApp = ({
     return app
 }
 
-export const startServer = ({
+// Without a `core`, loads the default one for `config` (with an
+// ephemeral codex schema path; main() passes its own core).
+export const startServer = async ({
     config,
     store,
     archive = null,
@@ -329,16 +619,31 @@ export const startServer = ({
     log = logger,
     startedAt = Date.now(),
     configPath = defaultConfigPath(),
-} = {}) =>
-    new Promise((resolve) => {
+    core = null,
+    coreInfo = {},
+    shellVersion = shellVersionId(),
+    loadCandidate = createCandidateLoader(),
+    credentialsPath = null,
+    serverInfoPath = null,
+} = {}) => {
+    const active =
+        core ??
+        (await loadDefaultCore({ config, packageVersion: VERSION, startedAt }))
+    return new Promise((resolve) => {
         const app = createApp({
             config,
             store,
             archive,
             logger: log,
             deps,
-            startedAt,
             configPath,
+            core: active,
+            coreInfo,
+            startedAt,
+            shellVersion,
+            loadCandidate,
+            credentialsPath,
+            serverInfoPath,
         })
         const server = app.listen(config.port, config.bind)
         let settled = false
@@ -395,10 +700,14 @@ export const startServer = ({
             // Followed immediately by a structured config summary so
             // the operator can verify the daemon picked up the right
             // version + provider + timeouts without curling /status.
-            log.info(summarizeStartup(config), "active config")
+            log.info(active.summarizeConfig(config), "active config")
+            app.locals.listenAddress = addr.address
+            app.locals.serverInfo.setAddress(addr)
+            app.locals.configStore.syncCredentials()
             settle({ ok: true, server, address: addr, sockets, app })
         })
     })
+}
 
 // Shut down the HTTP server cleanly. The contract:
 //   1. Stop accepting new connections (server.close()).
@@ -576,20 +885,37 @@ export const checkReviewerEnv = (
 /* istanbul ignore next -- process entry, exercised by smoke test only */
 const main = async () => {
     const configPath = process.env.REVIEW_ORCH_CONFIG ?? defaultConfigPath()
-    let config
+    const startedAt = Date.now()
+    // Startup loads core v1 through the same loader a reload uses.
+    let loaded
     try {
-        config = loadConfig({ configPath })
+        loaded = await loadCoreModule({ packageVersion: VERSION })
     } catch (err) {
         logger.error(
-            { err: err.message, code: err.code, configPath },
-            "failed to load config"
+            { err: err.message, code: err.code },
+            "failed to load the review core"
         )
         process.exitCode = 1
+        return
+    }
+    // Every other snapshot folder belongs to a core that no longer runs.
+    pruneSnapshots({ keep: loaded.snapshotDir })
+    const fail = (err, msg, extra = {}) => {
+        removeSnapshot(loaded.snapshotDir)
+        logger.error({ err: err.message, code: err.code, ...extra }, msg)
+        process.exitCode = 1
+    }
+    let config
+    try {
+        config = loaded.module.validateConfig(readConfigFile({ configPath }))
+    } catch (err) {
+        fail(err, "failed to load config", { configPath })
         return
     }
 
     const envProblem = checkReviewerEnv(config)
     if (envProblem) {
+        removeSnapshot(loaded.snapshotDir)
         logger.error(
             {
                 provider: config.reviewer?.provider,
@@ -601,8 +927,11 @@ const main = async () => {
         return
     }
 
+    // The idle interval follows the live config once the server runs (a
+    // reload can change it); until then, the startup value.
+    let liveConfig = () => config
     const store = createStateStore({
-        idleResetMs: config.limits.idleResetMinutes * 60 * 1000,
+        idleResetMs: () => liveConfig().limits.idleResetMinutes * 60 * 1000,
     })
     const archive = createArchive({
         reviewsDir: config.reviewsDir,
@@ -618,12 +947,54 @@ const main = async () => {
         )
     }
 
-    const result = await startServer({ config, store, archive, configPath })
+    const shellVersion = shellVersionId()
+    const codexSchemaPathOf = (version) =>
+        codexSchemaPathFor({
+            cacheDir: DEFAULT_CACHE_DIR,
+            version,
+            nonce: randomBytes(6).toString("hex"),
+        })
+    const codexSchemaPath = codexSchemaPathOf(loaded.version)
+    pruneCodexSchemas({ keep: codexSchemaPath })
+    let core
+    try {
+        core = prepareCore({
+            loaded,
+            config,
+            packageVersion: VERSION,
+            shellVersion,
+            startedAt,
+            codexSchemaPath,
+        })
+    } catch (err) {
+        fail(err, "the review core rejected this config")
+        return
+    }
+    logger.info({ coreVersion: loaded.version }, "review core loaded")
+
+    const result = await startServer({
+        config,
+        store,
+        archive,
+        configPath,
+        startedAt,
+        core,
+        coreInfo: {
+            reviewVersion: loaded.reviewVersion,
+            snapshotDir: loaded.snapshotDir,
+            codexSchemaPath,
+        },
+        shellVersion,
+        loadCandidate: createCandidateLoader({ codexSchemaPathOf }),
+        credentialsPath: defaultCredentialsPath(),
+        serverInfoPath: defaultServerInfoPath(),
+    })
     if (!result.ok) {
         process.exitCode = 1
         return
     }
     const { server, sockets, app } = result
+    liveConfig = () => app.locals.configStore.current()
 
     // One-shot graceful shutdown. The second SIGINT/SIGTERM hard-exits
     // so a wedged close() never leaves the operator stuck — matches the
@@ -636,6 +1007,8 @@ const main = async () => {
             return
         }
         logger.info({ signal }, "shutting down")
+        // First, so no new hook picks a server that's going away.
+        app.locals.serverInfo.remove()
         gracefulShutdown({
             server,
             sockets,

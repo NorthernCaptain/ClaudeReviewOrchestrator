@@ -25,6 +25,48 @@ const okResponse = (body, status = 200) => ({
     json: async () => body,
 })
 
+// The lib's connect() over the transport the plugin hands it, without the
+// challenge and signing (signed-client.mjs and the server's auth tests
+// cover those).
+const connectVia = ({ fetchFn }) => ({
+    ok: true,
+    server: {
+        baseUrl: "http://127.0.0.1:7777",
+        instanceId: "i-1",
+        hookTimeoutMs: null,
+    },
+    creds: { token: TOKEN, port: 7777 },
+    credentialsSource: "config",
+    configError: null,
+    request: async ({ method, path: target, body, timeoutMs }) => {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), timeoutMs)
+        try {
+            const res = await fetchFn(`http://127.0.0.1:7777${target}`, {
+                method,
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(body),
+                signal: controller.signal,
+            })
+            let parsed = null
+            try {
+                parsed = await res.json()
+            } catch {
+                parsed = null
+            }
+            return { httpStatus: res.status, body: parsed, fetchError: null }
+        } catch (err) {
+            return {
+                httpStatus: null,
+                body: null,
+                fetchError: err?.message ?? String(err),
+            }
+        } finally {
+            clearTimeout(timer)
+        }
+    },
+})
+
 // Minimal opencode client double: records what the plugin asked for.
 const makeClient = ({ session = {}, sessionGetError = null } = {}) => {
     const calls = { prompts: [], toasts: [], sessionGets: [] }
@@ -64,6 +106,7 @@ const build = async (over = {}) => {
         env: { REVIEW_ORCH_LIB: LIB, ...(over.env ?? {}) },
         ...(fetchImpl ? { fetchImpl } : {}),
         readFile: over.readFile ?? (() => CONFIG_JSON),
+        connectImpl: "connectImpl" in over ? over.connectImpl : connectVia,
         logLine: (l) => logs.push(l),
         ...(over.importLib ? { importLib: over.importLib } : {}),
     })
@@ -104,6 +147,109 @@ describe("plugin activation", () => {
         })
         expect(hooks).toEqual({})
         expect(logs.join("\n")).toMatch(/no authToken/)
+    })
+})
+
+describe("signed connections", () => {
+    const idle = (hooks) =>
+        hooks.event({
+            event: { type: "session.idle", properties: { sessionID: "s" } },
+        })
+
+    test("every request connects afresh through the lib, with the plugin's transport and reader", async () => {
+        const realLib = await import(pathToFileURL(LIB).href)
+        const connect = jest.fn(connectVia)
+        const readFile = jest.fn(() => CONFIG_JSON)
+        const { hooks, fetchImpl } = await build({
+            importLib: async () => ({ ...realLib, connect }),
+            connectImpl: null,
+            readFile,
+        })
+        await idle(hooks)
+        await hooks["tool.execute.after"]({ tool: "write", sessionID: "s" })
+        expect(connect).toHaveBeenCalledTimes(2)
+        expect(connect.mock.calls[0][0]).toEqual({
+            fetchFn: fetchImpl,
+            read: readFile,
+        })
+    })
+
+    test("an installed lib from before signed requests leaves the plugin inactive", async () => {
+        const realLib = await import(pathToFileURL(LIB).href)
+        const { hooks, logs } = await build({
+            importLib: async () => ({ ...realLib, connect: undefined }),
+        })
+        expect(hooks).toEqual({})
+        expect(logs.join("\n")).toMatch(/predates signed requests/)
+    })
+
+    test("no server proving the token: the review is skipped with the reason, and a notify is dropped", async () => {
+        const fetchImpl = jest.fn()
+        const { hooks, logs } = await build({
+            fetchImpl,
+            connectImpl: async () => ({
+                ok: false,
+                stage: "address",
+                reason: "no server proved the token",
+            }),
+        })
+        await idle(hooks)
+        await hooks["tool.execute.after"]({ tool: "write", sessionID: "s" })
+        expect(fetchImpl).not.toHaveBeenCalled()
+        expect(logs.join("\n")).toMatch(
+            /no server proved the token; skipping review/
+        )
+    })
+
+    test("a stale wait limit (409 HOOK_LIMIT_STALE) is resent with the limit the server asks for", async () => {
+        const replies = [
+            okResponse(
+                {
+                    status: "ESCALATE",
+                    code: "HOOK_LIMIT_STALE",
+                    hookTimeoutMs: 900_000,
+                },
+                409
+            ),
+            okResponse({ status: "GOOD_TO_GO", findings: [] }),
+        ]
+        const fetchImpl = jest.fn(async () => replies.shift())
+        const { hooks, client } = await build({ fetchImpl })
+        await idle(hooks)
+        const bodies = fetchImpl.mock.calls.map(([, init]) =>
+            JSON.parse(init.body)
+        )
+        expect(bodies.map((b) => b.timeoutMs)).toEqual([660_000, 900_000])
+        expect(client.calls.prompts).toEqual([])
+        expect(client.calls.toasts.at(-1)).toMatchObject({
+            message: "GOOD_TO_GO",
+        })
+    })
+
+    test("cached credentials are reported, and the server's published wait is the limit", async () => {
+        const fetchImpl = jest.fn(async () =>
+            okResponse({ status: "GOOD_TO_GO", findings: [] })
+        )
+        const { hooks, logs } = await build({
+            fetchImpl,
+            connectImpl: (opts) => ({
+                ...connectVia(opts),
+                credentialsSource: "cache",
+                configError: "config.json doesn't parse",
+                server: {
+                    baseUrl: "http://127.0.0.1:7777",
+                    instanceId: "i-1",
+                    hookTimeoutMs: 123_000,
+                },
+            }),
+        })
+        await idle(hooks)
+        expect(logs.join("\n")).toMatch(
+            /config.json doesn't parse; using the cached hook credentials/
+        )
+        expect(JSON.parse(fetchImpl.mock.calls[0][1].body).timeoutMs).toBe(
+            123_000
+        )
     })
 })
 
@@ -175,7 +321,7 @@ describe("tool.execute.after (notify-change)", () => {
         expect(fetchImpl).toHaveBeenCalledTimes(1)
         const [url, init] = fetchImpl.mock.calls[0]
         expect(url).toBe("http://127.0.0.1:7777/notify-change")
-        expect(init.headers["x-review-token"]).toBe(TOKEN)
+        expect(init.headers["x-review-token"]).toBeUndefined()
         expect(JSON.parse(init.body)).toEqual({
             cwd: "/repo",
             tool,
@@ -264,6 +410,8 @@ describe("event hook (session.idle → review)", () => {
             cwd: "/other/repo",
             session_id: "ses_1",
             trigger: "stop_hook",
+            // Sent through the shared client, with its wait limit.
+            timeoutMs: 660000,
         })
         expect(client.calls.prompts).toEqual([])
     })

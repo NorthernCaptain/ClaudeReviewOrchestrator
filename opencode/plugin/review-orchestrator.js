@@ -41,19 +41,21 @@
 // is injected. The skill therefore tells the agent to call request_review
 // itself, which works everywhere because it runs inside the turn.
 //
-// The /review protocol itself — endpoint, token, and the status→decision
-// mapping including the block-reason formatting — is NOT reimplemented
-// here. It is imported from the same hooks/stop-review.mjs the other CLIs
-// run, installed alongside as a plain module (see LIB_PATH). Duplicating
-// it would guarantee drift in the one place all three clients must agree.
+// The /review protocol itself — credentials, address selection, request
+// signing, the limit handshake and the status→decision mapping including
+// the block-reason formatting — is NOT reimplemented here. It is imported
+// from the same hooks/stop-review.mjs the other CLIs run (with the
+// signed-client.mjs it imports), installed alongside as plain modules (see
+// LIB_PATH). Duplicating it would guarantee drift in the one place all
+// three clients must agree. Every request reads the credentials and picks
+// the address afresh, so a token rotation never needs an opencode restart
+// for the end-of-turn reviews; only the MCP registration below keeps the
+// token it read at load.
 
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-
-const CONFIG_PATH = () =>
-    path.join(homedir(), ".config", "review-orchestrator", "config.json")
 
 // Installed copy of hooks/stop-review.mjs. Lives under our own config dir
 // rather than next to this file: opencode scans the plugin dir and would
@@ -74,12 +76,6 @@ const LIB_PATH = (env) =>
 const MUTATING_TOOLS = new Set(["write", "edit", "patch", "bash"])
 
 const NOTIFY_TIMEOUT_MS = 2000
-const DEFAULT_REVIEW_TIMEOUT_MS = 660 * 1000
-
-const notifyUrlFrom = (reviewUrl) =>
-    reviewUrl.replace(/\/review$/, "/notify-change")
-
-const mcpUrlFrom = (reviewUrl) => reviewUrl.replace(/\/review$/, "/mcp")
 
 // hey-api clients resolve to { data, error }; unwrap defensively so a
 // future shape change degrades to "no session info" instead of throwing.
@@ -106,40 +102,6 @@ const describeError = (err) => {
     }
 }
 
-const postJson = async ({ url, token, body, timeoutMs, fetchImpl }) => {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-    try {
-        const res = await fetchImpl(url, {
-            method: "POST",
-            headers: {
-                "content-type": "application/json",
-                "x-review-token": token,
-            },
-            body: JSON.stringify(body),
-            signal: controller.signal,
-        })
-        let parsed = null
-        try {
-            parsed = await res.json()
-        } catch {
-            parsed = null
-        }
-        return { httpStatus: res.status, body: parsed, error: null }
-    } catch (err) {
-        return {
-            httpStatus: null,
-            body: null,
-            error:
-                err?.name === "AbortError"
-                    ? `request timed out after ${timeoutMs}ms`
-                    : (err?.message ?? String(err)),
-        }
-    } finally {
-        clearTimeout(timer)
-    }
-}
-
 // Everything below is deliberately module-private: opencode treats EVERY
 // export of a plugin module as a plugin candidate, and a single export
 // that isn't a Plugin function makes it skip the module silently — no
@@ -153,6 +115,8 @@ const buildHooks = async ({
     env = process.env,
     fetchImpl = null,
     readFile = readFileSync,
+    // The lib's connect() unless a test swaps it.
+    connectImpl = null,
     // eslint-disable-next-line node/no-unsupported-features/es-syntax -- eslint-plugin-node's feature table predates Node 12.17; dynamic import is fine on the Node 24 this targets
     importLib = (specifier) => import(specifier),
     logLine = (line) => process.stderr.write(`${line}\n`),
@@ -177,27 +141,31 @@ const buildHooks = async ({
         return {}
     }
 
-    const config = lib.readToken({ configPath: CONFIG_PATH(), read: readFile })
-    if (!config) {
+    if (typeof lib.connect !== "function") {
         logLine(
-            "review-orchestrator: plugin inactive — no authToken in " +
-                CONFIG_PATH()
+            "review-orchestrator: plugin inactive — the installed lib " +
+                `(${LIB_PATH(env)}) predates signed requests. Rerun install.sh --opencode.`
         )
         return {}
     }
-
+    // Read once, for the MCP registration only.
+    const found = await lib.readCredentials({ read: readFile })
+    if (!found.creds) {
+        logLine(`review-orchestrator: plugin inactive — ${found.reason}`)
+        return {}
+    }
     // Same transport the Stop hook uses, and for the same reason: a review
     // can outlast undici's 300s headers/body timeouts, which fire
     // independently of our AbortController while the server holds the
     // connection open — turning a long review into "fetch failed" and
-    // losing the findings. Bun's fetch has no such cap today, but this
-    // borrows the lib's node:http client rather than depending on that.
-    const httpFetch = fetchImpl ?? lib.nodeHttpFetch ?? globalThis.fetch
-
+    // losing the findings.
+    const httpFetch = fetchImpl ?? lib.nodeHttpFetch
+    const connect = connectImpl ?? lib.connect
+    // Credentials and address afresh for every request.
+    const connectNow = () => connect({ fetchFn: httpFetch, read: readFile })
     const passive =
         typeof env?.REVIEW_ORCH_OPENCODE_PASSIVE === "string" &&
         env.REVIEW_ORCH_OPENCODE_PASSIVE.length > 0
-    const reviewTimeoutMs = config.fetchTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS
     const inFlight = new Set()
 
     const toast = async (message, variant) => {
@@ -237,12 +205,13 @@ const buildHooks = async ({
     const notifyChange = async (sessionID, tool, file) => {
         const cwd = await cwdFor(sessionID)
         if (!cwd) return
-        await postJson({
-            url: notifyUrlFrom(config.url),
-            token: config.token,
+        const conn = await connectNow()
+        if (!conn.ok) return
+        await conn.request({
+            method: "POST",
+            path: "/notify-change",
             body: { cwd, tool, file },
             timeoutMs: NOTIFY_TIMEOUT_MS,
-            fetchImpl: httpFetch,
         })
     }
 
@@ -256,14 +225,33 @@ const buildHooks = async ({
             const cwd = await cwdFor(sessionID)
             if (!cwd) return
 
+            const conn = await connectNow()
+            if (!conn.ok) {
+                logLine(`review-orchestrator: ${conn.reason}; skipping review.`)
+                return
+            }
+            if (conn.credentialsSource === "cache") {
+                logLine(
+                    `review-orchestrator: ${conn.configError}; using the cached hook credentials.`
+                )
+            }
             logLine("review-orchestrator: reviewing changes…")
-            const res = await postJson({
-                url: config.url,
-                token: config.token,
-                body: { cwd, session_id: sessionID, trigger: "stop_hook" },
-                timeoutMs: reviewTimeoutMs,
-                fetchImpl: httpFetch,
+            const body = { cwd, session_id: sessionID, trigger: "stop_hook" }
+            // The shared client retries a stale wait limit under one overall
+            // budget, like the Stop hooks, and waits as long as the running
+            // server publishes.
+            const posted = await lib.postReview({
+                conn,
+                requestBody: body,
+                limitMs:
+                    conn.server.hookTimeoutMs ??
+                    lib.resolveFetchTimeoutMs(conn.creds),
             })
+            const res = {
+                httpStatus: posted.httpStatus,
+                body: posted.body,
+                error: posted.fetchError,
+            }
             const decision = lib.decideStopHookResponse({
                 reviewResponse: res.body,
                 fetchHttpStatus: res.httpStatus,
@@ -342,9 +330,9 @@ const buildHooks = async ({
                 ...(cfg.mcp ?? {}),
                 review: {
                     type: "remote",
-                    url: mcpUrlFrom(config.url),
+                    url: `http://${lib.clientHostFromBind(found.creds.bind)}:${found.creds.port}/mcp`,
                     enabled: true,
-                    headers: { "X-Review-Token": config.token },
+                    headers: { "X-Review-Token": found.creds.token },
                 },
             }
         },

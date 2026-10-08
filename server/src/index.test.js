@@ -4,18 +4,38 @@
  */
 
 import { jest } from "@jest/globals"
-import { mkdtempSync, rmSync } from "node:fs"
+import { execFileSync } from "node:child_process"
+import { createHash } from "node:crypto"
+import http from "node:http"
+import {
+    existsSync,
+    mkdtempSync,
+    readFileSync,
+    realpathSync,
+    rmSync,
+    statSync,
+    writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
     createApp,
+    createServerInfo,
     startServer,
     gracefulShutdown,
     checkReviewerEnv,
-    summarizeStartup,
+    requestDeadline,
     VERSION,
 } from "./index.js"
+import { loadDefaultCore } from "./core-loader.js"
+import { DASHBOARD_API } from "./core/dashboard.js"
 import { createStateStore } from "./state.js"
+import {
+    challengeAt,
+    connect,
+    signedHeaders,
+} from "../../hooks/signed-client.mjs"
+import { rotateToken } from "../../install/rotate-token.mjs"
 
 const minimalConfig = (over = {}) => ({
     port: 0,
@@ -86,28 +106,98 @@ const makeStore = () => {
 
 const silentLog = { info: jest.fn(), error: jest.fn(), warn: jest.fn() }
 
+// A request signed the way hooks/signed-client.mjs signs it, for the
+// instance /healthz names. Resolves to the fetch Response.
+const signedFetch = async (
+    url,
+    route,
+    { method = "GET", body, token = "secret" } = {}
+) => {
+    const { instanceId } = await (await fetch(`${url}/healthz`)).json()
+    const text = body === undefined ? "" : JSON.stringify(body)
+    return fetch(`${url}${route}`, {
+        method,
+        headers: signedHeaders({
+            token,
+            method,
+            path: route,
+            text,
+            instanceId,
+        }),
+        body: text || undefined,
+    })
+}
+
+// A dashboard action as the page sends it: the token read from the page,
+// our own Origin, the page's API version and a JSON body.
+const dashboardFetch = async (
+    url,
+    route,
+    { method = "POST", body = {}, headers = {} } = {}
+) => {
+    const page = await (await fetch(`${url}/`)).text()
+    const csrf = page.match(/data-csrf="([^"]*)"/)[1]
+    return fetch(`${url}${route}`, {
+        method,
+        headers: {
+            "content-type": "application/json",
+            origin: url,
+            "x-dashboard-csrf": csrf,
+            "x-dashboard-api": String(DASHBOARD_API),
+            ...headers,
+        },
+        body: JSON.stringify(body),
+    })
+}
+
+// A config.json for servers started without the start() helper, so no
+// test ever reads the real one.
+const tempConfig = (config) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "index-config-"))
+    const configPath = path.join(dir, "config.json")
+    writeFileSync(configPath, JSON.stringify(config, null, 2))
+    return {
+        configPath,
+        cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    }
+}
+
+// Every server gets its own temp config.json, so a dashboard edit can
+// never reach the real ~/.config/review-orchestrator/config.json.
 const start = async (config, deps = happyDeps, providedStore = null) => {
     const store = providedStore ?? makeStore()
-    const r = await startServer({ config, store, deps, log: silentLog })
-    if (!r.ok) {
-        if (!providedStore)
+    const configDir = mkdtempSync(path.join(tmpdir(), "index-config-"))
+    const configPath = path.join(configDir, "config.json")
+    writeFileSync(configPath, JSON.stringify(config, null, 2))
+    const cleanup = () => {
+        rmSync(configDir, { recursive: true, force: true })
+        if (!providedStore) {
             rmSync(store.__dir, { recursive: true, force: true })
+        }
+    }
+    const r = await startServer({
+        config,
+        store,
+        deps,
+        log: silentLog,
+        configPath,
+    })
+    if (!r.ok) {
+        cleanup()
         throw r.error
     }
     return {
         server: r.server,
+        app: r.app,
         store,
+        configPath,
+        readConfigFile: () => JSON.parse(readFileSync(configPath, "utf8")),
         url: `http://127.0.0.1:${r.address.port}`,
         port: r.address.port,
         close: () =>
             new Promise((res) => {
                 r.server.close(() => {
-                    if (!providedStore) {
-                        rmSync(store.__dir, {
-                            recursive: true,
-                            force: true,
-                        })
-                    }
+                    cleanup()
                     res()
                 })
             }),
@@ -135,18 +225,75 @@ describe("startServer", () => {
                 port: first.port,
                 bind: "127.0.0.1",
             })
+            const temp = tempConfig(cfg)
             const result = await startServer({
                 config: cfg,
                 store: makeStore(),
                 deps: happyDeps,
                 log: silentLog,
+                configPath: temp.configPath,
             })
+            temp.cleanup()
             expect(result.ok).toBe(false)
             expect(result.error).toBeDefined()
             // Common codes: EADDRINUSE on macOS/Linux.
             expect(["EADDRINUSE", "EACCES"]).toContain(result.error.code)
         } finally {
             await first.close()
+        }
+    })
+})
+
+describe("startServer without injected capabilities", () => {
+    test("runs git and reviewers through the shell's own tools", async () => {
+        const repo = realpathSync(
+            mkdtempSync(path.join(tmpdir(), "index-git-"))
+        )
+        execFileSync("git", ["init", "-q", "-b", "main", repo])
+        const store = makeStore()
+        const config = minimalConfig({ allowedRoots: [repo] })
+        const temp = tempConfig(config)
+        const r = await startServer({
+            config,
+            store,
+            log: silentLog,
+            configPath: temp.configPath,
+        })
+        const url = `http://127.0.0.1:${r.address.port}`
+        try {
+            const post = (route) =>
+                signedFetch(url, route, { method: "POST", body: { cwd: repo } })
+            const reset = await post("/reset")
+            expect(reset.status).toBe(200)
+            expect((await reset.json()).context.branch).toBe("main")
+            expect((await post("/notify-change")).status).toBe(200)
+            // Reviewers run only with a config the shell pinned to an
+            // admitted review, and never as a Node executable.
+            const { spawnTool } = r.app.locals.live.deps
+            expect(() =>
+                spawnTool("codex", [], { config: { codex: {} } })
+            ).toThrow(
+                expect.objectContaining({ code: "TOOL_CONFIG_NOT_ISSUED" })
+            )
+            const ticket = await r.app.locals.reloads.admitReview()
+            try {
+                const nodeConfig = {
+                    ...ticket.config,
+                    codex: { binary: process.execPath },
+                }
+                expect(() =>
+                    spawnTool("codex", [], { config: nodeConfig })
+                ).toThrow(
+                    expect.objectContaining({ code: "TOOL_CONFIG_NOT_ISSUED" })
+                )
+            } finally {
+                ticket.release()
+            }
+        } finally {
+            await new Promise((done) => r.server.close(done))
+            rmSync(store.__dir, { recursive: true, force: true })
+            rmSync(repo, { recursive: true, force: true })
+            temp.cleanup()
         }
     })
 })
@@ -180,49 +327,95 @@ describe("createApp wiring", () => {
         }
     })
 
-    test("PUT /dashboard/provider switches in-memory without a token (v0.1.35)", async () => {
-        // Inject a fake fs so handleSetProvider's persistence step
-        // doesn't touch the real ~/.config/review-orchestrator/config.json
-        // when the test exercises the endpoint.
-        let writtenJson = null
-        const fakeFs = {
-            readFileSync: () =>
-                JSON.stringify({ reviewer: { provider: "codex" } }),
-            writeFileSync: (_p, data) => {
-                writtenJson = data
+    test("/inflight reads the shell-owned registry the caller injected", async () => {
+        const inflightMeta = new Map([
+            [
+                "k",
+                {
+                    contextKey: "/repo|main",
+                    repo: "repo",
+                    branch: "main",
+                    provider: "codex",
+                    force: false,
+                    startedAt: Date.now(),
+                },
+            ],
+        ])
+        const { url, close } = await start(minimalConfig(), {
+            ...happyDeps,
+            inflightMeta,
+        })
+        try {
+            const body = await (await fetch(`${url}/inflight`)).json()
+            expect(body.inFlight).toEqual([
+                expect.objectContaining({ contextKey: "/repo|main" }),
+            ])
+        } finally {
+            await close()
+        }
+    })
+
+    test("each app gets its own in-flight registries by default", async () => {
+        let release
+        let started
+        const running = new Promise((r) => {
+            started = r
+        })
+        const blockingDeps = {
+            ...happyDeps,
+            runAndParse: async (...args) => {
+                started()
+                await new Promise((r) => {
+                    release = r
+                })
+                return happyDeps.runAndParse(...args)
             },
         }
-        const cfg = minimalConfig({ reviewer: { provider: "codex" } })
-        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+        const a = await start(minimalConfig(), blockingDeps)
+        const b = await start(minimalConfig(), happyDeps)
         try {
-            expect(cfg.reviewer?.provider).toBe("codex")
-            const r = await fetch(`${url}/dashboard/provider`, {
+            const review = signedFetch(a.url, "/review", {
+                method: "POST",
+                body: { cwd: "/repo" },
+            })
+            await running
+            const inA = await (await fetch(`${a.url}/inflight`)).json()
+            const inB = await (await fetch(`${b.url}/inflight`)).json()
+            expect(inA.inFlight).toHaveLength(1)
+            expect(inB.inFlight).toEqual([])
+            release()
+            expect((await review).status).toBe(200)
+        } finally {
+            await a.close()
+            await b.close()
+        }
+    })
+
+    test("PUT /dashboard/provider switches the live config and the file without a token (v0.1.35)", async () => {
+        const cfg = minimalConfig({ reviewer: { provider: "codex" } })
+        const { url, app, readConfigFile, close } = await start(cfg)
+        try {
+            const r = await dashboardFetch(url, "/dashboard/provider", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ provider: "gemini" }),
+                body: { provider: "gemini" },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
             expect(body.ok).toBe(true)
             expect(body.provider).toBe("gemini")
-            expect(cfg.reviewer.provider).toBe("gemini")
-            // Persistence wrote through the fake fs, not the real file.
-            expect(writtenJson).toMatch(/"provider": "gemini"/)
+            expect(app.locals.live.config.reviewer.provider).toBe("gemini")
+            expect(readConfigFile().reviewer.provider).toBe("gemini")
         } finally {
             await close()
         }
     })
 
     test("PUT /dashboard/provider rejects an unknown provider with 400", async () => {
-        const { url, close } = await start(minimalConfig(), {
-            ...happyDeps,
-            fs: { readFileSync: () => "{}", writeFileSync: () => {} },
-        })
+        const { url, close } = await start(minimalConfig())
         try {
-            const r = await fetch(`${url}/dashboard/provider`, {
+            const r = await dashboardFetch(url, "/dashboard/provider", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ provider: "bogus" }),
+                body: { provider: "bogus" },
             })
             expect(r.status).toBe(400)
             const body = await r.json()
@@ -233,24 +426,12 @@ describe("createApp wiring", () => {
     })
 
     test("PUT /dashboard/reviewer-preset updates the active provider's model and effort", async () => {
-        let writtenJson = null
-        const fakeFs = {
-            readFileSync: () =>
-                JSON.stringify({
-                    codex: { model: "gpt-6.1-sol", reasoningEffort: "high" },
-                    reviewer: { provider: "codex" },
-                }),
-            writeFileSync: (_p, data) => {
-                writtenJson = data
-            },
-        }
         const cfg = minimalConfig({ reviewer: { provider: "codex" } })
-        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+        const { url, app, readConfigFile, close } = await start(cfg)
         try {
-            const r = await fetch(`${url}/dashboard/reviewer-preset`, {
+            const r = await dashboardFetch(url, "/dashboard/reviewer-preset", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ preset: "gpt-6-astra:medium" }),
+                body: { preset: "gpt-6-astra:medium" },
             })
             expect(r.status).toBe(200)
             expect(await r.json()).toMatchObject({
@@ -258,55 +439,44 @@ describe("createApp wiring", () => {
                 model: "gpt-6-astra",
                 effortOrMode: "medium",
             })
-            expect(cfg.codex).toMatchObject({
-                model: "gpt-6-astra",
-                reasoningEffort: "medium",
-            })
-            expect(writtenJson).toMatch(/"reasoningEffort": "medium"/)
+            for (const config of [app.locals.live.config, readConfigFile()]) {
+                expect(config.codex).toMatchObject({
+                    model: "gpt-6-astra",
+                    reasoningEffort: "medium",
+                })
+            }
         } finally {
             await close()
         }
     })
 
-    test("PUT /dashboard/max-rounds switches in-memory and persists (v1.1.8)", async () => {
-        let writtenJson = null
-        const fakeFs = {
-            readFileSync: () =>
-                JSON.stringify({ limits: { maxCodexRounds: 5 } }),
-            writeFileSync: (_p, data) => {
-                writtenJson = data
-            },
-        }
-        const cfg = minimalConfig({ limits: { maxCodexRounds: 5 } })
-        const { url, close } = await start(cfg, { ...happyDeps, fs: fakeFs })
+    test("PUT /dashboard/max-rounds switches the live config and the file (v1.1.8)", async () => {
+        const cfg = minimalConfig()
+        cfg.limits.maxCodexRounds = 5
+        const { url, app, readConfigFile, close } = await start(cfg)
         try {
-            const r = await fetch(`${url}/dashboard/max-rounds`, {
+            const r = await dashboardFetch(url, "/dashboard/max-rounds", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ value: 8 }),
+                body: { value: 8 },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
             expect(body.ok).toBe(true)
             expect(body.value).toBe(8)
             expect(body.previous).toBe(5)
-            expect(cfg.limits.maxCodexRounds).toBe(8)
-            expect(writtenJson).toMatch(/"maxCodexRounds": 8/)
+            expect(app.locals.live.config.limits.maxCodexRounds).toBe(8)
+            expect(readConfigFile().limits.maxCodexRounds).toBe(8)
         } finally {
             await close()
         }
     })
 
     test("PUT /dashboard/max-rounds rejects out-of-range with 400", async () => {
-        const { url, close } = await start(minimalConfig(), {
-            ...happyDeps,
-            fs: { readFileSync: () => "{}", writeFileSync: () => {} },
-        })
+        const { url, close } = await start(minimalConfig())
         try {
-            const r = await fetch(`${url}/dashboard/max-rounds`, {
+            const r = await dashboardFetch(url, "/dashboard/max-rounds", {
                 method: "PUT",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ value: 0 }),
+                body: { value: 0 },
             })
             expect(r.status).toBe(400)
             const body = await r.json()
@@ -338,10 +508,9 @@ describe("createApp wiring", () => {
                 blockCount: 3,
                 lastReviewedAt: 1,
             })
-            const r = await fetch(`${url}/dashboard/reset`, {
+            const r = await dashboardFetch(url, "/dashboard/reset", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ contextKey: "/repo|feature" }),
+                body: { contextKey: "/repo|feature" },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
@@ -365,10 +534,9 @@ describe("createApp wiring", () => {
     test("POST /dashboard/reset rejects missing contextKey with 400", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/dashboard/reset`, {
+            const r = await dashboardFetch(url, "/dashboard/reset", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({}),
+                body: {},
             })
             expect(r.status).toBe(400)
         } finally {
@@ -395,43 +563,6 @@ describe("createApp wiring", () => {
         }
     })
 
-    test("loopbackOnly: allows 127.0.0.1, ::1, ::ffff:127.0.0.1; rejects others 403", async () => {
-        const { loopbackOnly } = await import("./index.js")
-        const mkReq = (ip) => ({ ip, socket: { remoteAddress: ip } })
-        const mkRes = () => {
-            const res = { statusCode: 0, body: null }
-            res.status = (c) => {
-                res.statusCode = c
-                return res
-            }
-            res.json = (b) => {
-                res.body = b
-                return res
-            }
-            return res
-        }
-        for (const ip of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
-            const res = mkRes()
-            let nexted = false
-            loopbackOnly(mkReq(ip), res, () => {
-                nexted = true
-            })
-            expect(nexted).toBe(true)
-            expect(res.statusCode).toBe(0)
-        }
-        for (const ip of ["10.0.0.1", "192.168.1.5", "::ffff:10.0.0.1", ""]) {
-            const res = mkRes()
-            let nexted = false
-            loopbackOnly(mkReq(ip), res, () => {
-                nexted = true
-            })
-            expect(nexted).toBe(false)
-            expect(res.statusCode).toBe(403)
-            expect(res.body.ok).toBe(false)
-            expect(res.body.error).toMatch(/loopback only/i)
-        }
-    })
-
     test("POST /dashboard/exclusions adds + removes per context (v1.1)", async () => {
         const { url, store, close } = await start(minimalConfig(), happyDeps)
         try {
@@ -440,28 +571,26 @@ describe("createApp wiring", () => {
                 branch: "main",
                 lastReviewedAt: 1,
             })
-            const add = await fetch(`${url}/dashboard/exclusions`, {
+            const add = await dashboardFetch(url, "/dashboard/exclusions", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
+                body: {
                     contextKey: "/r|main",
                     file: "a.js",
                     message: "noise",
                     action: "add",
-                }),
+                },
             })
             expect(add.status).toBe(200)
             const addBody = await add.json()
             expect(addBody.exclusions).toHaveLength(1)
-            const remove = await fetch(`${url}/dashboard/exclusions`, {
+            const remove = await dashboardFetch(url, "/dashboard/exclusions", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
+                body: {
                     contextKey: "/r|main",
                     file: "a.js",
                     message: "noise",
                     action: "remove",
-                }),
+                },
             })
             expect(remove.status).toBe(200)
             const rmBody = await remove.json()
@@ -474,15 +603,14 @@ describe("createApp wiring", () => {
     test("POST /dashboard/exclusions rejects an unknown context with 404", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/dashboard/exclusions`, {
+            const r = await dashboardFetch(url, "/dashboard/exclusions", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
+                body: {
                     contextKey: "/nope|x",
                     file: "a",
                     message: "m",
                     action: "add",
-                }),
+                },
             })
             expect(r.status).toBe(404)
         } finally {
@@ -493,10 +621,9 @@ describe("createApp wiring", () => {
     test("POST /dashboard/reset rejects an unknown contextKey with 404", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/dashboard/reset`, {
+            const r = await dashboardFetch(url, "/dashboard/reset", {
                 method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ contextKey: "/nope|x" }),
+                body: { contextKey: "/nope|x" },
             })
             expect(r.status).toBe(404)
         } finally {
@@ -504,7 +631,7 @@ describe("createApp wiring", () => {
         }
     })
 
-    test("/review rejects with 401 when token is missing", async () => {
+    test("/review rejects an unsigned request with 401", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
             const r = await fetch(`${url}/review`, {
@@ -514,24 +641,32 @@ describe("createApp wiring", () => {
             })
             expect(r.status).toBe(401)
             const body = await r.json()
-            expect(body.code).toBe("UNAUTHORIZED")
+            expect(body.code).toBe("UNSIGNED_REQUEST")
         } finally {
             await close()
         }
     })
 
-    test("/review rejects with 401 when token is wrong", async () => {
+    test("/review rejects a request signed with the wrong token, or carrying X-Review-Token", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/review`, {
+            const r = await signedFetch(url, "/review", {
+                method: "POST",
+                body: { cwd: "/repo" },
+                token: "nope",
+            })
+            expect(r.status).toBe(401)
+            expect((await r.json()).code).toBe("BAD_SIGNATURE")
+            const raw = await fetch(`${url}/review`, {
                 method: "POST",
                 headers: {
                     "content-type": "application/json",
-                    "x-review-token": "nope",
+                    "x-review-token": "secret",
                 },
                 body: JSON.stringify({ cwd: "/repo" }),
             })
-            expect(r.status).toBe(401)
+            expect(raw.status).toBe(401)
+            expect((await raw.json()).code).toBe("TOKEN_NOT_ACCEPTED")
         } finally {
             await close()
         }
@@ -547,13 +682,9 @@ describe("createApp wiring", () => {
                 codexRounds: 3,
                 lastReviewedAt: 1,
             })
-            const r = await fetch(`${url}/reset`, {
+            const r = await signedFetch(url, "/reset", {
                 method: "POST",
-                headers: {
-                    "content-type": "application/json",
-                    "x-review-token": "secret",
-                },
-                body: JSON.stringify({ cwd: "/repo" }),
+                body: { cwd: "/repo" },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
@@ -567,13 +698,9 @@ describe("createApp wiring", () => {
     test("/review with valid token returns the envelope", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/review`, {
+            const r = await signedFetch(url, "/review", {
                 method: "POST",
-                headers: {
-                    "content-type": "application/json",
-                    "x-review-token": "secret",
-                },
-                body: JSON.stringify({ cwd: "/repo" }),
+                body: { cwd: "/repo" },
             })
             expect(r.status).toBe(200)
             const body = await r.json()
@@ -735,16 +862,25 @@ describe("gracefulShutdown", () => {
 })
 
 describe("MCP closeAllSessions integration via createApp", () => {
-    test("createApp exposes mcp.closeAllSessions on app.locals", () => {
+    test("createApp exposes mcp.closeAllSessions on app.locals", async () => {
         const store = createStateStore({ filePath: null, now: () => 0 })
+        const config = minimalConfig()
+        const temp = tempConfig(config)
         const app = createApp({
-            config: minimalConfig(),
+            config,
             store,
             archive: null,
             logger: silentLog,
             deps: happyDeps,
+            configPath: temp.configPath,
+            core: await loadDefaultCore({
+                config,
+                shellVersion: VERSION,
+                startedAt: 0,
+            }),
         })
         expect(typeof app.locals?.mcp?.closeAllSessions).toBe("function")
+        temp.cleanup()
     })
 })
 
@@ -860,108 +996,103 @@ describe("checkReviewerEnv", () => {
     })
 })
 
-describe("VERSION + summarizeStartup", () => {
+describe("VERSION", () => {
     test("VERSION is a non-empty semver-ish string read from package.json", () => {
         expect(typeof VERSION).toBe("string")
         expect(VERSION.length).toBeGreaterThan(0)
         // Should match major.minor.patch (allowing pre-release suffix).
         expect(VERSION).toMatch(/^\d+\.\d+\.\d+(-.+)?$/)
     })
+})
 
-    test("summarizeStartup picks codex sub-config and effort", () => {
-        const cfg = {
-            port: 7777,
-            bind: "127.0.0.1",
-            reviewer: { provider: "codex" },
-            codex: { model: "gpt-5.5", reasoningEffort: "high" },
-            limits: {
-                codexTimeoutSeconds: 240,
-                maxCodexRounds: 5,
-                maxBlocks: 6,
-            },
-            allowedRoots: ["/r"],
-            blockingSeverities: ["blocker", "major"],
-        }
-        const s = summarizeStartup(cfg, "0.1.0")
-        expect(s.version).toBe("0.1.0")
-        expect(s.provider).toBe("codex")
-        expect(s.model).toBe("gpt-5.5")
-        expect(s.effortOrMode).toBe("high")
-        expect(s.reviewerTimeoutSeconds).toBe(240)
-        expect(s.maxCodexRounds).toBe(5)
-        expect(s.allowedRootsCount).toBe(1)
-    })
-
-    test("summarizeStartup picks claude sub-config and effort", () => {
-        const cfg = {
-            port: 7777,
-            reviewer: {
-                provider: "claude",
-                claude: {
-                    model: "claude-opus-4-7",
-                    effort: "medium",
-                    timeoutSeconds: 600,
-                },
-            },
-            limits: { codexTimeoutSeconds: 240 },
-        }
-        const s = summarizeStartup(cfg, "0.1.0")
-        expect(s.provider).toBe("claude")
-        expect(s.model).toBe("claude-opus-4-7")
-        expect(s.effortOrMode).toBe("medium")
-        // claude's timeoutSeconds wins over the codex fallback.
-        expect(s.reviewerTimeoutSeconds).toBe(600)
-    })
-
-    test("summarizeStartup picks gemini sub-config and approvalMode", () => {
-        const cfg = {
-            port: 7777,
-            reviewer: {
-                provider: "gemini",
-                gemini: {
-                    model: "auto",
-                    approvalMode: "plan",
-                    timeoutSeconds: 600,
-                },
-            },
-            limits: { codexTimeoutSeconds: 240 },
-        }
-        const s = summarizeStartup(cfg, "0.1.0")
-        expect(s.provider).toBe("gemini")
-        expect(s.model).toBe("auto")
-        expect(s.effortOrMode).toBe("plan")
-        expect(s.reviewerTimeoutSeconds).toBe(600)
-    })
-
-    test("summarizeStartup surfaces hookFetchTimeoutSeconds=null when auto-derive is in effect", () => {
-        const s = summarizeStartup({
-            reviewer: { provider: "gemini", gemini: { model: "auto" } },
-            hook: { fetchTimeoutSeconds: null },
-            limits: { codexTimeoutSeconds: 240 },
+describe("/review — the limit handshake and request deadline", () => {
+    const post = (url, body) =>
+        signedFetch(url, "/review", {
+            method: "POST",
+            body: { cwd: "/repo", ...body },
         })
-        // null is the documented "auto-derive in stop-review.mjs" signal —
-        // we surface it verbatim rather than recomputing the derived
-        // number here (which would drift if the derivation changes).
-        expect(s.hookFetchTimeoutSeconds).toBeNull()
+    const withSpy = () => {
+        const runAndParse = jest.fn(happyDeps.runAndParse)
+        return { deps: { ...happyDeps, runAndParse }, runAndParse }
+    }
+
+    test("an unchanged-config hook limit passes at once", async () => {
+        const { deps, runAndParse } = withSpy()
+        const { url, close } = await start(minimalConfig(), deps)
+        try {
+            // codexTimeoutSeconds 240 → the hooks wait 300 s.
+            const r = await post(url, {
+                trigger: "stop_hook",
+                timeoutMs: 300_000,
+            })
+            expect(r.status).toBe(200)
+            expect((await r.json()).status).toBe("GOOD_TO_GO")
+            expect(runAndParse).toHaveBeenCalledTimes(1)
+        } finally {
+            await close()
+        }
     })
 
-    test("summarizeStartup surfaces a pinned hookFetchTimeoutSeconds", () => {
-        const s = summarizeStartup({
-            reviewer: { provider: "gemini", gemini: { model: "auto" } },
-            hook: { fetchTimeoutSeconds: 800 },
-            limits: { codexTimeoutSeconds: 240 },
-        })
-        expect(s.hookFetchTimeoutSeconds).toBe(800)
+    test("a limit too short for the pinned config is answered 409 HOOK_LIMIT_STALE before any work", async () => {
+        const { deps, runAndParse } = withSpy()
+        const { url, close } = await start(minimalConfig(), deps)
+        try {
+            const r = await post(url, {
+                trigger: "stop_hook",
+                timeoutMs: 60_000,
+            })
+            expect(r.status).toBe(409)
+            expect(await r.json()).toMatchObject({
+                status: "ESCALATE",
+                code: "HOOK_LIMIT_STALE",
+                hookTimeoutMs: 300_000,
+                notifyUser: false,
+            })
+            expect(runAndParse).not.toHaveBeenCalled()
+            // A final attempt is never answered with a 409.
+            const last = await post(url, {
+                trigger: "stop_hook",
+                timeoutMs: 60_000,
+                finalAttempt: true,
+            })
+            expect(last.status).toBe(200)
+            expect(runAndParse).toHaveBeenCalledTimes(1)
+        } finally {
+            await close()
+        }
     })
 
-    test("summarizeStartup defaults provider to codex when reviewer block is absent", () => {
-        const s = summarizeStartup({
-            port: 7777,
-            codex: { model: "gpt-5.5", reasoningEffort: "high" },
-            limits: { codexTimeoutSeconds: 240 },
-        })
-        expect(s.provider).toBe("codex")
-        expect(s.model).toBe("gpt-5.5")
+    test("a pinned hook.fetchTimeoutSeconds shorter than the reviewer timeout is respected", async () => {
+        const { deps } = withSpy()
+        const { url, close } = await start(
+            minimalConfig({ hook: { fetchTimeoutSeconds: 90 } }),
+            deps
+        )
+        try {
+            const r = await post(url, {
+                trigger: "stop_hook",
+                timeoutMs: 90_000,
+            })
+            expect(r.status).toBe(200)
+        } finally {
+            await close()
+        }
+    })
+
+    test("MCP-style requests without timeoutMs skip the handshake", async () => {
+        const { deps } = withSpy()
+        const { url, close } = await start(minimalConfig(), deps)
+        try {
+            expect((await post(url, { trigger: "mcp_tool" })).status).toBe(200)
+        } finally {
+            await close()
+        }
+    })
+
+    test("the deadline keeps a response margin of min(5 s, limit / 10)", () => {
+        expect(requestDeadline(1000, null)).toBeNull()
+        expect(requestDeadline(0, 3000)).toBe(2700)
+        expect(requestDeadline(0, 600_000)).toBe(595_000)
     })
 })
 
@@ -969,9 +1100,7 @@ describe("/status surfaces the version", () => {
     test("/status response body has a top-level version string", async () => {
         const { url, close } = await start(minimalConfig(), happyDeps)
         try {
-            const r = await fetch(`${url}/status`, {
-                headers: { "x-review-token": "secret" },
-            })
+            const r = await signedFetch(url, "/status")
             expect(r.status).toBe(200)
             const body = await r.json()
             expect(typeof body.version).toBe("string")
@@ -1008,6 +1137,582 @@ describe("GET / dashboard route", () => {
             expect(body).not.toContain("secret")
         } finally {
             await close()
+        }
+    })
+})
+
+describe("hook connection: challenge, server.json, credentials, rotation", () => {
+    const startWithFiles = async (config = minimalConfig()) => {
+        const dir = mkdtempSync(path.join(tmpdir(), "index-conn-"))
+        const configPath = path.join(dir, "config.json")
+        const credentialsPath = path.join(dir, "cache", "hook-credentials.json")
+        const serverInfoPath = path.join(dir, "cache", "server.json")
+        writeFileSync(configPath, JSON.stringify(config, null, 2))
+        const store = makeStore()
+        const r = await startServer({
+            config,
+            store,
+            deps: happyDeps,
+            log: silentLog,
+            configPath,
+            credentialsPath,
+            serverInfoPath,
+        })
+        if (!r.ok) throw r.error
+        const paths = { configPath, credentialsPath, serverInfoPath }
+        return {
+            ...paths,
+            app: r.app,
+            url: `http://127.0.0.1:${r.address.port}`,
+            port: r.address.port,
+            connectNow: () =>
+                connect({
+                    ...paths,
+                    sleep: async () => {},
+                }),
+            close: () =>
+                new Promise((done) =>
+                    r.server.close(() => {
+                        rmSync(dir, { recursive: true, force: true })
+                        rmSync(store.__dir, { recursive: true, force: true })
+                        done()
+                    })
+                ),
+        }
+    }
+    const until = async (check) => {
+        for (let i = 0; i < 100 && !check(); i++) {
+            await new Promise((r) => setTimeout(r, 10))
+        }
+        return check()
+    }
+
+    test("/healthz names the service and instance, and proves the token on a challenge", async () => {
+        const s = await startWithFiles()
+        try {
+            const plain = await (await fetch(`${s.url}/healthz`)).json()
+            expect(plain).toMatchObject({
+                ok: true,
+                service: "review-orchestrator",
+                instanceId: s.app.locals.instanceId,
+            })
+            const bad = await fetch(`${s.url}/healthz?challenge=short`)
+            expect(bad.status).toBe(400)
+            await expect(
+                challengeAt({ baseUrl: s.url, token: "secret" })
+            ).resolves.toEqual({
+                ok: true,
+                instanceId: s.app.locals.instanceId,
+            })
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("server.json carries the live address and wait; hook-credentials.json is written at startup", async () => {
+        const s = await startWithFiles()
+        try {
+            const info = JSON.parse(readFileSync(s.serverInfoPath, "utf8"))
+            expect(info).toMatchObject({
+                pid: process.pid,
+                port: s.port,
+                bind: "127.0.0.1",
+                instanceId: s.app.locals.instanceId,
+                // codexTimeoutSeconds 240, claude/gemini defaults 600 → 660 s
+                hookTimeoutMs: 660_000,
+            })
+            expect(statSync(s.serverInfoPath).mode & 0o777).toBe(0o600)
+            expect(await until(() => existsSync(s.credentialsPath))).toBe(true)
+            expect(
+                JSON.parse(readFileSync(s.credentialsPath, "utf8"))
+            ).toMatchObject({ token: "secret", port: 0 })
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("a config transaction (what dashboard edits run) that changes the wait rewrites server.json", async () => {
+        const s = await startWithFiles()
+        try {
+            await s.app.locals.configStore.mutate([
+                [["limits", "codexTimeoutSeconds"], 900],
+            ])
+            const info = JSON.parse(readFileSync(s.serverInfoPath, "utf8"))
+            expect(info.hookTimeoutMs).toBe(960_000)
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("a hook-style client picks server.json's address and gets verified answers; /status reports the auth state", async () => {
+        const s = await startWithFiles()
+        try {
+            const conn = await s.connectNow()
+            expect(conn).toMatchObject({
+                ok: true,
+                credentialsSource: "config",
+            })
+            expect(conn.server).toMatchObject({
+                source: "server.json",
+                hookTimeoutMs: 660_000,
+            })
+            const status = await conn.request({
+                method: "GET",
+                path: "/status",
+                timeoutMs: 5000,
+            })
+            expect(status.httpStatus).toBe(200)
+            expect(status.body.auth).toEqual({
+                currentTokenHash: createHash("sha256")
+                    .update("secret")
+                    .digest("hex"),
+                previousTokenGrace: null,
+            })
+            expect(status.body.instanceId).toBe(s.app.locals.instanceId)
+            const review = await conn.request({
+                method: "POST",
+                path: "/review",
+                body: {
+                    cwd: "/repo",
+                    trigger: "stop_hook",
+                    timeoutMs: 660_000,
+                },
+                timeoutMs: 10_000,
+            })
+            expect(review).toMatchObject({
+                httpStatus: 200,
+                body: { status: "GOOD_TO_GO" },
+            })
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("a rotation: the new token works at once, the old one only in its grace, and --revoke-now ends it", async () => {
+        const s = await startWithFiles()
+        try {
+            const old = await s.connectNow()
+            const rotated = await rotateToken({
+                configPath: s.configPath,
+                credentialsPath: s.credentialsPath,
+            })
+            // The old token, signed: still accepted, in grace.
+            const inGrace = await old.request({
+                method: "GET",
+                path: "/status",
+                timeoutMs: 5000,
+            })
+            expect(inGrace.httpStatus).toBe(200)
+            expect(inGrace.body.auth.previousTokenGrace).toMatchObject({
+                tokenHash: createHash("sha256").update("secret").digest("hex"),
+            })
+            // The new token, through the credentials the rotation wrote.
+            const fresh = await s.connectNow()
+            expect(fresh.creds.token).toBe(rotated.token)
+            expect(
+                (
+                    await fresh.request({
+                        method: "GET",
+                        path: "/status",
+                        timeoutMs: 5000,
+                    })
+                ).httpStatus
+            ).toBe(200)
+            // MCP keeps working on the old token during the grace.
+            const mcp = await fetch(`${s.url}/mcp`, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    accept: "application/json, text/event-stream",
+                    "x-review-token": "secret",
+                },
+                body: "{}",
+            })
+            expect(mcp.status).not.toBe(401)
+            await rotateToken({
+                configPath: s.configPath,
+                credentialsPath: s.credentialsPath,
+                revokeNow: true,
+            })
+            const refused = await fresh.request({
+                method: "GET",
+                path: "/status",
+                timeoutMs: 5000,
+            })
+            expect(refused.fetchError).toMatch(/HTTP 401 BAD_SIGNATURE/)
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("a hand-edited token is noticed on the next request and the hooks' credentials cache follows it", async () => {
+        const s = await startWithFiles()
+        try {
+            const cfg = JSON.parse(readFileSync(s.configPath, "utf8"))
+            cfg.authToken = "hand-edited"
+            writeFileSync(s.configPath, JSON.stringify(cfg))
+            const conn = await s.connectNow()
+            expect(conn.creds.token).toBe("hand-edited")
+            expect(
+                (
+                    await conn.request({
+                        method: "GET",
+                        path: "/status",
+                        timeoutMs: 5000,
+                    })
+                ).httpStatus
+            ).toBe(200)
+            const cached = () =>
+                JSON.parse(readFileSync(s.credentialsPath, "utf8")).token
+            for (let i = 0; i < 100 && cached() !== "hand-edited"; i++) {
+                await new Promise((r) => setTimeout(r, 10))
+            }
+            expect(cached()).toBe("hand-edited")
+        } finally {
+            await s.close()
+        }
+    })
+
+    test("server.json republishes the hook wait when a reload becomes pending and again when it applies", async () => {
+        const s = await startWithFiles()
+        try {
+            const wait = () =>
+                JSON.parse(readFileSync(s.serverInfoPath, "utf8")).hookTimeoutMs
+            expect(wait()).toBe(660_000)
+            const ticket = await s.app.locals.reloads.admitReview()
+            const cfg = JSON.parse(readFileSync(s.configPath, "utf8"))
+            cfg.reviewer = {
+                ...(cfg.reviewer ?? {}),
+                claude: { timeoutSeconds: 900 },
+            }
+            writeFileSync(s.configPath, JSON.stringify(cfg))
+            const r = await s.app.locals.reloads.trigger()
+            expect(r).toMatchObject({ scheduled: true })
+            // The larger wait plus the 45 s hold allowance.
+            expect(wait()).toBe(960_000 + 45_000)
+            ticket.release()
+            for (let i = 0; i < 100 && wait() !== 960_000; i++) {
+                await new Promise((res) => setTimeout(res, 10))
+            }
+            expect(wait()).toBe(960_000)
+        } finally {
+            await s.close()
+        }
+    })
+})
+
+describe("createServerInfo", () => {
+    const make = (over = {}) => {
+        const dir = mkdtempSync(path.join(tmpdir(), "server-info-"))
+        const file = path.join(dir, "server.json")
+        let wait = 1000
+        const info = createServerInfo({
+            path: file,
+            instanceId: "inst-1",
+            startedAt: 0,
+            hookTimeoutMs: () => wait,
+            logger: silentLog,
+            pid: 42,
+            ...over,
+        })
+        return {
+            info,
+            file,
+            setWait: (ms) => {
+                wait = ms
+            },
+            cleanup: () => rmSync(dir, { recursive: true, force: true }),
+        }
+    }
+
+    test("writes once it has an address, again only when something changed, and removes only its own file", () => {
+        const t = make()
+        try {
+            expect(t.info.refresh()).toBe(false)
+            expect(
+                t.info.setAddress({ port: 7777, address: "127.0.0.1" })
+            ).toBe(true)
+            expect(JSON.parse(readFileSync(t.file, "utf8"))).toEqual({
+                pid: 42,
+                port: 7777,
+                bind: "127.0.0.1",
+                startedAt: "1970-01-01T00:00:00.000Z",
+                instanceId: "inst-1",
+                hookTimeoutMs: 1000,
+            })
+            expect(t.info.refresh()).toBe(false)
+            t.setWait(2000)
+            expect(t.info.refresh()).toBe(true)
+            writeFileSync(t.file, JSON.stringify({ instanceId: "newer" }))
+            expect(t.info.remove()).toBe(false)
+            expect(existsSync(t.file)).toBe(true)
+            t.info.setAddress({ port: 7778, address: "127.0.0.1" })
+            expect(t.info.remove()).toBe(true)
+            expect(existsSync(t.file)).toBe(false)
+            expect(t.info.remove()).toBe(false)
+        } finally {
+            t.cleanup()
+        }
+    })
+
+    test("without a path it writes nothing; a failed write is logged", () => {
+        const none = createServerInfo({
+            path: null,
+            instanceId: "i",
+            startedAt: 0,
+            hookTimeoutMs: () => 1,
+        })
+        expect(none.setAddress({ port: 1, address: "x" })).toBe(false)
+        expect(none.remove()).toBe(false)
+        const warn = jest.fn()
+        const t = make({
+            write: () => {
+                throw new Error("EROFS")
+            },
+            logger: { warn },
+        })
+        try {
+            expect(t.info.setAddress({ port: 1, address: "x" })).toBe(false)
+            expect(warn).toHaveBeenCalledWith(
+                { err: "EROFS" },
+                "failed to write server.json"
+            )
+            expect(t.info.remove()).toBe(false)
+        } finally {
+            t.cleanup()
+        }
+    })
+})
+
+describe("dashboard safety and reload controls over HTTP (§5.8)", () => {
+    // fetch can't set Host; node:http can.
+    const rawGet = (url, path, headers) =>
+        new Promise((resolve, reject) => {
+            const u = new URL(url)
+            const req = http.request(
+                {
+                    hostname: u.hostname,
+                    port: u.port,
+                    path,
+                    method: "GET",
+                    headers,
+                },
+                (res) => {
+                    let body = ""
+                    res.on("data", (c) => (body += c))
+                    res.on("end", () =>
+                        resolve({ status: res.statusCode, body })
+                    )
+                }
+            )
+            req.on("error", reject)
+            req.end()
+        })
+
+    test("a request naming another host (DNS rebinding) gets 421 on every route", async () => {
+        const { url, close } = await start(minimalConfig())
+        try {
+            for (const path of ["/", "/healthz", "/inflight", "/status"]) {
+                const r = await rawGet(url, path, {
+                    host: `evil.example:${new URL(url).port}`,
+                })
+                expect(r.status).toBe(421)
+                expect(JSON.parse(r.body).code).toBe("HOST_NOT_ALLOWED")
+            }
+            const ok = await rawGet(url, "/healthz", {
+                host: `localhost:${new URL(url).port}`,
+            })
+            expect(ok.status).toBe(200)
+        } finally {
+            await close()
+        }
+    })
+
+    test("the page can't be framed and embeds this start's token and versions", async () => {
+        const { url, app, close } = await start(minimalConfig())
+        try {
+            const r = await fetch(`${url}/`)
+            expect(r.headers.get("x-frame-options")).toBe("DENY")
+            expect(r.headers.get("content-security-policy")).toBe(
+                "frame-ancestors 'none'"
+            )
+            const html = await r.text()
+            expect(html).toContain(`data-csrf="${app.locals.dashboardCsrf}"`)
+            const { coreVersion } = await (
+                await fetch(`${url}/inflight`)
+            ).json()
+            expect(coreVersion).toMatch(/^[0-9a-f]{16}$/)
+            expect(html).toContain(`data-core-version="${coreVersion}"`)
+            expect(html).toContain('data-reload-action="reload"')
+        } finally {
+            await close()
+        }
+    })
+
+    test("an action without the page's token, from another origin, or not JSON is refused", async () => {
+        const { url, app, close } = await start(minimalConfig())
+        try {
+            const put = (headers, body = '{"value":7}') =>
+                fetch(`${url}/dashboard/max-rounds`, {
+                    method: "PUT",
+                    headers,
+                    body,
+                })
+            const csrf = app.locals.dashboardCsrf
+            let r = await put({
+                "content-type": "application/json",
+                origin: url,
+            })
+            expect(r.status).toBe(403)
+            expect((await r.json()).code).toBe("BAD_DASHBOARD_TOKEN")
+            r = await put({
+                "content-type": "application/json",
+                origin: "http://evil.example",
+                "x-dashboard-csrf": csrf,
+            })
+            expect((await r.json()).code).toBe("CROSS_ORIGIN")
+            r = await put({
+                "content-type": "text/plain",
+                origin: url,
+                "x-dashboard-csrf": csrf,
+            })
+            expect(r.status).toBe(415)
+            expect(app.locals.live.config.limits.maxCodexRounds).toBe(5)
+            // The same request done right goes through.
+            r = await dashboardFetch(url, "/dashboard/max-rounds", {
+                method: "PUT",
+                body: { value: 7 },
+            })
+            expect(r.status).toBe(200)
+        } finally {
+            await close()
+        }
+    })
+
+    test("a page from another dashboard API is told to reload", async () => {
+        const { url, close } = await start(minimalConfig())
+        try {
+            const r = await dashboardFetch(url, "/dashboard/max-rounds", {
+                method: "PUT",
+                body: { value: 7 },
+                headers: { "x-dashboard-api": "0" },
+            })
+            expect(r.status).toBe(409)
+            expect((await r.json()).code).toBe("PAGE_OUTDATED")
+        } finally {
+            await close()
+        }
+    })
+
+    test("the reload buttons drive the same controller as /admin/reload", async () => {
+        const { url, close } = await start(minimalConfig())
+        try {
+            let r = await dashboardFetch(url, "/dashboard/reload", {
+                body: {},
+            })
+            expect(await r.json()).toMatchObject({ ok: true, unchanged: true })
+            r = await dashboardFetch(url, "/dashboard/reload", {
+                body: { rollback: true },
+            })
+            expect(r.status).toBe(409)
+            expect(await r.json()).toMatchObject({
+                ok: false,
+                code: "NOTHING_TO_ROLL_BACK",
+            })
+            // Only literal true counts.
+            r = await dashboardFetch(url, "/dashboard/reload", {
+                body: { cancel: "yes" },
+            })
+            expect(await r.json()).toMatchObject({ unchanged: true })
+        } finally {
+            await close()
+        }
+    })
+})
+
+describe("dashboard guards across routes and restarts (§9 dashboard CSRF)", () => {
+    test("421 for a foreign Host covers the dashboard actions and /mcp too", async () => {
+        const { url, close } = await start(minimalConfig())
+        try {
+            const port = new URL(url).port
+            for (const [method, path] of [
+                ["POST", "/dashboard/reload"],
+                ["PUT", "/dashboard/max-rounds"],
+                ["POST", "/mcp"],
+            ]) {
+                const status = await new Promise((resolve, reject) => {
+                    const req = http.request(
+                        {
+                            hostname: "127.0.0.1",
+                            port,
+                            path,
+                            method,
+                            headers: {
+                                host: `evil.example:${port}`,
+                                "content-type": "application/json",
+                            },
+                        },
+                        (res) => {
+                            res.resume()
+                            resolve(res.statusCode)
+                        }
+                    )
+                    req.on("error", reject)
+                    req.end("{}")
+                })
+                expect(status).toBe(421)
+            }
+        } finally {
+            await close()
+        }
+    })
+
+    test("a cross-origin reload, rollback or cancel is refused and nothing reloads", async () => {
+        const { url, app, close } = await start(minimalConfig())
+        try {
+            for (const body of [{}, { rollback: true }, { cancel: true }]) {
+                const r = await fetch(`${url}/dashboard/reload`, {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json",
+                        origin: "http://evil.example",
+                        "x-dashboard-csrf": app.locals.dashboardCsrf,
+                    },
+                    body: JSON.stringify(body),
+                })
+                expect(r.status).toBe(403)
+            }
+            expect(app.locals.reloads.status()).toMatchObject({
+                appliedCount: 0,
+                history: [],
+            })
+        } finally {
+            await close()
+        }
+    })
+
+    test("every server start gets its own dashboard token", async () => {
+        const a = await start(minimalConfig())
+        const b = await start(minimalConfig())
+        try {
+            expect(a.app.locals.dashboardCsrf).toMatch(/^[A-Za-z0-9_-]{43}$/)
+            expect(a.app.locals.dashboardCsrf).not.toBe(
+                b.app.locals.dashboardCsrf
+            )
+            // A's token is no good on B.
+            const r = await fetch(`${b.url}/dashboard/reload`, {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    origin: b.url,
+                    "x-dashboard-csrf": a.app.locals.dashboardCsrf,
+                },
+                body: "{}",
+            })
+            expect((await r.json()).code).toBe("BAD_DASHBOARD_TOKEN")
+        } finally {
+            await a.close()
+            await b.close()
         }
     })
 })

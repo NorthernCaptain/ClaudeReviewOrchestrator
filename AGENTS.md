@@ -30,12 +30,39 @@ and the phased implementation plan — read it before making non-trivial changes
 
 ## Layout
 
-`server/src/` contains implementation modules; `hooks/` contains shared Stop
+`server/src/` is the stable shell and `server/src/core/` the reloadable
+core (review path under `core/review/`); `hooks/` contains shared Stop
 and PostToolUse hooks; `codex/skill/SKILL.md` supplies the installed review
 skill; and `install.sh --codex` wires Codex config, hooks, and the skill.
 
-`reviews/`, `node_modules/`, `coverage/`, and persisted runtime state are
-generated — do not commit them.
+`reviews/`, `node_modules/`, `coverage/`, `server/.core-versions/` and
+persisted runtime state are generated — do not commit them.
+
+## Hot reload: shell, core and state
+
+The server swaps its core and re-reads `config.json` without a restart
+(README "Hot reload"). Keep that true:
+
+- Put behaviour in `server/src/core/` (it reloads). The shell
+  (`server/src/*.js`) keeps HTTP and auth, the MCP transport, the state
+  store, the archive, the config holder and the reload controller; a shell
+  change needs a restart.
+- Core modules import only each other and packages, never the shell, and
+  never start processes or read their own folder at run time.
+- `CORE_API` is the core↔shell contract; an incompatible change bumps it
+  (restart).
+- State compatibility, both directions: within a `STATE_FORMAT`, persisted
+  changes are additive only. New fields are optional, readers ignore
+  unknown fields and default missing ones, saves keep fields they don't
+  interpret, and nothing is renamed, removed or redefined. Anything else
+  bumps `STATE_FORMAT` (restart).
+- `authToken` and `auth.rotations` are owned by `config.json`; reloads and
+  rollbacks never restore them. Config writers use `install/config-lock.mjs`.
+- Needs a restart: shell code, a `CORE_API` or `STATE_FORMAT` bump,
+  dependency or Node upgrades, the restart-only keys (`port`, `bind`,
+  `logging.dir`, `reviewsDir`, `reviewsRetentionDays`), MCP tool schema
+  changes. Hooks, plugin and scripts need `install.sh`.
+- Non-MCP callers never send the token: they use `hooks/signed-client.mjs`.
 
 ## Conventions
 

@@ -10,13 +10,18 @@
 #   - ~/.claude/hooks/stop-review.mjs            (Stop hook)
 #   - ~/.claude/hooks/notify-change.mjs          (PostToolUse hook —
 #     change-notification fast path for the review server)
+#   - ~/.claude/hooks/signed-client.mjs          (the signed-request
+#     client both hooks import)
+#   - ~/.cache/review-orchestrator/hook-credentials.json (the hooks'
+#     fallback when config.json is caught mid-edit)
 #   - the mcpServers.review entry in ~/.claude.json
 #   - the Stop + PostToolUse hook entries in ~/.claude/settings.json
 #   - the review-orchestrator block in ~/.claude/CLAUDE.md
 #
 # Pass --codex to ALSO wire codex CLI as a main developer (additive —
 # the Claude wiring above still runs):
-#   - ~/.codex/hooks/stop-review.mjs + notify-change.mjs (reused as-is)
+#   - ~/.codex/hooks/stop-review.mjs + notify-change.mjs + signed-client.mjs
+#     (reused as-is)
 #   - the [mcp_servers.review] table in ~/.codex/config.toml
 #   - the Stop + PostToolUse entries in ~/.codex/hooks.json
 #   - the code-review-loop skill in ~/.codex/skills/code-review-loop/
@@ -24,8 +29,9 @@
 # Pass --opencode to ALSO wire opencode CLI as a main developer (additive):
 #   - ~/.config/opencode/plugin/review-orchestrator.js (auto-discovered;
 #     replaces both hooks AND the MCP config entry — see the plugin header)
-#   - ~/.config/review-orchestrator/lib/stop-review.mjs (the /review
-#     protocol the plugin imports; same file the other CLIs run as a hook)
+#   - ~/.config/review-orchestrator/lib/stop-review.mjs + signed-client.mjs
+#     (the /review protocol the plugin imports; the same files the other
+#     CLIs run as hooks)
 #   - the code-review-loop skill in ~/.config/opencode/skill/
 #   - the review-orchestrator block in ~/.config/opencode/AGENTS.md
 #
@@ -100,6 +106,7 @@ CLAUDE_DIR="$HOME_DIR/.claude"
 HOOKS_DIR="$CLAUDE_DIR/hooks"
 HOOK_PATH="$HOOKS_DIR/stop-review.mjs"
 NOTIFY_HOOK_PATH="$HOOKS_DIR/notify-change.mjs"
+SIGNED_CLIENT_PATH="$HOOKS_DIR/signed-client.mjs"
 CLAUDE_JSON="$HOME_DIR/.claude.json"
 SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
@@ -107,6 +114,7 @@ CODEX_DIR="$HOME_DIR/.codex"
 CODEX_HOOKS_DIR="$CODEX_DIR/hooks"
 CODEX_STOP_HOOK="$CODEX_HOOKS_DIR/stop-review.mjs"
 CODEX_NOTIFY_HOOK="$CODEX_HOOKS_DIR/notify-change.mjs"
+CODEX_SIGNED_CLIENT="$CODEX_HOOKS_DIR/signed-client.mjs"
 CODEX_CONFIG_TOML="$CODEX_DIR/config.toml"
 CODEX_HOOKS_JSON="$CODEX_DIR/hooks.json"
 CODEX_SKILL="$CODEX_DIR/skills/code-review-loop/SKILL.md"
@@ -115,6 +123,7 @@ OPENCODE_PLUGIN="$OPENCODE_DIR/plugin/review-orchestrator.js"
 OPENCODE_SKILL="$OPENCODE_DIR/skill/code-review-loop/SKILL.md"
 OPENCODE_AGENTS_MD="$OPENCODE_DIR/AGENTS.md"
 LIB_STOP_REVIEW="$CONFIG_DIR/lib/stop-review.mjs"
+LIB_SIGNED_CLIENT="$CONFIG_DIR/lib/signed-client.mjs"
 LAUNCHAGENTS_DIR="$HOME_DIR/Library/LaunchAgents"
 PLIST_NAME="com.leo.review-orchestrator.plist"
 PLIST_DST="$LAUNCHAGENTS_DIR/$PLIST_NAME"
@@ -240,13 +249,16 @@ echo "  --launch:  $([ "$LAUNCH" -eq 1 ] && echo yes || echo no)"
 echo "  --dry-run: $([ "$DRY_RUN" -eq 1 ] && echo yes || echo no)"
 echo
 
-# 1. authToken + config.json
+# 1. authToken + config.json (under the config lock; also refreshes
+# ~/.cache/review-orchestrator/hook-credentials.json)
 run_helper "config.json" "$REPO_ROOT/install/ensure-token.mjs" "$CONFIG_PATH" "$HOME_DIR"
 
 # 2. mcp-headers.sh
 write_headers_script "$HEADERS_SCRIPT" "$CONFIG_PATH"
 
-# 3a. Stop hook
+# 3a. Stop hook. The signed client goes first: a hook that fires mid-install
+# must find the module it imports.
+install_file_idempotent "$REPO_ROOT/hooks/signed-client.mjs" "$SIGNED_CLIENT_PATH" 0644 "signed client"
 install_file_idempotent "$REPO_ROOT/hooks/stop-review.mjs" "$HOOK_PATH" 0700 "Stop hook"
 
 # 3b. PostToolUse hook — drives the change-notification fast path so
@@ -295,6 +307,7 @@ run_helper "~/.claude/CLAUDE.md (snippet)" "$REPO_ROOT/install/merge-claude-md.m
 # same ones Claude uses (identical stdin + decision:block contract); only
 # the registration shape differs (config.toml MCP + hooks.json + skill).
 if [ "$CODEX" -eq 1 ]; then
+    install_file_idempotent "$REPO_ROOT/hooks/signed-client.mjs" "$CODEX_SIGNED_CLIENT" 0644 "codex signed client"
     install_file_idempotent "$REPO_ROOT/hooks/stop-review.mjs" "$CODEX_STOP_HOOK" 0700 "codex Stop hook"
     install_file_idempotent "$REPO_ROOT/hooks/notify-change.mjs" "$CODEX_NOTIFY_HOOK" 0700 "codex PostToolUse hook"
     install_file_idempotent "$REPO_ROOT/codex/skill/SKILL.md" "$CODEX_SKILL" 0644 "codex skill"
@@ -313,6 +326,7 @@ fi
 # imports the /review protocol from the installed copy of the same
 # stop-review.mjs the other two run, so the three clients cannot drift.
 if [ "$OPENCODE" -eq 1 ]; then
+    install_file_idempotent "$REPO_ROOT/hooks/signed-client.mjs" "$LIB_SIGNED_CLIENT" 0644 "opencode signed client"
     install_file_idempotent "$REPO_ROOT/hooks/stop-review.mjs" "$LIB_STOP_REVIEW" 0644 "opencode protocol lib"
     install_file_idempotent "$REPO_ROOT/opencode/plugin/review-orchestrator.js" "$OPENCODE_PLUGIN" 0644 "opencode plugin"
     install_file_idempotent "$REPO_ROOT/opencode/skill/SKILL.md" "$OPENCODE_SKILL" 0644 "opencode skill"
