@@ -5581,6 +5581,88 @@ describe("handleReview — baseline after a passing review clears prior findings
         expect(savedBaseline().progressHash).toBe("with-priors")
     })
 
+    test("caches the prior-free baseline when it only turns a fully reviewed file into an omission marker, so the next Stop hook is NO_CHANGES", async () => {
+        // maxFiles reached: the prior file didn't count against it in the
+        // reviewed build, so b.js got its full diff; in the prior-free
+        // build a.js counts again and b.js is only a marker.
+        seedIssues()
+        const build = jest.fn(({ priorFindings }) =>
+            priorFindings.length > 0
+                ? makePayload({
+                      progressHash: "with-priors",
+                      priorFindingPaths: ["a.js"],
+                      blockHashes: ["block-a.js", "block-b.js"],
+                      markerBlockHashes: [],
+                      contentHashes: ["content-a.js", "content-b.js"],
+                  })
+                : makePayload({
+                      progressHash: "prior-free",
+                      blockHashes: ["block-a.js", "marker-b.js"],
+                      markerBlockHashes: ["marker-b.js"],
+                      contentHashes: ["content-a.js", "content-b.js"],
+                  })
+        )
+        const runSpy = jest.fn(async () => ({
+            status: "GOOD_TO_GO",
+            findings: [],
+            raw,
+        }))
+        const deps = makeDeps({
+            buildPayload: build,
+            runAndParse: runSpy,
+            currentHeadSha: () => "abc1234",
+            isWorkingTreeClean: () => false,
+        })
+        const agent = await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        expect(agent.body.status).toBe("GOOD_TO_GO")
+        expect(savedBaseline().progressHash).toBe("prior-free")
+        expect(savedBaseline().fastPathEligible).toBeUndefined()
+        const stop = await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        expect(stop.body.status).toBe("NO_CHANGES")
+        expect(runSpy).toHaveBeenCalledTimes(1)
+    })
+
+    test("a marker doesn't excuse a full block or a fingerprint the reviewer never saw", async () => {
+        seedIssues()
+        const build = jest.fn(({ priorFindings }) =>
+            priorFindings.length > 0
+                ? makePayload({
+                      progressHash: "with-priors",
+                      priorFindingPaths: ["a.js"],
+                      blockHashes: ["block-a.js", "marker-b.js"],
+                      markerBlockHashes: ["marker-b.js"],
+                      contentHashes: ["content-a.js", "content-b.js"],
+                  })
+                : makePayload({
+                      progressHash: "prior-free",
+                      // b.js now shown in full: never reviewed.
+                      blockHashes: ["block-a.js", "block-b.js", "marker-c.js"],
+                      markerBlockHashes: ["marker-c.js"],
+                      contentHashes: ["content-a.js", "content-b.js"],
+                  })
+        )
+        await handleReview({
+            body: { cwd: "/repo", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({ buildPayload: build }),
+        })
+        expect(savedBaseline()).toMatchObject({
+            progressHash: "with-priors",
+            fastPathEligible: false,
+        })
+    })
+
     test("keeps the reviewed baseline when the prior-free build has a fingerprint the reviewer never saw", async () => {
         // A file changed between the two builds beyond what the prompt
         // shows: same blocks, different content fingerprint.

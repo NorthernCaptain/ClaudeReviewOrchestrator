@@ -1047,6 +1047,63 @@ describe("buildPayload (integration)", () => {
             ).toBe(true)
         })
 
+        test("at maxFiles a prior-free build turns the file the prior's free slot showed into a marker; every other block was seen", async () => {
+            for (const f of ["a.js", "b.js", "c.js"]) {
+                writeFileSync(path.join(dir, f), `${f} 1\n`)
+            }
+            commitAll("files")
+            for (const f of ["a.js", "b.js", "c.js"]) {
+                writeFileSync(path.join(dir, f), `${f} 2\n`)
+            }
+            const cfg = baseConfig()
+            cfg.limits.maxFiles = 2
+            const priorFindings = [{ file: "a.js", severity: "major" }]
+            const reviewed = await buildPayload({
+                repoRoot: dir,
+                config: cfg,
+                priorFindings,
+            })
+            const priorFree = await buildPayload({ repoRoot: dir, config: cfg })
+            // The prior didn't take a slot: all three shown in full.
+            expect(reviewed.promptText).toMatch(/c\.js \(modified\) ===/)
+            expect(reviewed.markerBlockHashes).toEqual([])
+            expect(priorFree.promptText).toMatch(
+                /c\.js \(modified, omitted: maxFiles\) ===/
+            )
+            expect(priorFree.markerBlockHashes).toHaveLength(1)
+            const unseen = priorFree.blockHashes.filter(
+                (h) => !reviewed.blockHashes.includes(h)
+            )
+            expect(unseen).toEqual(priorFree.markerBlockHashes)
+            expect(
+                priorFree.contentHashes.every((h) =>
+                    reviewed.contentHashes.includes(h)
+                )
+            ).toBe(true)
+        })
+
+        test("markers cover header-only blocks of every kind, never a block with content", async () => {
+            writeFileSync(path.join(dir, "big.js"), "x\n")
+            commitAll("big")
+            writeFileSync(path.join(dir, "big.js"), "y".repeat(400) + "\n")
+            writeFileSync(path.join(dir, "img.bin"), Buffer.from([0, 1, 2, 0]))
+            const cfg = baseConfig()
+            // Too small for big.js's diff, room for its header.
+            cfg.limits.maxPayloadBytes = 300
+            const out = await buildPayload({ repoRoot: dir, config: cfg })
+            const lines = out.promptText.split("\n").filter(Boolean)
+            expect(lines).toEqual(
+                expect.arrayContaining([
+                    expect.stringMatching(
+                        /big\.js .*\(omitted: payload limit\)/
+                    ),
+                    expect.stringMatching(/img\.bin \(untracked, binary/),
+                ])
+            )
+            expect(out.markerBlockHashes).toHaveLength(2)
+            expect(out.markerBlockHashes.length).toBe(out.blockHashes.length)
+        })
+
         test("a prior-free build exposes a block the reviewed one omitted when an ignored flagged file used the budget", async () => {
             writeFileSync(path.join(dir, "deps.lock"), "v1\n")
             writeFileSync(path.join(dir, "z.txt"), "z1\n")

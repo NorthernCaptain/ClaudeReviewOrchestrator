@@ -198,10 +198,22 @@ const allSeenIn = (candidate, reviewed) => {
 // findings only removes paths, so anything new means either freed budget
 // exposed an omitted file or the tree changed between the two builds.
 // Missing lists can't prove it, so they count as unreviewed.
-const showsNothingUnreviewed = (candidate, reviewed) =>
-    sameCommitRange(candidate, reviewed) &&
-    allSeenIn(candidate.blockHashes, reviewed.blockHashes) &&
-    allSeenIn(candidate.contentHashes, reviewed.contentHashes)
+// A candidate's header-only markers don't count: they show none of a
+// path's content (its fingerprint must still match). A prior file
+// counting against maxFiles again turns a path the reviewer saw in full
+// into such a marker.
+const showsNothingUnreviewed = (candidate, reviewed) => {
+    if (!Array.isArray(candidate.blockHashes)) return false
+    const markers = new Set(candidate.markerBlockHashes ?? [])
+    return (
+        sameCommitRange(candidate, reviewed) &&
+        allSeenIn(
+            candidate.blockHashes.filter((h) => !markers.has(h)),
+            reviewed.blockHashes
+        ) &&
+        allSeenIn(candidate.contentHashes, reviewed.contentHashes)
+    )
+}
 
 // Concatenate the project-config static directive and the per-call
 // extra_instructions, in that order. Project guidance comes first so the

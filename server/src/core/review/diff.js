@@ -481,6 +481,8 @@ export const buildPayload = async ({
     let truncated = false
     let filesEmitted = 0
     const blocks = []
+    // Indexes of blocks that name a path without showing any of it.
+    const markerAt = new Set()
     const emittedPaths = new Set()
     const filesMeta = {
         modified: [],
@@ -508,11 +510,14 @@ export const buildPayload = async ({
         const block = body ? `${header}\n${body}\n` : `${header}\n`
         if (tryEmit(block)) return
         truncated = true
-        tryEmit(`${header} (omitted: payload limit)\n`)
+        if (tryEmit(`${header} (omitted: payload limit)\n`)) {
+            markerAt.add(blocks.length - 1)
+        }
     }
 
     const pushHeaderOnly = (header) => {
-        if (!tryEmit(`${header}\n`)) truncated = true
+        if (tryEmit(`${header}\n`)) markerAt.add(blocks.length - 1)
+        else truncated = true
     }
 
     for (const file of modifiedSet) {
@@ -667,6 +672,10 @@ export const buildPayload = async ({
     // Per-block identity, so a caller can tell whether another build of the
     // same tree shows the reviewer anything this one didn't.
     const blockHashes = blocks.map(sha256Hex)
+    // The header-only ones (omitted by maxFiles or the payload limit,
+    // binary, deleted): they show the reviewer none of a path's content,
+    // which the per-path fingerprints below cover instead.
+    const markerBlockHashes = blockHashes.filter((_, i) => markerAt.has(i))
 
     const promptHash = sha256Hex(promptText)
 
@@ -757,6 +766,7 @@ export const buildPayload = async ({
         promptHash,
         progressHash,
         blockHashes,
+        markerBlockHashes,
         contentHashes,
         fingerprintComplete,
         priorFindingPaths: sortedPriorPaths,
