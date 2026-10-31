@@ -903,10 +903,18 @@ describe("MCP calls parked in their roots check", () => {
         }
     })
 
-    test("a reset_review_context parked in roots/list across two swaps keeps its core until it finishes, then completes", async () => {
+    test("a reset_review_context parked in its context resolution across two swaps keeps its core until it finishes, then completes", async () => {
         const repoRoot = realpathSync(work.root)
         const s = await start(config(), { repoRoot })
         const mcp = await parkedRootsClient(s.url, repoRoot)
+        // Reset doesn't ask for roots: it parks on resolving its folder.
+        mcp.unpark()
+        let release = null
+        const context = s.deps.resolveContext()
+        s.deps.resolveContext.mockImplementationOnce(
+            () => new Promise((r) => (release = () => r(context)))
+        )
+        const parked = { unpark: () => release?.() }
         try {
             makeVariant("v2")
             const v2 = await reloadNow(s)
@@ -916,7 +924,7 @@ describe("MCP calls parked in their roots check", () => {
                 name: "reset_review_context",
                 arguments: { cwd: repoRoot },
             })
-            await until(() => mcp.parked())
+            await until(() => release !== null)
 
             // A pinned non-review call doesn't hold a reload back.
             makeVariant("v3")
@@ -928,7 +936,7 @@ describe("MCP calls parked in their roots check", () => {
             // v2 is neither current nor previous, but the call pins it.
             expect(existsSync(v2Dir)).toBe(true)
 
-            mcp.unpark()
+            parked.unpark()
             expect((await call).structuredContent).toMatchObject({
                 ok: true,
                 context: { repoRoot, branch: "main" },
@@ -1218,5 +1226,25 @@ describe("two instances of the same core version", () => {
         gates.shift()()
         expect((await joiner).body.status).toBe("GOOD_TO_GO")
         expect((await owner).body.code).toBe("DEADLINE_EXCEEDED")
+    })
+})
+
+describe("the package version a reloaded core reports", () => {
+    test("is read from package.json at each reload, not taken from the shell's start", async () => {
+        let version = "1.0.0"
+        const load = createCandidateLoader({
+            coreDir: work.coreDir,
+            snapshotRoot: work.snapshotRoot,
+            codexSchemaPathOf: (v) => path.join(work.root, `${v}.json`),
+            readVersion: () => version,
+        })
+        const first = await load({ version: "running" })
+        expect(first.packageVersion).toBe("1.0.0")
+        version = "1.1.0"
+        makeV2()
+        const second = await load({ version: first.version })
+        expect(second.packageVersion).toBe("1.1.0")
+        // The version is part of the core's identity.
+        expect(second.version).not.toBe(first.version)
     })
 })

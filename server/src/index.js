@@ -7,7 +7,7 @@ import { randomBytes, randomUUID } from "node:crypto"
 import { readFileSync, rmSync } from "node:fs"
 import path from "node:path"
 import express from "express"
-import { VERSION } from "./version.js"
+import { readPackageVersion, VERSION } from "./version.js"
 
 export { VERSION }
 import {
@@ -74,10 +74,13 @@ export const createCandidateLoader =
         coreDir = DEFAULT_CORE_DIR,
         snapshotRoot = DEFAULT_SNAPSHOT_ROOT,
         codexSchemaPathOf = (version) => ephemeralCodexSchemaPath(version),
-        packageVersion = VERSION,
+        // Read at every reload unless pinned (tests).
+        packageVersion = null,
+        readVersion = readPackageVersion,
     } = {}) =>
     async (current) => {
-        const captured = captureCore({ coreDir, packageVersion })
+        const version = packageVersion ?? readVersion()
+        const captured = captureCore({ coreDir, packageVersion: version })
         if (captured.version === current.version) return { same: true }
         const { module: mod, snapshotDir } = await importCore({
             captured,
@@ -91,6 +94,7 @@ export const createCandidateLoader =
             resources: captured.resources,
             snapshotDir,
             codexSchemaPath: codexSchemaPathOf(captured.version),
+            packageVersion: version,
         }
     }
 
@@ -365,7 +369,7 @@ export const createApp = ({
             prepareCore({
                 loaded,
                 config: candidateConfig,
-                packageVersion: VERSION,
+                packageVersion: loaded.packageVersion ?? VERSION,
                 shellVersion,
                 startedAt,
                 codexSchemaPath: loaded.codexSchemaPath,

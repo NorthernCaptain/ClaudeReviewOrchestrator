@@ -1805,3 +1805,114 @@ describe("main — the credentials cache is read-only for hooks (§9 hooks and t
         }
     })
 })
+
+describe("decideStopHookResponse — several folders (linked worktrees)", () => {
+    const folders = [
+        {
+            repo: "app",
+            repoRoot: "/w/app",
+            status: "GOOD_TO_GO",
+            state: { codexRounds: 2 },
+            blockingFindings: [],
+        },
+        {
+            repo: "infra",
+            repoRoot: "/w/tmp/infra",
+            status: "ISSUES",
+            state: { codexRounds: 1 },
+            blockingFindings: [
+                {
+                    file: "main.tf",
+                    line: 4,
+                    severity: "major",
+                    message: "open port",
+                },
+            ],
+        },
+        {
+            repo: "web",
+            repoRoot: "/w/tmp/web",
+            status: "ESCALATE",
+            code: "REVIEWER_TIMEOUT",
+            reason: "timed out",
+        },
+    ]
+
+    test("blocks with one section per folder, paths relative to it", () => {
+        const d = decideStopHookResponse({
+            reviewResponse: {
+                status: "ISSUES",
+                blockingFindings: [{ file: "/w/tmp/infra/main.tf" }],
+                folders,
+            },
+        })
+        const reason = d.stdoutJson.reason
+        expect(reason).toContain(
+            "Code review of 3 folders this session changed:"
+        )
+        expect(reason).toContain(
+            "## app — /w/app (GOOD_TO_GO, round 2)\n\nNo blocking findings."
+        )
+        expect(reason).toContain("## infra — /w/tmp/infra (ISSUES, round 1)")
+        expect(reason).toContain("`main.tf:4` *(major)* — open port")
+        expect(reason).toContain(
+            "## web — /w/tmp/web (ESCALATE)\n\nNot reviewed: timed out"
+        )
+        expect(reason).toMatch(/in the folder it is listed under/)
+    })
+
+    test("passes list each folder's status on stderr, with a failed folder's code", () => {
+        const d = decideStopHookResponse({
+            reviewResponse: {
+                status: "GOOD_TO_GO",
+                folders: [folders[0], folders[2]],
+            },
+        })
+        expect(d.stdoutJson).toBeNull()
+        expect(d.stderrLines).toEqual([
+            "review-orchestrator: GOOD_TO_GO",
+            "  • /w/app: GOOD_TO_GO",
+            "  • /w/tmp/web: ESCALATE (REVIEWER_TIMEOUT)",
+        ])
+        const notes = decideStopHookResponse({
+            reviewResponse: {
+                status: "GOOD_TO_GO_WITH_NOTES",
+                findings: [
+                    { file: "a", line: 1, severity: "minor", message: "m" },
+                ],
+                folders: [folders[0], { ...folders[0], repoRoot: "/w/b" }],
+            },
+        })
+        expect(notes.stderrLines.slice(-2)).toEqual([
+            "  • /w/app: GOOD_TO_GO",
+            "  • /w/b: GOOD_TO_GO",
+        ])
+    })
+
+    test("a single folder keeps today's format", () => {
+        const d = decideStopHookResponse({
+            reviewResponse: {
+                status: "ISSUES",
+                blockingFindings: [
+                    { file: "a.js", line: 1, severity: "major", message: "x" },
+                ],
+                folders: [folders[1]],
+                state: { codexRounds: 1, blockCount: 1 },
+            },
+        })
+        expect(d.stdoutJson.reason).toContain("Code review (round 1, block 1):")
+        expect(d.stdoutJson.reason).not.toMatch(/^## /m)
+    })
+
+    test("a failed folder without a reason or code still says it wasn't reviewed", () => {
+        const d = decideStopHookResponse({
+            reviewResponse: {
+                status: "ISSUES",
+                folders: [folders[1], { repoRoot: "/w/x", status: "ESCALATE" }],
+            },
+        })
+        expect(d.stdoutJson.reason).toContain(
+            "## repo — /w/x (ESCALATE)\n\nNot reviewed: reviewer failed"
+        )
+    })
+})

@@ -114,6 +114,33 @@ describe("redactConfig", () => {
 })
 
 describe("summarizeContext", () => {
+    test("lists the folders linked to a context, with their last edit", () => {
+        const r = summarizeContext({
+            key: "/w/app|main",
+            repoRoot: "/w/app",
+            branch: "main",
+            linkedContexts: {
+                "/w/tmp/infra|feat": {
+                    repo: "infra",
+                    repoRoot: "/w/tmp/infra",
+                    branch: "feat",
+                    linkedAt: 0,
+                    lastChangeAt: Date.parse("2026-10-30T12:00:00.000Z"),
+                },
+                "/w/tmp/web|x": { repoRoot: "/w/tmp/web", branch: "x" },
+            },
+        })
+        expect(r.linkedFolders).toEqual([
+            {
+                repoRoot: "/w/tmp/infra",
+                branch: "feat",
+                lastChangeAt: "2026-10-30T12:00:00.000Z",
+            },
+            { repoRoot: "/w/tmp/web", branch: "x", lastChangeAt: null },
+        ])
+        expect(summarizeContext({ key: "k" }).linkedFolders).toEqual([])
+    })
+
     test("drops priorFindings array and files baseline; keeps counts and hashes (truncated)", () => {
         const r = summarizeContext({
             key: "/repo|main",

@@ -483,6 +483,13 @@ export const buildPayload = async ({
     const blocks = []
     // Indexes of blocks that name a path without showing any of it.
     const markerAt = new Set()
+    // Paths whose content the prompt doesn't show in full, for the
+    // reviewer to inspect itself, with why: "maxFiles", "payload limit" or
+    // "truncated" (cut at maxFileBytes). Untracked files and standalone
+    // prior-finding files have no diff to ask git for; the reviewer reads
+    // them whole.
+    const notShown = new Map()
+    const readWhole = new Set()
     const emittedPaths = new Set()
     const filesMeta = {
         modified: [],
@@ -504,7 +511,9 @@ export const buildPayload = async ({
         return true
     }
 
-    const pushBlock = (header, body, file) => {
+    // `file` counts for slots and prior findings; `shownAs` is the path
+    // whose content the block carries (a rename's destination).
+    const pushBlock = (header, body, file, shownAs = file) => {
         if (!isPrior(file)) filesEmitted++
         emittedPaths.add(file)
         const block = body ? `${header}\n${body}\n` : `${header}\n`
@@ -513,6 +522,7 @@ export const buildPayload = async ({
         if (tryEmit(`${header} (omitted: payload limit)\n`)) {
             markerAt.add(blocks.length - 1)
         }
+        notShown.set(shownAs, "payload limit")
     }
 
     const pushHeaderOnly = (header) => {
@@ -524,12 +534,16 @@ export const buildPayload = async ({
         filesMeta.modified.push({ path: file })
         if (!haveFileSlot(file)) {
             pushHeaderOnly(makeHeader(file, "modified, omitted: maxFiles"))
+            notShown.set(file, "maxFiles")
             truncated = true
             continue
         }
         const diff = await git(repoRoot, ["diff", diffRef, "--", file])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
-        if (t) truncated = true
+        if (t) {
+            truncated = true
+            notShown.set(file, "truncated")
+        }
         pushBlock(
             makeHeader(file, t ? "modified, truncated" : "modified"),
             text,
@@ -546,19 +560,24 @@ export const buildPayload = async ({
             pushHeaderOnly(
                 makeHeader(`${r.from} -> ${r.to}`, "renamed, omitted: maxFiles")
             )
+            notShown.set(r.to, "maxFiles")
             truncated = true
             continue
         }
         const diff = await git(repoRoot, ["diff", diffRef, "--", r.to])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
-        if (t) truncated = true
+        if (t) {
+            truncated = true
+            notShown.set(r.to, "truncated")
+        }
         pushBlock(
             makeHeader(
                 `${r.from} -> ${r.to}`,
                 t ? "renamed, truncated" : "renamed"
             ),
             text,
-            slotKey
+            slotKey,
+            r.to
         )
         // Mark both endpoints as emitted so a follow-up standalone pass
         // doesn't duplicate.
@@ -570,12 +589,16 @@ export const buildPayload = async ({
         filesMeta.deleted.push(file)
         if (!haveFileSlot(file)) {
             pushHeaderOnly(makeHeader(file, "deleted, omitted: maxFiles"))
+            notShown.set(file, "maxFiles")
             truncated = true
             continue
         }
         const diff = await git(repoRoot, ["diff", diffRef, "--", file])
         const { text, truncated: t } = truncateText(diff, limits.maxFileBytes)
-        if (t) truncated = true
+        if (t) {
+            truncated = true
+            notShown.set(file, "truncated")
+        }
         pushBlock(
             makeHeader(file, t ? "deleted, truncated" : "deleted"),
             text,
@@ -591,6 +614,7 @@ export const buildPayload = async ({
         filesMeta.untracked.push({ path: file, binary })
         if (!haveFileSlot(file)) {
             pushHeaderOnly(makeHeader(file, "untracked, omitted: maxFiles"))
+            notShown.set(file, "maxFiles")
             truncated = true
             continue
         }
@@ -606,7 +630,10 @@ export const buildPayload = async ({
             text,
             limits.maxFileBytes
         )
-        if (t) truncated = true
+        if (t) {
+            truncated = true
+            notShown.set(file, "truncated")
+        }
         pushBlock(
             makeHeader(file, t ? "untracked, truncated" : "untracked"),
             truncatedText,
@@ -632,6 +659,7 @@ export const buildPayload = async ({
             continue
         }
         const binary = isBinary(buf)
+        readWhole.add(file)
         filesMeta.priorFindingContext.push({
             path: file,
             missing: false,
@@ -652,7 +680,10 @@ export const buildPayload = async ({
             text,
             limits.maxFileBytes
         )
-        if (t) truncated = true
+        if (t) {
+            truncated = true
+            notShown.set(file, "truncated")
+        }
         pushBlock(
             makeHeader(
                 file,
@@ -767,6 +798,15 @@ export const buildPayload = async ({
         progressHash,
         blockHashes,
         markerBlockHashes,
+        omittedFiles: [...notShown].map(([p, reason]) => ({
+            path: p,
+            reason,
+            ...(untrackedPaths.has(p) || readWhole.has(p)
+                ? { wholeFile: true }
+                : {}),
+        })),
+        // What the reviewer diffs against to see an omitted file in full.
+        diffRef,
         contentHashes,
         fingerprintComplete,
         priorFindingPaths: sortedPriorPaths,

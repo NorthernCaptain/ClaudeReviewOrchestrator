@@ -181,10 +181,28 @@ MCP roots (advertised by the client via `roots/list`) give a *set* of allowed
 roots per session, not the active one. So:
 
 - The tool **requires** `cwd` in input.
-- The server **validates** that `cwd` resolves to a repo root inside one of
-  the session's advertised roots (when present) or inside
-  `config.allowedRoots` (always).
+- The server **validates** that `cwd` resolves to a repo root inside
+  `config.allowedRoots`. Any such folder can be reviewed, including one
+  outside the session's own (a worktree of another repo).
+- The session's advertised roots only identify the session's repo: a
+  review of another folder **links** that folder to it (see *Linked
+  folders* below).
 - CLAUDE.md guidance tells Claude to pass the actual working directory.
+
+#### Linked folders
+
+A session can change other repos besides its own, typically a git worktree
+of another repo in another folder. The server links such a folder to the
+session's repo when the session edits a file there (the change
+notification names the file) or calls `request_review` on it (the session's
+repo comes from the client's MCP roots). The session's Stop hook then
+reviews its own repo and every linked folder, in parallel (at most 3 at
+once), each with its own loop state, cache and archive, and answers once:
+it blocks if any folder has blocking findings, with one section per folder
+and paths relative to that folder. A linked folder's reviewer failure is
+reported but doesn't hold the stop. A link ends when its folder passes with
+no edit since, can no longer be reviewed, or sees no edit for 12 hours.
+`/status` lists each context's `linkedFolders`.
 
 #### Allowed roots
 
@@ -1924,8 +1942,8 @@ These are settled for v1.
 - **Per-project overrides:** in v1 (lite), keys limited to `ignorePaths`,
   `limits`, `blockingSeverities`, `extraReviewerInstructions`.
 - **MCP `cwd`:** required tool input. Server resolves to repo root and
-  checks against `allowedRoots` (and the session's MCP roots when
-  advertised).
+  checks against `allowedRoots`; the session's MCP roots only link the
+  folder to the session's repo.
 
 ## Deferred to v2
 

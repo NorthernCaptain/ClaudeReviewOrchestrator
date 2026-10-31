@@ -290,6 +290,46 @@ const formatRoundHeader = (envelope) => {
     return `${label} (round ${rounds}, block ${blocks})`
 }
 
+// A Stop hook's answer can cover the session's folder and other folders
+// linked to it (worktrees of other repos it changed): `folders` then
+// holds each one's own result.
+const multiFolder = (envelope) =>
+    Array.isArray(envelope?.folders) && envelope.folders.length > 1
+
+const folderHeading = (f) => {
+    const name = cap(stripControl(String(f?.repo ?? "repo")), FILE_MAX)
+    const where = cap(stripControl(String(f?.repoRoot ?? "?")), FILE_MAX)
+    const status = stripControl(String(f?.status ?? "?"))
+    const round = Number.isInteger(f?.state?.codexRounds)
+        ? `, round ${f.state.codexRounds}`
+        : ""
+    return `## ${name} — ${where} (${status}${round})`
+}
+
+// One section per folder; finding paths are relative to that folder.
+export const formatFolderSections = (envelope) =>
+    envelope.folders
+        .map((f) => {
+            const findings = formatBlockingFindings(f)
+            const note =
+                f?.status === "ESCALATE"
+                    ? `Not reviewed: ${stripControl(String(f?.reason ?? f?.code ?? "reviewer failed"))}`
+                    : "No blocking findings."
+            return [folderHeading(f), "", findings || note].join("\n")
+        })
+        .join("\n\n")
+
+const folderStatusLines = (envelope) =>
+    multiFolder(envelope)
+        ? envelope.folders.map(
+              (f) =>
+                  `  • ${stripControl(String(f?.repoRoot ?? "?"))}: ${stripControl(String(f?.status ?? "?"))}` +
+                  (f?.status === "ESCALATE" && f?.code
+                      ? ` (${stripControl(String(f.code))})`
+                      : "")
+          )
+        : []
+
 // Decide what the hook should emit based on the /review response (or an
 // error condition observed before the response landed). Pure function —
 // no I/O — so it's trivially unit-testable across every result.status.
@@ -342,7 +382,10 @@ export const decideStopHookResponse = ({
         case "NO_CHANGES":
             return {
                 stdoutJson: null,
-                stderrLines: [`review-orchestrator: ${status}`],
+                stderrLines: [
+                    `review-orchestrator: ${status}`,
+                    ...folderStatusLines(reviewResponse),
+                ],
                 logEntry: { event: "pass", status },
             }
         case "GOOD_TO_GO_WITH_NOTES": {
@@ -359,6 +402,7 @@ export const decideStopHookResponse = ({
             if (findings.length > 5) {
                 lines.push(`  ...and ${findings.length - 5} more`)
             }
+            lines.push(...folderStatusLines(reviewResponse))
             return {
                 stdoutJson: null,
                 stderrLines: lines,
@@ -414,12 +458,19 @@ export const decideStopHookResponse = ({
         }
         case "ISSUES":
         case "NO_PROGRESS_WITH_OPEN_ISSUES": {
-            const header = formatRoundHeader(reviewResponse)
-            const body = formatBlockingFindings(reviewResponse)
+            const multi = multiFolder(reviewResponse)
+            const header = multi
+                ? `Code review of ${reviewResponse.folders.length} folders this session changed`
+                : formatRoundHeader(reviewResponse)
+            const body = multi
+                ? formatFolderSections(reviewResponse)
+                : formatBlockingFindings(reviewResponse)
             const tail =
                 status === "NO_PROGRESS_WITH_OPEN_ISSUES"
                     ? "No on-disk progress since the last review. Edit the flagged files, then finish."
-                    : "Address every BLOCKING point, then finish."
+                    : multi
+                      ? "Address every BLOCKING point in the folder it is listed under (paths are relative to that folder), then finish."
+                      : "Address every BLOCKING point, then finish."
             const reason = [
                 REASON_PREFACE,
                 "",

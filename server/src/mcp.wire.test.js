@@ -212,79 +212,82 @@ describe("/mcp HTTP wire — basic protocol", () => {
     })
 })
 
-describe("/mcp HTTP wire — MCP roots enforcement", () => {
-    // With per-session stateful transports, capabilities advertised at
-    // initialize survive across subsequent tools/call requests. These tests
-    // exercise that wiring end-to-end.
+describe("/mcp HTTP wire — client roots only link, never refuse", () => {
+    // Claude Code advertises the session folder as its root. A review of
+    // any other folder inside allowedRoots runs, and is linked to the
+    // session's repo so its Stop hook reviews that folder too.
+    const contexts = {
+        "/work/app": {
+            repo: "app",
+            repoRoot: "/work/app",
+            branch: "main",
+            key: "/work/app|main",
+        },
+        "/work/tmp/infra-wt": {
+            repo: "infra",
+            repoRoot: "/work/tmp/infra-wt",
+            branch: "feat",
+            key: "/work/tmp/infra-wt|feat",
+        },
+    }
+    const twoRepos = () => ({
+        ...happyDeps(),
+        resolveContext: ({ cwd }) => contexts[cwd],
+    })
 
-    test("client advertising roots NOT containing cwd → ESCALATE NOT_IN_CLIENT_ROOT", async () => {
-        const { url, close } = await startApp()
+    test("a folder outside the session's root is reviewed and linked to the session's repo", async () => {
+        const { url, close, store } = await startApp({ deps: twoRepos() })
         try {
             const client = await connectClient(url, {
                 clientCapabilities: { roots: {} },
                 rootsHandler: async () => ({
-                    roots: [{ uri: "file:///somewhere/else" }],
+                    roots: [{ uri: "file:///work/app" }],
                 }),
             })
             const r = await client.callTool({
                 name: "request_review",
-                arguments: { cwd: "/repo" },
+                arguments: { cwd: "/work/tmp/infra-wt" },
             })
-            expect(r.structuredContent.status).toBe("ESCALATE")
-            expect(r.structuredContent.code).toBe("NOT_IN_CLIENT_ROOT")
+            expect(r.structuredContent.status).toBe("GOOD_TO_GO")
+            expect(
+                Object.keys(store.peek("/work/app|main").linkedContexts)
+            ).toEqual(["/work/tmp/infra-wt|feat"])
             await client.close()
         } finally {
             await close()
         }
     })
 
-    test("client advertising roots throwing on listRoots → ESCALATE ROOTS_FETCH_FAILED (fail closed)", async () => {
+    test.each([
+        ["roots elsewhere", async () => ({ roots: [{ uri: "file:///x" }] })],
+        ["an empty root list", async () => ({ roots: [] })],
+        [
+            "a client that refuses to list roots",
+            async () => {
+                throw new Error("client refused to enumerate roots")
+            },
+        ],
+    ])("%s: the review still runs", async (_label, rootsHandler) => {
         const { url, close } = await startApp()
         try {
             const client = await connectClient(url, {
                 clientCapabilities: { roots: {} },
-                rootsHandler: async () => {
-                    throw new Error("client refused to enumerate roots")
-                },
+                rootsHandler,
             })
             const r = await client.callTool({
                 name: "request_review",
                 arguments: { cwd: "/repo" },
             })
-            expect(r.structuredContent.status).toBe("ESCALATE")
-            expect(r.structuredContent.code).toBe("ROOTS_FETCH_FAILED")
-            expect(r.structuredContent.reason).toMatch(
-                /client refused to enumerate roots/
-            )
+            expect(r.structuredContent.status).toBe("GOOD_TO_GO")
             await client.close()
         } finally {
             await close()
         }
     })
 
-    test("client advertising roots returning an EMPTY list → ESCALATE NOT_IN_CLIENT_ROOT", async () => {
+    test("client NOT advertising roots → request succeeds", async () => {
         const { url, close } = await startApp()
         try {
-            const client = await connectClient(url, {
-                clientCapabilities: { roots: {} },
-                rootsHandler: async () => ({ roots: [] }),
-            })
-            const r = await client.callTool({
-                name: "request_review",
-                arguments: { cwd: "/repo" },
-            })
-            expect(r.structuredContent.status).toBe("ESCALATE")
-            expect(r.structuredContent.code).toBe("NOT_IN_CLIENT_ROOT")
-            await client.close()
-        } finally {
-            await close()
-        }
-    })
-
-    test("client NOT advertising roots → request succeeds (no extra check)", async () => {
-        const { url, close } = await startApp()
-        try {
-            // No `capabilities.roots`, no rootsHandler.
             const client = await connectClient(url)
             const r = await client.callTool({
                 name: "request_review",

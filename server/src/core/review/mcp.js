@@ -3,20 +3,17 @@
  * Author: Leo Khramov
  */
 
-// MCP tool behaviour for request_review: the client-roots check and the
-// tool handler. Transport and sessions are the shell's (server/src/mcp.js);
-// it registers REQUEST_REVIEW_TOOL per session and calls the core's
-// handler for every tools/call.
+// MCP tool behaviour for request_review: linking a reviewed folder to the
+// session's repo (through the client's advertised roots) and the tool
+// handler. Transport and sessions are the shell's (server/src/mcp.js); it
+// registers REQUEST_REVIEW_TOOL per session and calls the core's handler
+// for every tools/call.
 
-import { realpathSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { z } from "zod"
 import { handleReview } from "./review.js"
-import {
-    resolveContext as defaultResolveContext,
-    isContainedIn,
-    ContextError,
-} from "./context.js"
+import { recordLink } from "./linked.js"
+import { resolveContext as defaultResolveContext } from "./context.js"
 
 // Best-effort parse of an MCP root URI. MCP roots are file:// URIs per the
 // spec; we tolerate bare paths too.
@@ -38,68 +35,13 @@ const rootUriToPath = (uri) => {
     return null
 }
 
-const realpathOrNull = (p) => {
-    try {
-        return realpathSync(p)
-    } catch {
-        return null
-    }
-}
-
-// True iff `repoRoot` (already realpath'd) lies inside at least one of the
-// client-advertised roots. The caller is expected to invoke this ONLY when
-// the client advertised a roots capability — in which case an empty
-// `roots` array means "no roots are allowed" and we must reject.
-// (Compare with the old contract where empty was treated as "skip"; the
-// failure-mode split lives in the caller now via maybeListClientRoots.)
-export const repoInClientRoots = (repoRoot, roots) => {
-    if (!Array.isArray(roots)) return false
-    if (roots.length === 0) return false
-    for (const r of roots) {
-        const p = rootUriToPath(r?.uri)
-        if (p === null) continue
-        const real = realpathOrNull(p)
-        if (real === null) continue
-        if (isContainedIn(real, repoRoot)) return true
-    }
-    return false
-}
-
-// Wraps a resolveContext implementation with an extra membership check
-// against client-advertised MCP roots. If the resolved repoRoot escapes
-// all of them, raises ContextError("NOT_IN_CLIENT_ROOT") which the review
-// handler maps to a 403 ESCALATE.
-const wrapResolveWithClientRoots =
-    (resolveImpl, clientRoots) => async (args) => {
-        const ctx = await resolveImpl(args)
-        if (!repoInClientRoots(ctx.repoRoot, clientRoots)) {
-            throw new ContextError(
-                "NOT_IN_CLIENT_ROOT",
-                `cwd resolves to ${ctx.repoRoot}, which is outside the MCP client's advertised roots`
-            )
-        }
-        return ctx
-    }
-
-// Three-way result for the roots probe. Failure modes are distinct so the
-// caller can fail closed when the client claims a roots capability but the
-// list cannot be retrieved.
-//
-//   { advertised: false }
-//     The client never advertised a roots capability. Skip the check.
-//
-//   { advertised: true, roots: Root[] }
-//     Roots successfully fetched. The handler MUST apply the membership
-//     check; an empty array means "no roots allowed" → repo is rejected.
-//
-//   { advertised: true, error: string }
-//     listRoots() threw. Fail CLOSED: the handler returns ESCALATE
-//     ROOTS_FETCH_FAILED instead of silently relaxing back to
-//     allowedRoots-only enforcement.
-// The probe is sent on the calling tools/call's own response stream
-// (relatedRequestId). Without it the SDK routes a server→client request
-// to the standalone GET stream, which a client may not have opened yet;
-// the request is then dropped and the probe hangs.
+// The client's advertised roots name the session's own folder (MCP calls
+// carry no session id). They're used only to link a reviewed folder to
+// the session's repo, never to refuse one: any folder inside
+// allowedRoots can be reviewed. The probe is sent on the calling
+// tools/call's own response stream (relatedRequestId); without it the
+// SDK routes a server→client request to the standalone GET stream,
+// which a client may not have opened yet, and the probe hangs.
 export const ROOTS_PROBE_TIMEOUT_MS = 10_000
 
 export const maybeListClientRoots = async (
@@ -125,10 +67,72 @@ export const maybeListClientRoots = async (
         const message = err?.message ?? String(err)
         logger?.warn?.(
             { err: message },
-            "MCP: client advertised roots capability but listRoots failed; failing closed"
+            "MCP: listRoots failed; the reviewed folder won't be linked"
         )
         return { advertised: true, error: message }
     }
+}
+
+// The session folders the client advertised, as local paths.
+const sessionFolders = async (mcpServer, logger, requestId) => {
+    const probe = await maybeListClientRoots(mcpServer, logger, {
+        relatedRequestId: requestId,
+    })
+    if (!probe.advertised || probe.error) return []
+    return probe.roots.map((r) => rootUriToPath(r?.uri)).filter(Boolean)
+}
+
+// Links the folder an agent asked to review to the session's repo (its
+// advertised root), when they differ, so the session's Stop hook reviews
+// it too. Best effort: a review never fails over a link.
+export const linkToSession = async ({
+    cwd,
+    config,
+    store,
+    deps = {},
+    mcpServer,
+    logger,
+    requestId,
+    now,
+}) => {
+    const roots = await sessionFolders(mcpServer, logger, requestId)
+    if (roots.length === 0) return []
+    const resolve = (p) =>
+        (deps.resolveContext ?? defaultResolveContext)({
+            cwd: p,
+            allowedRoots: config.allowedRoots,
+            git: deps.git,
+        })
+    let target
+    try {
+        target = await resolve(cwd)
+    } catch {
+        return []
+    }
+    const linked = []
+    for (const root of roots) {
+        let session
+        try {
+            session = await resolve(root)
+        } catch {
+            // A root that isn't a repo inside allowedRoots.
+            continue
+        }
+        const made = recordLink({
+            store,
+            primary: session,
+            secondary: target,
+            ...(now ? { now } : {}),
+        })
+        if (made) linked.push(session.key)
+    }
+    if (linked.length > 0) {
+        logger?.info?.(
+            { linked: target.key, to: linked },
+            "MCP: reviewed folder linked to the session's repo"
+        )
+    }
+    return linked
 }
 
 // Tool input schemas. The MCP SDK accepts plain ZodRawShape objects (i.e. an
@@ -201,45 +205,6 @@ export const asContent = (summary, structured) => ({
  * Tool handler for `request_review`. Pure function over { args, ctx } where
  * ctx contains all server-side dependencies. Returns an MCP CallToolResult.
  */
-// Returns either { ok: true, deps } with deps possibly wrapped, or
-// { ok: false, body } where body is a ready-to-return escalate envelope.
-export const applyRootsPolicy = async ({
-    mcpServer,
-    logger,
-    deps,
-    requestId,
-}) => {
-    const probe = await maybeListClientRoots(mcpServer, logger, {
-        relatedRequestId: requestId,
-    })
-    if (!probe.advertised) {
-        return { ok: true, deps }
-    }
-    if (probe.error) {
-        return {
-            ok: false,
-            body: {
-                status: "ESCALATE",
-                findings: [],
-                blockingFindings: [],
-                droppedFindings: [],
-                reason: `MCP roots/list failed: ${probe.error}`,
-                code: "ROOTS_FETCH_FAILED",
-            },
-        }
-    }
-    const baseResolve = deps.resolveContext ?? defaultResolveContext
-    return {
-        ok: true,
-        deps: {
-            ...deps,
-            resolveContext: wrapResolveWithClientRoots(
-                baseResolve,
-                probe.roots
-            ),
-        },
-    }
-}
 
 export const reviewRequestHandler = async ({
     args,
@@ -257,16 +222,16 @@ export const reviewRequestHandler = async ({
     },
     requestId,
 }) => {
-    const policy = await applyRootsPolicy({
+    await linkToSession({
+        cwd: args?.cwd,
+        config,
+        store,
+        deps,
         mcpServer,
         logger,
-        deps,
         requestId,
+        now,
     })
-    if (!policy.ok) {
-        if (metrics) metrics.record(policy.body)
-        return asContent(summarizeReview(policy.body), policy.body)
-    }
     const result = await handleReview({
         body: {
             cwd: args?.cwd,
@@ -280,7 +245,7 @@ export const reviewRequestHandler = async ({
         store,
         archive,
         logger,
-        deps: policy.deps,
+        deps,
         schema,
         ...versions,
         now,

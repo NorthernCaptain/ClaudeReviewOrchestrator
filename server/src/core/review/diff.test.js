@@ -1018,6 +1018,94 @@ describe("buildPayload (integration)", () => {
         expect(typeof out.progressHash).toBe("string")
     })
 
+    describe("omittedFiles", () => {
+        const commitAll = (msg) => {
+            execFileSync("git", ["-C", dir, "add", "-A"])
+            execFileSync("git", ["-C", dir, "commit", "-qm", msg])
+        }
+
+        test("lists every changed file not shown in full, with why; files shown in full aren't listed", async () => {
+            for (const f of ["a.js", "b.js", "c.js"]) {
+                writeFileSync(path.join(dir, f), `${f} 1\n`)
+            }
+            commitAll("files")
+            writeFileSync(path.join(dir, "a.js"), "a 2\n")
+            writeFileSync(path.join(dir, "b.js"), "b".repeat(2000) + "\n")
+            writeFileSync(path.join(dir, "c.js"), "c 2\n")
+            writeFileSync(path.join(dir, "new.txt"), "untracked\n")
+            const cfg = baseConfig()
+            cfg.limits.maxFiles = 2
+            cfg.limits.maxFileBytes = 600
+            const out = await buildPayload({ repoRoot: dir, config: cfg })
+            expect(out.diffRef).toBe("HEAD")
+            expect(out.omittedFiles).toEqual([
+                { path: "b.js", reason: "truncated" },
+                { path: "c.js", reason: "maxFiles" },
+                { path: "new.txt", reason: "maxFiles", wholeFile: true },
+            ])
+        })
+
+        test("a file cut by the payload limit is listed as such", async () => {
+            writeFileSync(path.join(dir, "big.js"), "x\n")
+            commitAll("big")
+            writeFileSync(path.join(dir, "big.js"), "y".repeat(400) + "\n")
+            const cfg = baseConfig()
+            cfg.limits.maxPayloadBytes = 300
+            const out = await buildPayload({ repoRoot: dir, config: cfg })
+            expect(out.omittedFiles).toEqual([
+                { path: "big.js", reason: "payload limit" },
+            ])
+        })
+
+        test("a rename whose old path had a finding, cut by the payload limit, lists the destination", async () => {
+            writeFileSync(path.join(dir, "old.js"), "x\n".repeat(200))
+            commitAll("old")
+            execFileSync("git", ["-C", dir, "mv", "old.js", "new.js"])
+            writeFileSync(path.join(dir, "new.js"), "x\n".repeat(199) + "y\n")
+            const cfg = baseConfig()
+            cfg.limits.maxPayloadBytes = 200
+            const out = await buildPayload({
+                repoRoot: dir,
+                config: cfg,
+                priorFindings: [{ file: "old.js", severity: "major" }],
+            })
+            expect(out.files.renamed).toEqual([
+                { from: "old.js", to: "new.js" },
+            ])
+            const listed = out.omittedFiles.map((f) => f.path)
+            expect(listed).toContain("new.js")
+            expect(listed).not.toContain("old.js")
+        })
+
+        test("a flagged file the change doesn't touch, cut short, is to be read whole", async () => {
+            writeFileSync(path.join(dir, "flagged.js"), "z".repeat(2000) + "\n")
+            writeFileSync(path.join(dir, "a.js"), "one\n")
+            commitAll("files")
+            writeFileSync(path.join(dir, "a.js"), "two\n")
+            const cfg = baseConfig()
+            cfg.limits.maxFileBytes = 600
+            const out = await buildPayload({
+                repoRoot: dir,
+                config: cfg,
+                priorFindings: [{ file: "flagged.js", severity: "major" }],
+            })
+            expect(out.omittedFiles).toEqual([
+                { path: "flagged.js", reason: "truncated", wholeFile: true },
+            ])
+        })
+
+        test("nothing is listed when everything fits", async () => {
+            writeFileSync(path.join(dir, "a.js"), "one\n")
+            commitAll("a")
+            writeFileSync(path.join(dir, "a.js"), "two\n")
+            const out = await buildPayload({
+                repoRoot: dir,
+                config: baseConfig(),
+            })
+            expect(out.omittedFiles).toEqual([])
+        })
+    })
+
     describe("blockHashes", () => {
         const commitAll = (msg) => {
             execFileSync("git", ["-C", dir, "add", "-A"])

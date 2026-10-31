@@ -19,6 +19,7 @@ import {
 } from "./diff.js"
 import { pickReviewer, providerCfg, wrapPrompt } from "./reviewer.js"
 import { loadProjectConfig, mergeWithGlobal } from "./project-config.js"
+import { combineResults, linksOf, runFolders, settleLinks } from "./linked.js"
 
 // Tail a string buffer for log lines — the reviewer's stderr is the
 // gold for debugging auth/quota/network failures and we want it in
@@ -693,6 +694,14 @@ export const handleReview = async ({
             ? fresh.exclusions
             : (writes.exclusions ?? [])
         const out = { ...writes, exclusions: freshExclusions }
+        // Links (linked.js) are written by change notifications and MCP
+        // calls while this review runs; the snapshot it started from must
+        // not undo them.
+        if (fresh && "linkedContexts" in fresh) {
+            out.linkedContexts = fresh.linkedContexts
+        } else {
+            delete out.linkedContexts
+        }
         // Cache-invalidation preservation (v1.1.6). If exclusions
         // changed DURING the review, the prompt the reviewer saw
         // referenced the OLD list, so the just-computed baseline is
@@ -1253,6 +1262,8 @@ export const handleReview = async ({
             priorFindings: state.priorFindings,
             extraInstructions,
             exclusions: state.exclusions ?? [],
+            omittedFiles: payload.omittedFiles ?? [],
+            diffRef: payload.diffRef,
         })
 
         // Pick the reviewer adapter (codex or claude). The picker maps
@@ -1750,42 +1761,131 @@ export const createReviewHandler =
             versions = {},
         } = getOptions(request)
         const deadline = request?.deadline ?? null
-        const work = handleReview({
-            body: req.body,
-            config,
-            store,
-            archive,
-            logger,
-            deps,
-            schema,
-            ...versions,
-            deadline,
-            requestId: req.requestId ?? null,
-        })
-        // The deadline covers everything before the pipeline too (context
-        // resolution runs git): answer on time, and let the work finish.
-        let result
-        if (deadline === null) {
-            result = await work
-        } else {
-            const outcome = await raceDeadline(work, deadline, Date.now)
-            result =
-                outcome === TIMED_OUT
-                    ? {
-                          ...deadlineExceeded(
-                              "the request was still being prepared at its deadline"
-                          ),
-                          background: work,
-                      }
-                    : outcome
-        }
-        if (metrics) metrics.record(result.body)
+        const runOne = (body) =>
+            handleReview({
+                body,
+                config,
+                store,
+                archive,
+                logger,
+                deps,
+                schema,
+                ...versions,
+                deadline,
+                requestId: req.requestId ?? null,
+            })
+        // Each review answers by the deadline on its own, so a Stop hook's
+        // folders that finished are combined even when one didn't.
+        const timedOne = (body) => onTime(runOne(body), deadline)
+        const result = isStopHook(req.body?.trigger)
+            ? await reviewSessionFolders({
+                  body: req.body,
+                  runOne: timedOne,
+                  config,
+                  store,
+                  deps,
+                  metrics,
+                  deadline,
+              })
+            : await timedOne(req.body)
+        if (metrics && !result.metricsRecorded) metrics.record(result.body)
         res.status(result.httpStatus).json(result.body)
         // Answered at the deadline with work still running: this request
         // stays admitted (the shell releases it when we return) until all
         // of it, including a review it started, is done.
         await settleBackground(result.background)
     }
+
+// The deadline covers everything before the pipeline too (context
+// resolution runs git): answer on time, and let the work finish.
+const onTime = async (work, deadline) => {
+    if (deadline === null) return work
+    const outcome = await raceDeadline(
+        Promise.resolve(work),
+        deadline,
+        Date.now
+    )
+    return outcome === TIMED_OUT
+        ? {
+              ...deadlineExceeded(
+                  "the request was still being prepared at its deadline"
+              ),
+              background: work,
+          }
+        : outcome
+}
+
+// A Stop hook reviews the session's folder and every folder linked to it
+// (linked.js), in parallel, and answers once for all of them. With no
+// links it's exactly the single review.
+export const reviewSessionFolders = async ({
+    body,
+    runOne,
+    config,
+    store,
+    deps = {},
+    metrics = null,
+    deadline = null,
+    now = Date.now,
+}) => {
+    let primary
+    try {
+        primary = await onTime(
+            (deps.resolveContext ?? resolveContext)({
+                cwd: body?.cwd,
+                allowedRoots: config.allowedRoots,
+                git: deps.git,
+            }),
+            deadline
+        )
+    } catch {
+        primary = null
+    }
+    // Not resolved in time: answer now, and keep the request pinned until
+    // that git call ends (its background), rather than start another.
+    if (primary?.body) return primary
+    // Unresolvable: the review reports why.
+    if (!primary?.key) return runOne(body)
+    const links = linksOf({ store, key: primary.key, now })
+    if (links.length === 0) return runOne(body)
+    const startedAt = now()
+    const { answered, done } = runFolders({
+        tasks: [
+            () => runOne(body),
+            ...links.map(
+                (link) => () => runOne({ ...body, cwd: link.repoRoot })
+            ),
+        ],
+        deadline,
+        notStarted: () =>
+            deadlineExceeded(
+                "not started before the deadline: other folders' reviews were still running"
+            ),
+        failed: (err) => ({
+            httpStatus: 500,
+            body: envelope("ESCALATE", {
+                reason: `review failed: ${err?.message ?? String(err)}`,
+                code: "REVIEW_FAILED",
+                notifyUser: false,
+            }),
+        }),
+        settle: (answer) => settleBackground(answer?.background),
+    })
+    const results = await answered
+    settleLinks({
+        store,
+        key: primary.key,
+        results: links.map((link, i) => ({ link, result: results[i + 1] })),
+        startedAt,
+    })
+    if (metrics) for (const r of results) metrics.record(r.body)
+    const combined = combineResults([
+        { primary: true, ...primary, result: results[0] },
+        ...links.map((link, i) => ({ ...link, result: results[i + 1] })),
+    ])
+    // The request stays admitted until every folder's review is done.
+    return { ...combined, metricsRecorded: true, background: done }
+}
 
 // Waits for work left running after a deadline answer: a pipeline, or a
 // whole handleReview whose own result may carry a pipeline in turn.

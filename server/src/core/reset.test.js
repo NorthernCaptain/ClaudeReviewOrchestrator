@@ -18,7 +18,7 @@ import {
 } from "./reset.js"
 import { ContextError } from "./review/context.js"
 import { createStateStore } from "../state.js"
-import { ROOTS_PROBE_TIMEOUT_MS } from "./review/mcp.js"
+import { recordLink } from "./review/linked.js"
 
 const { summarizeReset } = __test__
 
@@ -316,30 +316,11 @@ describe("reset_review_context MCP tool", () => {
         )
     })
 
-    test("resetRequestHandler also honors client roots", async () => {
+    test("resetRequestHandler resets any repo inside allowedRoots, without asking the client for roots", async () => {
+        const listRoots = jest.fn(async () => ({
+            roots: [{ uri: "file:///somewhere/else" }],
+        }))
         const out = await resetRequestHandler({
-            args: { cwd: "/repo" },
-            ctx: {
-                config: minimalConfig(),
-                store,
-                deps: { resolveContext: () => happyContext },
-                mcpServer: {
-                    server: {
-                        getClientCapabilities: () => ({ roots: {} }),
-                        listRoots: async () => ({
-                            roots: [{ uri: "file:///somewhere/else" }],
-                        }),
-                    },
-                },
-            },
-        })
-        expect(out.structuredContent.status).toBe("ESCALATE")
-        expect(out.structuredContent.code).toBe("NOT_IN_CLIENT_ROOT")
-    })
-
-    test("the roots probe rides the tool call's own stream", async () => {
-        const listRoots = jest.fn(async () => ({ roots: [] }))
-        await resetRequestHandler({
             args: { cwd: "/repo" },
             ctx: {
                 config: minimalConfig(),
@@ -352,11 +333,68 @@ describe("reset_review_context MCP tool", () => {
                     },
                 },
             },
-            requestId: 7,
         })
-        expect(listRoots.mock.calls[0][1]).toEqual({
-            relatedRequestId: 7,
-            timeout: ROOTS_PROBE_TIMEOUT_MS,
+        expect(out.structuredContent.ok).toBe(true)
+        expect(listRoots).not.toHaveBeenCalled()
+    })
+})
+
+describe("resets keep the session's linked folders", () => {
+    const infra = {
+        repo: "infra",
+        repoRoot: "/w/tmp/infra",
+        branch: "feat",
+        key: "/w/tmp/infra|feat",
+    }
+    let store
+    beforeEach(() => {
+        store = makeStore()
+        store.save(happyContext.key, {
+            repoRoot: "/repo",
+            branch: "main",
+            codexRounds: 4,
         })
+        recordLink({ store, primary: happyContext, secondary: infra })
+    })
+    afterEach(() => cleanup(store))
+
+    test("handleReset clears the loop, not the links", async () => {
+        const r = await handleReset({
+            body: { cwd: "/repo" },
+            config: minimalConfig(),
+            store,
+            deps: { resolveContext: () => happyContext },
+        })
+        expect(r.httpStatus).toBe(200)
+        expect(store.peek(happyContext.key).codexRounds).toBe(0)
+        expect(
+            Object.keys(store.peek(happyContext.key).linkedContexts)
+        ).toEqual([infra.key])
+    })
+
+    test("the dashboard reset too", () => {
+        const r = handleDashboardReset({
+            body: { contextKey: happyContext.key },
+            store,
+        })
+        expect(r.httpStatus).toBe(200)
+        expect(store.peek(happyContext.key).codexRounds).toBe(0)
+        expect(
+            Object.keys(store.peek(happyContext.key).linkedContexts)
+        ).toEqual([infra.key])
+    })
+
+    test("a context without links resets as before", async () => {
+        store.save("/other|x", {
+            repoRoot: "/other",
+            branch: "x",
+            codexRounds: 2,
+        })
+        const r = handleDashboardReset({
+            body: { contextKey: "/other|x" },
+            store,
+        })
+        expect(r.httpStatus).toBe(200)
+        expect(store.peek("/other|x").linkedContexts).toBeUndefined()
     })
 })
