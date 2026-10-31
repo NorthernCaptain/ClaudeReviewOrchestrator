@@ -15,10 +15,15 @@ import { fileURLToPath } from "node:url"
 const here = path.dirname(fileURLToPath(import.meta.url))
 const pkgPath = path.join(here, "..", "..", "package.json")
 
-export const VERSION = (() => {
+// package.json's version now. A hot reload stamps the core it loads with
+// this, so the dashboard and /status show the code that's running, not
+// the version the shell started with.
+export const readPackageVersion = (read = readFileSync) => {
     try {
-        return JSON.parse(readFileSync(pkgPath, "utf8")).version ?? "unknown"
+        return JSON.parse(read(pkgPath, "utf8")).version ?? "unknown"
     } catch {
         return "unknown"
     }
-})()
+}
+
+export const VERSION = readPackageVersion()

@@ -14,8 +14,10 @@ import {
     computeExtrasHash,
     computeReviewKey,
     defaultInflight,
+    reviewSessionFolders,
     snapshotInFlight,
 } from "./review.js"
+import { recordLink } from "./linked.js"
 import { ContextError } from "./context.js"
 import { createOutputSchema } from "./schema.js"
 import { createStateStore } from "../../state.js"
@@ -4503,6 +4505,39 @@ describe("handleReview — exclusions wiring (v1.1)", () => {
     })
     afterEach(() => cleanupStore(store))
 
+    test("the payload's omitted files and diff ref are threaded into the prompt", async () => {
+        let received = null
+        const runAndParse = jest.fn(async ({ prompt }) => {
+            received = prompt
+            return {
+                status: "GOOD_TO_GO",
+                findings: [],
+                raw: {
+                    exitCode: 0,
+                    durationMs: 1,
+                    rawStdout: "{}",
+                    rawStderr: "",
+                },
+            }
+        })
+        await handleReview({
+            body: { cwd: "/repo", trigger: "stop_hook" },
+            config: minimalConfig(),
+            store,
+            deps: makeDeps({
+                buildPayload: () =>
+                    makePayload({
+                        omittedFiles: [{ path: "a.js", reason: "maxFiles" }],
+                        diffRef: "HEAD",
+                    }),
+                runAndParse,
+            }),
+        })
+        expect(received).toContain("<<<OMITTED_FILES>>>")
+        expect(received).toContain('"path": "a.js"')
+        expect(received).toContain("diff HEAD -- <path>")
+    })
+
     test("state.exclusions is threaded into wrapPrompt", async () => {
         store.save("/repo|main", {
             repoRoot: "/repo",
@@ -6428,13 +6463,19 @@ describe("handleReview — request deadlines (hot-reload plan §5.5)", () => {
     })
 
     test("the deadline also covers context resolution: a slow git answers on time", async () => {
-        let finishResolve
+        // Git stalls until finishResolve; every call after that answers.
+        let slow = true
+        const waiting = []
+        const finishResolve = () => {
+            slow = false
+            for (const resolve of waiting) resolve(happyContext)
+        }
         const deps = makeDeps({
             inflight: new Map(),
             resolveContext: () =>
-                new Promise((resolve) => {
-                    finishResolve = () => resolve(happyContext)
-                }),
+                slow
+                    ? new Promise((resolve) => waiting.push(resolve))
+                    : happyContext,
         })
         const handler = createReviewHandler(() => ({
             config: minimalConfig(),
@@ -6467,5 +6508,360 @@ describe("handleReview — request deadlines (hot-reload plan §5.5)", () => {
         finishResolve()
         await handled
         expect(done).toBe(true)
+    })
+})
+
+describe("Stop hooks review the session's folder and its linked folders", () => {
+    let store
+    beforeEach(() => {
+        store = makeStoreInMemory()
+    })
+    afterEach(() => rmSync(store.__dir, { recursive: true, force: true }))
+
+    const app = {
+        repo: "app",
+        repoRoot: "/work/app",
+        branch: "main",
+        key: "/work/app|main",
+    }
+    const infra = {
+        repo: "infra",
+        repoRoot: "/work/tmp/infra",
+        branch: "feat",
+        key: "/work/tmp/infra|feat",
+    }
+    const contexts = { "/work/app": app, "/work/tmp/infra": infra }
+    const resolveContext = ({ cwd }) => {
+        if (!contexts[cwd]) throw new ContextError("NOT_A_GIT_REPO", "no")
+        return contexts[cwd]
+    }
+    const pass = (ctx, status = "GOOD_TO_GO", extra = {}) => ({
+        httpStatus: 200,
+        body: {
+            status,
+            context: ctx,
+            findings: [],
+            blockingFindings: [],
+            ...extra,
+        },
+    })
+
+    test("with no linked folder it is exactly the single review", async () => {
+        const runOne = jest.fn(async () => pass(app))
+        const r = await reviewSessionFolders({
+            body: { cwd: "/work/app", trigger: "stop_hook" },
+            runOne,
+            config: minimalConfig(),
+            store,
+            deps: { resolveContext },
+        })
+        expect(runOne).toHaveBeenCalledTimes(1)
+        expect(r).toEqual(pass(app))
+    })
+
+    test("a cwd that doesn't resolve is left to the review to report", async () => {
+        const runOne = jest.fn(async () => ({
+            httpStatus: 400,
+            body: { status: "ESCALATE" },
+        }))
+        await reviewSessionFolders({
+            body: { cwd: "/nowhere", trigger: "stop_hook" },
+            runOne,
+            config: minimalConfig(),
+            store,
+            deps: { resolveContext },
+        })
+        expect(runOne).toHaveBeenCalledWith({
+            cwd: "/nowhere",
+            trigger: "stop_hook",
+        })
+    })
+
+    test("linked folders are reviewed in parallel; one answer, metrics per folder, passed links settled", async () => {
+        recordLink({ store, primary: app, secondary: infra })
+        const started = []
+        let releaseAll
+        const gate = new Promise((r) => (releaseAll = r))
+        const runOne = jest.fn(async (body) => {
+            started.push(body.cwd)
+            await gate
+            return body.cwd === "/work/app"
+                ? pass(app)
+                : pass(infra, "ISSUES", {
+                      blockingFindings: [
+                          {
+                              file: "main.tf",
+                              line: 2,
+                              severity: "major",
+                              message: "open",
+                          },
+                      ],
+                  })
+        })
+        const metrics = { record: jest.fn() }
+        const pending = reviewSessionFolders({
+            body: { cwd: "/work/app", session_id: "s", trigger: "stop_hook" },
+            runOne,
+            config: minimalConfig(),
+            store,
+            deps: { resolveContext },
+            metrics,
+        })
+        await new Promise((r) => setImmediate(r))
+        // Both started before either finished.
+        expect(started).toEqual(["/work/app", "/work/tmp/infra"])
+        releaseAll()
+        const r = await pending
+        expect(runOne.mock.calls[1][0]).toEqual({
+            cwd: "/work/tmp/infra",
+            session_id: "s",
+            trigger: "stop_hook",
+        })
+        expect(r.metricsRecorded).toBe(true)
+        expect(metrics.record).toHaveBeenCalledTimes(2)
+        expect(r.body.status).toBe("ISSUES")
+        expect(r.body.blockingFindings[0].file).toBe("/work/tmp/infra/main.tf")
+        expect(r.body.folders.map((f) => f.repoRoot)).toEqual([
+            "/work/app",
+            "/work/tmp/infra",
+        ])
+        // Still open: the link stays.
+        expect(Object.keys(store.peek(app.key).linkedContexts)).toEqual([
+            infra.key,
+        ])
+    })
+
+    test("a linked folder that passes is unlinked; work left running at the deadline is awaited", async () => {
+        recordLink({
+            store,
+            primary: app,
+            secondary: infra,
+            now: () => Date.now() - 1000,
+        })
+        let finished = false
+        const runOne = async (body) =>
+            body.cwd === "/work/app"
+                ? pass(app)
+                : {
+                      ...pass(infra, "NO_CHANGES"),
+                      background: new Promise((r) =>
+                          setTimeout(() => {
+                              finished = true
+                              r({ background: null })
+                          }, 5)
+                      ),
+                  }
+        const r = await reviewSessionFolders({
+            body: { cwd: "/work/app", trigger: "stop_hook" },
+            runOne,
+            config: minimalConfig(),
+            store,
+            deps: { resolveContext },
+        })
+        expect(r.body.folders).toHaveLength(2)
+        expect(r.body.status).toBe("GOOD_TO_GO")
+        expect(store.peek(app.key).linkedContexts).toEqual({})
+        await r.background
+        expect(finished).toBe(true)
+    })
+
+    test("at the deadline a slow folder doesn't hide another folder's blocking findings", async () => {
+        recordLink({ store, primary: app, secondary: infra })
+        let releaseInfra
+        const deps = makeDeps({
+            inflight: new Map(),
+            // infra's git stalls past the deadline; app's review finishes.
+            resolveContext: ({ cwd }) =>
+                cwd === "/work/tmp/infra"
+                    ? new Promise((r) => (releaseInfra = () => r(infra)))
+                    : resolveContext({ cwd }),
+            runAndParse: async () => ({
+                status: "ISSUES",
+                findings: [
+                    {
+                        file: "a.js",
+                        line: 1,
+                        severity: "major",
+                        category: "bug",
+                        message: "real bug",
+                    },
+                ],
+                raw: { durationMs: 1, exitCode: 0, timedOut: false },
+            }),
+        })
+        const handler = createReviewHandler(() => ({
+            config: minimalConfig(),
+            store,
+            deps,
+        }))
+        const res = {
+            status(c) {
+                this.statusCode = c
+                return this
+            },
+            json(b) {
+                this.body = b
+                return this
+            },
+        }
+        const handled = handler(
+            { body: { cwd: "/work/app", trigger: "stop_hook" } },
+            res,
+            { config: minimalConfig(), deadline: Date.now() + 200 }
+        )
+        await new Promise((r) => setTimeout(r, 400))
+        expect(res.body.status).toBe("ISSUES")
+        expect(res.body.blockingFindings.map((f) => f.file)).toEqual([
+            "/work/app/a.js",
+        ])
+        expect(res.body.folders[1]).toMatchObject({
+            repoRoot: "/work/tmp/infra",
+            status: "ESCALATE",
+            code: "DEADLINE_EXCEEDED",
+        })
+        releaseInfra()
+        await handled
+    })
+
+    test("a link added while the session repo's review runs survives that review's save", async () => {
+        // The review starts with one link in its snapshot.
+        const web = {
+            repo: "web",
+            repoRoot: "/work/tmp/web",
+            branch: "x",
+            key: "/work/tmp/web|x",
+        }
+        recordLink({ store, primary: app, secondary: web })
+        let release
+        const deps = makeDeps({
+            inflight: new Map(),
+            resolveContext,
+            runAndParse: () =>
+                new Promise(
+                    (r) =>
+                        (release = () =>
+                            r({
+                                status: "GOOD_TO_GO",
+                                findings: [],
+                                raw: {
+                                    durationMs: 1,
+                                    exitCode: 0,
+                                    timedOut: false,
+                                },
+                            }))
+                ),
+        })
+        const review = handleReview({
+            body: { cwd: "/work/app", trigger: "mcp_tool" },
+            config: minimalConfig(),
+            store,
+            deps,
+        })
+        for (let i = 0; i < 50 && !release; i++) {
+            await new Promise((r) => setTimeout(r, 5))
+        }
+        recordLink({ store, primary: app, secondary: infra })
+        release()
+        expect((await review).body.status).toBe("GOOD_TO_GO")
+        expect(Object.keys(store.peek(app.key).linkedContexts)).toEqual([
+            web.key,
+            infra.key,
+        ])
+    })
+
+    test("a linked folder whose review throws is reported as failed; the session's answer still comes back", async () => {
+        recordLink({ store, primary: app, secondary: infra })
+        const r = await reviewSessionFolders({
+            body: { cwd: "/work/app", trigger: "stop_hook" },
+            runOne: async (body) => {
+                if (body.cwd === "/work/tmp/infra") throw new Error("disk full")
+                return pass(app, "ISSUES", {
+                    blockingFindings: [
+                        {
+                            file: "a.js",
+                            line: 1,
+                            severity: "major",
+                            message: "m",
+                        },
+                    ],
+                })
+            },
+            config: minimalConfig(),
+            store,
+            deps: { resolveContext },
+        })
+        expect(r.body.status).toBe("ISSUES")
+        expect(r.body.folders[1]).toMatchObject({
+            status: "ESCALATE",
+            code: "REVIEW_FAILED",
+            reason: "review failed: disk full",
+        })
+        await r.background
+    })
+
+    test("resolving the session's repo past the deadline answers at once, pinned to that git call, without starting another", async () => {
+        let release
+        const slowResolve = jest.fn(
+            () => new Promise((r) => (release = () => r(app)))
+        )
+        const runOne = jest.fn()
+        const r = await reviewSessionFolders({
+            body: { cwd: "/work/app", trigger: "stop_hook" },
+            runOne,
+            config: minimalConfig(),
+            store,
+            deps: { resolveContext: slowResolve },
+            deadline: Date.now() + 20,
+        })
+        expect(r.body.code).toBe("DEADLINE_EXCEEDED")
+        expect(runOne).not.toHaveBeenCalled()
+        expect(slowResolve).toHaveBeenCalledTimes(1)
+        let settled = false
+        const pinned = r.background.then(() => (settled = true))
+        await new Promise((res) => setTimeout(res, 10))
+        expect(settled).toBe(false)
+        release()
+        await pinned
+    })
+
+    test("through the route: a Stop hook fans out, an agent's review never does", async () => {
+        recordLink({ store, primary: app, secondary: infra })
+        const deps = makeDeps({ resolveContext, inflight: new Map() })
+        const handler = createReviewHandler(() => ({
+            config: minimalConfig(),
+            store,
+            deps,
+        }))
+        const res = () => ({
+            status(c) {
+                this.statusCode = c
+                return this
+            },
+            json(b) {
+                this.body = b
+                return this
+            },
+        })
+        const stop = res()
+        await handler(
+            { body: { cwd: "/work/app", trigger: "stop_hook" } },
+            stop,
+            {
+                config: minimalConfig(),
+            }
+        )
+        expect(stop.body.folders.map((f) => f.repoRoot)).toEqual([
+            "/work/app",
+            "/work/tmp/infra",
+        ])
+        const agent = res()
+        await handler(
+            { body: { cwd: "/work/app", trigger: "mcp_tool" } },
+            agent,
+            {
+                config: minimalConfig(),
+            }
+        )
+        expect(agent.body.folders).toBeUndefined()
     })
 })

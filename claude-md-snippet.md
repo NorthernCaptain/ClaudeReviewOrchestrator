@@ -50,6 +50,12 @@ this session** (the absolute path you'd see from `pwd`). The server uses
   verify each is resolved instead of re-flagging from scratch.
 - The repo must be a git repository. If it isn't, the tool returns
   `ESCALATE` — run `git init` or move into a repo before retrying.
+- `cwd` can be any repo folder you're changing, including another repo's
+  worktree outside this session's folder: pass that folder as `cwd`.
+  Reviewing it (or editing files there with Write/Edit) links it to this
+  session, and from then on the `Stop` hook reviews it too, reporting
+  each folder's findings under its own heading. Fix each finding in the
+  folder it's listed under.
 
 ### Result shapes
 

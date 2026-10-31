@@ -99,6 +99,14 @@ const summarizeContext = (ctx) => ({
     // ESCALATE notification gate (v0.1.14). True means we've already
     // told Claude about the current failure run.
     escalateNotified: ctx.escalateNotified ?? null,
+    // Other repos this context's sessions work on (linked.js).
+    linkedFolders: Object.values(ctx.linkedContexts ?? {}).map((l) => ({
+        repoRoot: l.repoRoot,
+        branch: l.branch,
+        lastChangeAt: l.lastChangeAt
+            ? new Date(l.lastChangeAt).toISOString()
+            : null,
+    })),
     lastBaseline: ctx.lastBaseline
         ? {
               headSha: ctx.lastBaseline.headSha?.slice(0, 12),

@@ -4,13 +4,12 @@
  */
 
 import { jest } from "@jest/globals"
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import {
     asContent,
     reviewRequestHandler,
-    repoInClientRoots,
     ROOTS_PROBE_TIMEOUT_MS,
     REQUEST_REVIEW_INPUT_SHAPE,
     REQUEST_REVIEW_TOOL,
@@ -360,168 +359,89 @@ describe("input schemas", () => {
     })
 })
 
-describe("repoInClientRoots — edge cases", () => {
-    test("ignores roots with malformed file URIs", () => {
-        // `file://` with no path, missing host info: fileURLToPath would
-        // throw; we tolerate and treat as a non-match.
-        const tmp = mkdtempSync(path.join(tmpdir(), "roots-"))
-        try {
-            expect(
-                repoInClientRoots(realpathSync(tmp), [
-                    { uri: "file://" },
-                    { uri: "" },
-                    { uri: null },
-                ])
-            ).toBe(false)
-        } finally {
-            rmSync(tmp, { recursive: true, force: true })
-        }
-    })
-
-    test("accepts bare absolute path root URIs", () => {
-        const tmp = mkdtempSync(path.join(tmpdir(), "roots-"))
-        const tmpReal = realpathSync(tmp)
-        try {
-            expect(repoInClientRoots(tmpReal, [{ uri: tmpReal }])).toBe(true)
-        } finally {
-            rmSync(tmp, { recursive: true, force: true })
-        }
-    })
-
-    test("ignores roots whose realpath fails (non-existent path)", () => {
-        expect(
-            repoInClientRoots("/repo", [
-                { uri: "file:///definitely/does/not/exist" },
-            ])
-        ).toBe(false)
-    })
-})
-
-describe("repoInClientRoots", () => {
-    test("returns false when roots is null or non-array", () => {
-        expect(repoInClientRoots("/repo", null)).toBe(false)
-        expect(repoInClientRoots("/repo", undefined)).toBe(false)
-        expect(repoInClientRoots("/repo", "nope")).toBe(false)
-    })
-
-    test("returns false when roots is empty (advertised but nothing allowed)", () => {
-        expect(repoInClientRoots("/repo", [])).toBe(false)
-    })
-
-    test("accepts repo inside an advertised root (file:// URI)", () => {
-        // We use the test's own tmpdir so realpath resolves. On macOS,
-        // /var/folders is a symlink to /private/var/folders — repoInClientRoots
-        // expects an already-realpath'd repoRoot per its contract (matches
-        // how resolveContext produces its repoRoot value), so we realpath
-        // here before passing in.
-        const tmp = mkdtempSync(path.join(tmpdir(), "roots-"))
-        const tmpReal = realpathSync(tmp)
-        try {
-            const sub = path.join(tmpReal, "sub")
-            mkdirSync(sub)
-            expect(repoInClientRoots(sub, [{ uri: `file://${tmp}` }])).toBe(
-                true
-            )
-        } finally {
-            rmSync(tmp, { recursive: true, force: true })
-        }
-    })
-
-    test("rejects repo outside every advertised root", () => {
-        const tmp = mkdtempSync(path.join(tmpdir(), "roots-"))
-        try {
-            // tmp is the only advertised root; /etc is clearly outside.
-            expect(repoInClientRoots("/etc", [{ uri: `file://${tmp}` }])).toBe(
-                false
-            )
-        } finally {
-            rmSync(tmp, { recursive: true, force: true })
-        }
-    })
-
-    test("ignores non-file:// URIs", () => {
-        expect(
-            repoInClientRoots("/repo", [{ uri: "https://example.com/repo" }])
-        ).toBe(false)
-    })
-})
-
-describe("maybeListClientRoots edge cases (via reviewRequestHandler)", () => {
+describe("reviewRequestHandler — linking the reviewed folder to the session's repo", () => {
     let store
     beforeEach(() => {
         store = makeStore()
     })
     afterEach(() => cleanup(store))
 
-    test("mcpServer with no `server` low-level falls back to allowedRoots-only", async () => {
-        const out = await reviewRequestHandler({
-            args: { cwd: "/repo" },
-            ctx: {
-                config: minimalConfig(),
-                store,
-                deps: happyDeps(),
-                mcpServer: {
-                    /* no `.server` */
-                },
-            },
-        })
-        expect(out.structuredContent.status).toBe("GOOD_TO_GO")
-    })
-
-    test("when listRoots returns a non-array, treats it as empty → ESCALATE NOT_IN_CLIENT_ROOT", async () => {
-        const mcpServer = {
-            server: {
-                getClientCapabilities: () => ({ roots: {} }),
-                listRoots: async () => ({ roots: "garbage" }),
-            },
-        }
-        const out = await reviewRequestHandler({
-            args: { cwd: "/repo" },
-            ctx: {
-                config: minimalConfig(),
-                store,
-                deps: happyDeps(),
-                mcpServer,
-            },
-        })
-        expect(out.structuredContent.status).toBe("ESCALATE")
-        expect(out.structuredContent.code).toBe("NOT_IN_CLIENT_ROOT")
-    })
-})
-
-describe("reviewRequestHandler — MCP roots check", () => {
-    let store
-    beforeEach(() => {
-        store = makeStore()
-    })
-    afterEach(() => cleanup(store))
-
-    const mockMcpServerWithRoots = (rootsArray) => ({
-        server: {
-            getClientCapabilities: () => ({ roots: {} }),
-            listRoots: async () => ({ roots: rootsArray }),
+    const session = {
+        repo: "app",
+        repoRoot: "/work/app",
+        branch: "main",
+        key: "/work/app|main",
+    }
+    const other = {
+        repo: "infra",
+        repoRoot: "/work/tmp/infra-wt",
+        branch: "feat",
+        key: "/work/tmp/infra-wt|feat",
+    }
+    const contexts = { "/work/app": session, "/work/tmp/infra-wt": other }
+    const deps = () => ({
+        ...happyDeps(),
+        currentHeadSha: async () => "abc1234",
+        isWorkingTreeClean: async () => false,
+        resolveContext: ({ cwd }) => {
+            const c = contexts[cwd]
+            if (!c) {
+                throw Object.assign(new Error(`not a repo: ${cwd}`), {
+                    code: "NOT_A_GIT_REPO",
+                })
+            }
+            return c
         },
     })
-
-    test("when client advertises roots, repos outside them get ESCALATE NOT_IN_CLIENT_ROOT", async () => {
-        const out = await reviewRequestHandler({
-            args: { cwd: "/repo" },
+    const withRoots = (roots) => ({
+        server: {
+            getClientCapabilities: () => ({ roots: {} }),
+            listRoots: jest.fn(async () => ({ roots })),
+        },
+    })
+    const review = (cwd, mcpServer, extra = {}) =>
+        reviewRequestHandler({
+            args: { cwd },
             ctx: {
                 config: minimalConfig(),
                 store,
-                deps: happyDeps(),
-                mcpServer: mockMcpServerWithRoots([
-                    // No roots that contain /repo.
-                    { uri: "file:///somewhere/else" },
-                ]),
+                deps: deps(),
+                mcpServer,
+                ...extra,
             },
+            requestId: 42,
         })
-        expect(out.structuredContent.status).toBe("ESCALATE")
-        expect(out.structuredContent.code).toBe("NOT_IN_CLIENT_ROOT")
+    const linksOfSession = () =>
+        Object.keys(store.peek(session.key)?.linkedContexts ?? {})
+
+    test("a folder outside the client's roots is reviewed, and linked to the session's repo", async () => {
+        const out = await review(
+            "/work/tmp/infra-wt",
+            withRoots([{ uri: "file:///work/app" }])
+        )
+        expect(out.structuredContent.status).toBe("GOOD_TO_GO")
+        expect(linksOfSession()).toEqual([other.key])
     })
 
-    test("when listRoots throws, handler FAILS CLOSED with ESCALATE ROOTS_FETCH_FAILED", async () => {
-        const mcpServer = {
+    test("the session's own repo links nothing", async () => {
+        await review("/work/app", withRoots([{ uri: "file:///work/app" }]))
+        expect(linksOfSession()).toEqual([])
+    })
+
+    test("roots that can't name the session (empty, malformed, not a repo, probe failure) link nothing and never block", async () => {
+        for (const roots of [
+            [],
+            "not-an-array",
+            [{ uri: "file:///" }, { uri: "https://x" }, { uri: "" }],
+            [{ uri: "file:///nowhere" }],
+        ]) {
+            const out = await review("/work/tmp/infra-wt", withRoots(roots))
+            expect(["GOOD_TO_GO", "NO_CHANGES"]).toContain(
+                out.structuredContent.status
+            )
+        }
+        const warn = jest.fn()
+        const failing = {
             server: {
                 getClientCapabilities: () => ({ roots: {} }),
                 listRoots: async () => {
@@ -529,62 +449,56 @@ describe("reviewRequestHandler — MCP roots check", () => {
                 },
             },
         }
-        const logger = { warn: jest.fn(), error: jest.fn() }
-        const out = await reviewRequestHandler({
-            args: { cwd: "/repo" },
-            ctx: {
-                config: minimalConfig(),
-                store,
-                deps: happyDeps(),
-                logger,
-                mcpServer,
-            },
+        const out = await review("/work/tmp/infra-wt", failing, {
+            logger: { warn, info() {}, error() {} },
         })
+        expect(["GOOD_TO_GO", "NO_CHANGES"]).toContain(
+            out.structuredContent.status
+        )
+        expect(warn).toHaveBeenCalled()
+        expect(linksOfSession()).toEqual([])
+    })
+
+    test("a bare absolute path root works like a file:// one", async () => {
+        await review("/work/tmp/infra-wt", withRoots([{ uri: "/work/app" }]))
+        expect(linksOfSession()).toEqual([other.key])
+    })
+
+    test("a folder that isn't a repo links nothing; the review reports it", async () => {
+        const out = await review(
+            "/work/tmp/nope",
+            withRoots([{ uri: "file:///work/app" }])
+        )
         expect(out.structuredContent.status).toBe("ESCALATE")
-        expect(out.structuredContent.code).toBe("ROOTS_FETCH_FAILED")
-        expect(out.structuredContent.reason).toMatch(/not supported/)
-        expect(logger.warn).toHaveBeenCalled()
+        expect(linksOfSession()).toEqual([])
     })
 
     test("the roots probe rides the tool call's own stream, with a bounded timeout", async () => {
-        const listRoots = jest.fn(async () => ({ roots: [] }))
-        const mcpServer = {
-            server: { getClientCapabilities: () => ({ roots: {} }), listRoots },
-        }
-        await reviewRequestHandler({
-            args: { cwd: "/repo" },
-            ctx: {
-                config: minimalConfig(),
-                store,
-                deps: happyDeps(),
-                mcpServer,
-            },
-            requestId: 42,
-        })
-        expect(listRoots).toHaveBeenCalledTimes(1)
-        expect(listRoots.mock.calls[0][1]).toEqual({
+        const mcpServer = withRoots([])
+        await review("/work/app", mcpServer)
+        expect(mcpServer.server.listRoots).toHaveBeenCalledTimes(1)
+        expect(mcpServer.server.listRoots.mock.calls[0][1]).toEqual({
             relatedRequestId: 42,
             timeout: ROOTS_PROBE_TIMEOUT_MS,
         })
     })
 
-    test("when client doesn't advertise roots capability, no listRoots call is made", async () => {
+    test("a client without the roots capability isn't asked, and its reviews run", async () => {
         const listRoots = jest.fn()
-        const mcpServer = {
-            server: {
-                getClientCapabilities: () => ({}),
-                listRoots,
-            },
-        }
-        await reviewRequestHandler({
-            args: { cwd: "/repo" },
-            ctx: {
-                config: minimalConfig(),
-                store,
-                deps: happyDeps(),
-                mcpServer,
-            },
+        const out = await review("/work/tmp/infra-wt", {
+            server: { getClientCapabilities: () => ({}), listRoots },
         })
         expect(listRoots).not.toHaveBeenCalled()
+        expect(["GOOD_TO_GO", "NO_CHANGES"]).toContain(
+            out.structuredContent.status
+        )
+        const noServer = await review("/work/tmp/infra-wt", null)
+        expect(["GOOD_TO_GO", "NO_CHANGES"]).toContain(
+            noServer.structuredContent.status
+        )
+        const noLowLevel = await review("/work/tmp/infra-wt", {})
+        expect(["GOOD_TO_GO", "NO_CHANGES"]).toContain(
+            noLowLevel.structuredContent.status
+        )
     })
 })

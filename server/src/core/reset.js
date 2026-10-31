@@ -9,7 +9,7 @@ import {
     ContextError,
     resolveContext,
 } from "./review/context.js"
-import { applyRootsPolicy, asContent } from "./review/mcp.js"
+import { asContent } from "./review/mcp.js"
 
 const escalate = (status, code, reason) => ({
     status: "ESCALATE",
@@ -19,6 +19,14 @@ const escalate = (status, code, reason) => ({
     reason,
     code,
 })
+
+// A reset clears the loop, not the session's linked folders (linked.js):
+// one of them may still have open findings its Stop hook must see.
+const resetKeepingLinks = (store, context) => {
+    const links = store.peek?.(context.key)?.linkedContexts
+    const fresh = store.reset(context)
+    return links ? store.save(context.key, { linkedContexts: links }) : fresh
+}
 
 export const handleReset = async ({ body, config, store, deps = {} }) => {
     const cwd = body?.cwd
@@ -50,7 +58,7 @@ export const handleReset = async ({ body, config, store, deps = {} }) => {
         }
     }
 
-    const fresh = store.reset(context)
+    const fresh = resetKeepingLinks(store, context)
     return {
         httpStatus: 200,
         body: {
@@ -89,7 +97,7 @@ export const handleDashboardReset = ({ body, store }) => {
             body: { ok: false, error: `unknown context: ${contextKey}` },
         }
     }
-    const fresh = store.reset({
+    const fresh = resetKeepingLinks(store, {
         key: known.key,
         repoRoot: known.repoRoot,
         branch: known.branch,
@@ -147,27 +155,17 @@ const summarizeReset = (body) => {
     return lines.join("\n")
 }
 
-// MCP tool handler for `reset_review_context`. Honors the client's
-// advertised roots the same way request_review does.
+// MCP tool handler for `reset_review_context`: any repo inside
+// allowedRoots, like request_review.
 export const resetRequestHandler = async ({
     args,
-    ctx: { config, store, logger, deps = {}, mcpServer },
-    requestId,
+    ctx: { config, store, deps = {} },
 }) => {
-    const policy = await applyRootsPolicy({
-        mcpServer,
-        logger,
-        deps,
-        requestId,
-    })
-    if (!policy.ok) {
-        return asContent(summarizeReset(policy.body), policy.body)
-    }
     const result = await handleReset({
         body: { cwd: args?.cwd },
         config,
         store,
-        deps: policy.deps,
+        deps,
     })
     return asContent(summarizeReset(result.body), result.body)
 }
