@@ -1,0 +1,5 @@
+{
+    "title": "A flagged change that follows the referenced review guidelines",
+    "rule": "False positives with repository guidance",
+    "expect": "clean"
+}

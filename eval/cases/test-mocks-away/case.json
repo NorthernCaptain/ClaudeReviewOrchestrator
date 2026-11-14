@@ -1,0 +1,8 @@
+{
+    "title": "The new test mocks the function it claims to test",
+    "rule": "Tests",
+    "expect": "issues",
+    "findings": [
+        { "files": ["test/discount.test.js"], "minSeverity": "minor", "slack": 30 }
+    ]
+}

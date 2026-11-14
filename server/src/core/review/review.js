@@ -114,12 +114,14 @@ export const REVIEW_CONFIG_KEYS = Object.freeze([
 // config (the pinned global config merged with .review-orchestrator.json),
 // the review code (reviewVersion) and the shell (shellVersion). Every
 // persisted cache shortcut requires it to match, and it's part of the
-// duplicate key. Caller extras are separate (extrasHash).
+// duplicate key. Caller extras are separate (extrasHash). The rules'
+// text is in it too: a rulesFile edit leaves config and code unchanged.
 export const computeReviewKey = ({
     config,
     provider,
     reviewVersion = null,
     shellVersion = null,
+    rulesHash = null,
 }) =>
     sha256(
         stableStringify({
@@ -129,6 +131,7 @@ export const computeReviewKey = ({
             ),
             reviewVersion,
             shellVersion,
+            rulesHash,
         })
     )
 
@@ -277,6 +280,11 @@ const partitionFindings = (findings, payloadPaths, repoRoot) => {
     }
     return { kept, dropped }
 }
+
+// The reviewer's findings the server keeps for this payload ({ kept,
+// dropped }): safe repo-relative paths of files in the payload only.
+export const filterPayloadFindings = (findings, payload, repoRoot) =>
+    partitionFindings(findings, collectPayloadPaths(payload), repoRoot)
 
 // Re-validate cached state findings before they leave the server. Legacy
 // or corrupt state could carry unsafe paths; this is the defensive read
@@ -563,6 +571,8 @@ export const handleReview = async ({
     logger = noopLogger,
     deps = {},
     schema = null,
+    // The core's review rules (rules.js); null reviews without them.
+    rules = null,
     // The running core's versions: for the review key and duplicate key.
     reviewVersion = null,
     shellVersion = null,
@@ -737,6 +747,23 @@ export const handleReview = async ({
         logger: log,
     })
     config = mergeWithGlobal(config, projectConfig)
+    // Read per review: config.reviewer.rulesFile can change between two.
+    let reviewRules = null
+    try {
+        reviewRules = rules ? rules.resolve(config) : null
+    } catch (err) {
+        log.error(
+            { err: err?.message, rulesFile: config.reviewer?.rulesFile },
+            "review rules unreadable"
+        )
+        return {
+            httpStatus: 500,
+            body: envelope("ESCALATE", {
+                reason: err?.message ?? "review rules unreadable",
+                code: err?.code ?? "REVIEW_RULES_UNREADABLE",
+            }),
+        }
+    }
     const effectiveProvider =
         providerOverride ?? config.reviewer?.provider ?? "codex"
     const cacheKeys = {
@@ -746,6 +773,7 @@ export const handleReview = async ({
             provider: effectiveProvider,
             reviewVersion,
             shellVersion,
+            rulesHash: reviewRules?.hash ?? null,
         }),
         extrasHash: computeExtrasHash(body?.extra_instructions),
     }
@@ -761,6 +789,12 @@ export const handleReview = async ({
             extraReviewerInstructionsSet: Boolean(
                 config.extraReviewerInstructions
             ),
+            rules: reviewRules
+                ? {
+                      source: reviewRules.source,
+                      hash: short(reviewRules.hash, 16),
+                  }
+                : null,
         },
         "config resolved"
     )
@@ -1264,6 +1298,7 @@ export const handleReview = async ({
             exclusions: state.exclusions ?? [],
             omittedFiles: payload.omittedFiles ?? [],
             diffRef: payload.diffRef,
+            reviewRules: reviewRules?.text ?? null,
         })
 
         // Pick the reviewer adapter (codex or claude). The picker maps
@@ -1511,10 +1546,9 @@ export const handleReview = async ({
         //   2) Compute blockingFindings from the remaining set using
         //      config.blockingSeverities (the project-config-merged value when
         //      Phase 5 lands).
-        const payloadPaths = collectPayloadPaths(payload)
-        const { kept: keptAll, dropped } = partitionFindings(
+        const { kept: keptAll, dropped } = filterPayloadFindings(
             codexResult.findings,
-            payloadPaths,
+            payload,
             context.repoRoot
         )
         // Server-side guarantee for user exclusions (v1.1.3): the
@@ -1758,6 +1792,7 @@ export const createReviewHandler =
             deps,
             metrics = null,
             schema = null,
+            rules = null,
             versions = {},
         } = getOptions(request)
         const deadline = request?.deadline ?? null
@@ -1770,6 +1805,7 @@ export const createReviewHandler =
                 logger,
                 deps,
                 schema,
+                rules,
                 ...versions,
                 deadline,
                 requestId: req.requestId ?? null,

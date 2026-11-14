@@ -1,0 +1,8 @@
+{
+    "title": "New code repeats a literal that has a named constant",
+    "rule": "Constants",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/reports.js"], "near": "\"admin\"", "minSeverity": "minor" }
+    ]
+}

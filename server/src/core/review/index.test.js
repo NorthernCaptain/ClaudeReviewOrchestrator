@@ -11,6 +11,9 @@ const resources = {
     "review/codex-output.schema.json": readFileSync(
         new URL("./codex-output.schema.json", import.meta.url)
     ),
+    "review/review-rules.md": readFileSync(
+        new URL("./review-rules.md", import.meta.url)
+    ),
 }
 
 const happyContext = {
@@ -91,6 +94,36 @@ describe("createReviewEntry", () => {
         expect(() =>
             createReviewEntry({ resources: {}, getLive: () => null })
         ).toThrow(/core resource missing/)
+    })
+
+    test("refuses staging without the review rules", () => {
+        expect(() =>
+            createReviewEntry({
+                resources: {
+                    "review/codex-output.schema.json":
+                        resources["review/codex-output.schema.json"],
+                },
+                getLive: () => null,
+            })
+        ).toThrow(/core resource missing: review\/review-rules.md/)
+    })
+
+    test("every review prompt carries the bundled rules", async () => {
+        const runAndParse = okReview()
+        const live = makeLive(runAndParse)
+        const review = createReviewEntry({ resources, getLive: () => live })
+        await review.mcp.requestReview({
+            args: { cwd: "/repo" },
+            requestId: 1,
+            mcpServer: null,
+        })
+        const { prompt } = runAndParse.mock.calls[0][0]
+        expect(review.rules.bundled.source).toBe("bundled")
+        expect(prompt).toContain("<<<REVIEW_RULES>>>")
+        expect(prompt).toContain(review.rules.bundled.text)
+        expect(prompt.indexOf("<<<REVIEW_RULES>>>")).toBeLessThan(
+            prompt.indexOf("\n<<<REVIEW_INPUT>>>\n")
+        )
     })
 
     test("POST /review runs on the live capabilities with this core's schema", async () => {

@@ -259,6 +259,36 @@ describe("validateConfig", () => {
     })
 })
 
+describe("reviewer.rulesFile", () => {
+    test("defaults to null: the bundled rules", () => {
+        expect(validateConfig({ authToken: "t" }).reviewer.rulesFile).toBe(null)
+    })
+
+    test("expands ~/ and keeps absolute paths", () => {
+        const home = "/home/u"
+        const at = (rulesFile) =>
+            validateConfig(
+                { authToken: "t", reviewer: { rulesFile } },
+                { home }
+            ).reviewer
+        expect(at("~/rules/review.md").rulesFile).toBe(
+            path.join(home, "rules/review.md")
+        )
+        expect(at("/etc/review.md").rulesFile).toBe("/etc/review.md")
+        // The rest of the reviewer block keeps its defaults.
+        expect(at("/etc/review.md").provider).toBe("codex")
+    })
+
+    test("rejects a relative path", () => {
+        expect(() =>
+            validateConfig({
+                authToken: "t",
+                reviewer: { rulesFile: "rules.md" },
+            })
+        ).toThrow(/reviewer\.rulesFile: must be an absolute path/)
+    })
+})
+
 describe("port", () => {
     test("accepts 0 (an OS-assigned port) and rejects out-of-range values", () => {
         expect(validateConfig({ authToken: "t", port: 0 }).port).toBe(0)

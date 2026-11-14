@@ -1,0 +1,8 @@
+{
+    "title": "A rule that lives only in a file AGENTS.md points to",
+    "rule": "Repository guidance: follow referenced files",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/shipping.js"], "near": "FREE_SHIPPING_THRESHOLD_CENTS", "minSeverity": "minor" }
+    ]
+}

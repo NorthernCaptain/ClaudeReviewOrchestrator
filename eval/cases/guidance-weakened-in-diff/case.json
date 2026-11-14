@@ -1,0 +1,8 @@
+{
+    "title": "The change drops a rule from AGENTS.md and then breaks it",
+    "rule": "Repository guidance: edited guidance uses the pre-change version",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/receipt.js", "AGENTS.md"], "minSeverity": "minor" }
+    ]
+}

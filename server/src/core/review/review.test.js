@@ -20,6 +20,7 @@ import {
 import { recordLink } from "./linked.js"
 import { ContextError } from "./context.js"
 import { createOutputSchema } from "./schema.js"
+import { createReviewRules, RulesError } from "./rules.js"
 import { createStateStore } from "../../state.js"
 
 const minimalConfig = () => ({
@@ -6053,6 +6054,89 @@ describe("handleReview — review key and caller extras (hot-reload plan §5.5)"
         await run(spy, { body: { provider: "claude" } })
         await run(spy, { body: { provider: "codex" } })
         expect(spy).toHaveBeenCalledTimes(3)
+    })
+
+    describe("review rules", () => {
+        const fileConfig = () => {
+            const cfg = minimalConfig()
+            cfg.reviewer = { provider: "codex", rulesFile: "/r/rules.md" }
+            return cfg
+        }
+
+        test("the prompt carries the resolved rules before the diff", async () => {
+            const spy = jest.fn(pass)
+            const rules = createReviewRules(Buffer.from("# Bundled rules"))
+            await run(spy, { rules })
+            const { prompt } = spy.mock.calls[0][0]
+            expect(prompt).toContain("<<<REVIEW_RULES>>>")
+            expect(prompt).toContain("# Bundled rules")
+            expect(prompt.indexOf("# Bundled rules")).toBeLessThan(
+                prompt.indexOf("\n<<<REVIEW_INPUT>>>\n")
+            )
+        })
+
+        test("without rules the prompt has no rules block", async () => {
+            const spy = jest.fn(pass)
+            await run(spy)
+            expect(spy.mock.calls[0][0].prompt).not.toContain(
+                "<<<END_REVIEW_RULES>>>"
+            )
+        })
+
+        test("an edited rulesFile reviews the unchanged tree again", async () => {
+            let text = "# v1"
+            const rules = createReviewRules(Buffer.from("b"), {
+                readFile: () => Buffer.from(text),
+            })
+            const spy = jest.fn(pass)
+            const config = fileConfig()
+            await run(spy, { rules, config })
+            expect((await run(spy, { rules, config })).body.status).toBe(
+                "NO_CHANGES"
+            )
+            text = "# v2"
+            expect((await run(spy, { rules, config })).body.status).toBe(
+                "GOOD_TO_GO"
+            )
+            expect(spy).toHaveBeenCalledTimes(2)
+            expect(spy.mock.calls[1][0].prompt).toContain("# v2")
+        })
+
+        test("an unreadable rulesFile escalates without running the reviewer", async () => {
+            const rules = createReviewRules(Buffer.from("b"), {
+                readFile: () => {
+                    throw new RulesError("can't open review rules /r/rules.md")
+                },
+            })
+            const spy = jest.fn(pass)
+            const r = await run(spy, { rules, config: fileConfig() })
+            expect(r.httpStatus).toBe(500)
+            expect(r.body.status).toBe("ESCALATE")
+            expect(r.body.code).toBe("REVIEW_RULES_UNREADABLE")
+            expect(r.body.reason).toContain("/r/rules.md")
+            expect(spy).not.toHaveBeenCalled()
+        })
+
+        test("a non-RulesError keeps a generic code", async () => {
+            const rules = {
+                resolve: () => {
+                    throw new Error("boom")
+                },
+            }
+            const r = await run(jest.fn(pass), { rules })
+            expect(r.body.code).toBe("REVIEW_RULES_UNREADABLE")
+            expect(r.body.reason).toBe("boom")
+        })
+
+        test("computeReviewKey covers the rules hash", () => {
+            const base = { config: minimalConfig(), provider: "codex" }
+            expect(computeReviewKey({ ...base, rulesHash: "a" })).not.toBe(
+                computeReviewKey({ ...base, rulesHash: "b" })
+            )
+            expect(computeReviewKey({ ...base, rulesHash: null })).toBe(
+                computeReviewKey(base)
+            )
+        })
     })
 
     test("a baseline from before the review key never matches", async () => {

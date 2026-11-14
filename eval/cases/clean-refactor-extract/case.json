@@ -1,0 +1,5 @@
+{
+    "title": "Duplicated validation extracted into one helper, behaviour unchanged",
+    "rule": "False positives",
+    "expect": "clean"
+}

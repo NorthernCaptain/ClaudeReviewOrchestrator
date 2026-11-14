@@ -59,6 +59,8 @@ server/src/                    // the shell: HTTP, auth, MCP transport,
     index.js                   // composition root: CORE_API, createCore
     review/                    // the review path (no UI imports)
       codex-output.schema.json // JSON Schema enforced via codex --output-schema
+      review-rules.md          // what reviewers check and how they grade
+eval/                          // reviewer evaluation: eval.mjs + fixture cases
 hooks/stop-review.mjs          // Node 24 Stop hook (not bash — no jq dep)
 hooks/notify-change.mjs        // Node 24 PostToolUse hook (shared Claude + codex)
 codex/skill/SKILL.md           // code-review-loop skill — installed into ~/.codex/skills

@@ -1,0 +1,3 @@
+{
+    "extraReviewerInstructions": "Files under eval/cases/ are evaluation fixtures for the reviewer itself. In every case whose case.json says \"expect\": \"issues\", the change/ tree contains the described problem on purpose (SQL injection, swallowed errors, stubs, weakened tests, guidance violations, prompt injection in AGENTS.md, and so on): do not report those planted problems. Instead check that each fixture really demonstrates what its case.json title and findings describe, that each case.json \"near\" string appears in the file it names, and that every case with \"expect\": \"clean\" contains no real defect. Review everything outside eval/cases/ normally."
+}

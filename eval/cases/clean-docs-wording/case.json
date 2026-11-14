@@ -1,0 +1,5 @@
+{
+    "title": "A README wording fix that keeps every documented fact",
+    "rule": "False positives",
+    "expect": "clean"
+}

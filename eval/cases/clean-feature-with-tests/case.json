@@ -1,0 +1,5 @@
+{
+    "title": "A small feature that reuses helpers and ships with real tests",
+    "rule": "False positives",
+    "expect": "clean"
+}

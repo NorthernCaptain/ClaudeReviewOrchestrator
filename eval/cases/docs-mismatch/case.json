@@ -1,0 +1,8 @@
+{
+    "title": "A default changes; the README that documents it does not",
+    "rule": "Documentation",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/client.js", "README.md"], "near": "retries", "minSeverity": "minor", "slack": 10 }
+    ]
+}

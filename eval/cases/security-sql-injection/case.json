@@ -1,0 +1,8 @@
+{
+    "title": "A new endpoint builds SQL from the query string",
+    "rule": "Security",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/routes/users.js"], "near": "LIKE", "minSeverity": "major" }
+    ]
+}

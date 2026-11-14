@@ -1,0 +1,8 @@
+{
+    "title": "A failed write is swallowed and reported as success",
+    "rule": "Errors and resources",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/profile.js"], "near": "catch", "minSeverity": "major", "slack": 8 }
+    ]
+}

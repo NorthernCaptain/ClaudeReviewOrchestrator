@@ -1,0 +1,8 @@
+{
+    "title": "A rule from an AGENTS.md in the changed file's folder",
+    "rule": "Repository guidance: nested AGENTS.md",
+    "expect": "issues",
+    "findings": [
+        { "files": ["services/billing/src/invoice.js"], "near": "Date.now()", "minSeverity": "minor" }
+    ]
+}

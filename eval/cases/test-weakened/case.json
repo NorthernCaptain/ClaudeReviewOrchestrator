@@ -1,0 +1,8 @@
+{
+    "title": "A bug is introduced and the test expectation rewritten to match it",
+    "rule": "Tests: expectations not rewritten to match wrong output",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/paginate.js", "test/paginate.test.js"], "minSeverity": "major", "slack": 20 }
+    ]
+}

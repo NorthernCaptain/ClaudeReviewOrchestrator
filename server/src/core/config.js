@@ -72,6 +72,18 @@ const ConfigSchema = z
                 provider: z
                     .enum(["codex", "claude", "gemini"])
                     .default("codex"),
+                // The review rules (Markdown) every reviewer gets. null
+                // uses the copy bundled with the core
+                // (core/review/review-rules.md); a path is read on every
+                // review, so an edit applies to the next one.
+                rulesFile: z
+                    .string()
+                    .refine(
+                        (p) => path.isAbsolute(p) || p.startsWith("~/"),
+                        "must be an absolute path or start with ~/"
+                    )
+                    .nullable()
+                    .default(null),
                 claude: z
                     .object({
                         binary: z.string().default("claude"),
@@ -281,6 +293,10 @@ const expandPathsInConfig = (cfg, home) => ({
         }
     }),
     reviewsDir: expandHome(cfg.reviewsDir, home),
+    reviewer: {
+        ...cfg.reviewer,
+        rulesFile: expandHome(cfg.reviewer.rulesFile, home),
+    },
     logging: {
         ...cfg.logging,
         dir: expandHome(cfg.logging.dir, home),

@@ -34,6 +34,9 @@ and the phased implementation plan — read it before making non-trivial changes
 core (review path under `core/review/`); `hooks/` contains shared Stop
 and PostToolUse hooks; `codex/skill/SKILL.md` supplies the installed review
 skill; and `install.sh --codex` wires Codex config, hooks, and the skill.
+`server/src/core/review/review-rules.md` holds the review rules every
+reviewer gets, and `eval/` measures reviewers against fixture repositories
+(`npm run eval`; it runs the real reviewer CLIs).
 
 `reviews/`, `node_modules/`, `coverage/`, `server/.core-versions/` and
 persisted runtime state are generated — do not commit them.

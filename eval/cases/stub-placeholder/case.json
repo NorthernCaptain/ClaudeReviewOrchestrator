@@ -1,0 +1,8 @@
+{
+    "title": "A placeholder implementation is wired into checkout",
+    "rule": "Purpose: unfinished work",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/shipping.js", "src/checkout.js"], "minSeverity": "major", "slack": 15 }
+    ]
+}

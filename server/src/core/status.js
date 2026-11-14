@@ -33,6 +33,7 @@ const redactConfig = (config) => {
         reviewer: config.reviewer
             ? {
                   provider: config.reviewer.provider,
+                  rulesFile: config.reviewer.rulesFile ?? null,
                   claude: config.reviewer.claude
                       ? {
                             binary: config.reviewer.claude.binary,

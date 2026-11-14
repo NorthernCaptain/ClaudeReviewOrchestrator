@@ -1,0 +1,8 @@
+{
+    "title": "A new enum value misses the label registry its serializer requires",
+    "rule": "Callers and contracts",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/order-status.js", "src/refunds.js"], "minSeverity": "major", "slack": 20 }
+    ]
+}

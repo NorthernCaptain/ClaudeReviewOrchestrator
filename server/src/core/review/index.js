@@ -10,6 +10,7 @@
 import { REQUEST_REVIEW_TOOL, reviewRequestHandler } from "./mcp.js"
 import { createReviewHandler } from "./review.js"
 import { pickReviewer } from "./reviewer.js"
+import { createReviewRules, REVIEW_RULES_RESOURCE } from "./rules.js"
 import { createOutputSchema, OUTPUT_SCHEMA_RESOURCE } from "./schema.js"
 
 // The review half of a core. `resources` are the bytes the shell read at
@@ -27,6 +28,7 @@ export const createReviewEntry = ({
         throw new Error(`core resource missing: ${OUTPUT_SCHEMA_RESOURCE}`)
     }
     const schema = createOutputSchema(bytes, { strictPath: codexSchemaPath })
+    const rules = createReviewRules(resources?.[REVIEW_RULES_RESOURCE])
     // A review runs on the config the shell pinned when it admitted it.
     const options = (request) => {
         const live = getLive()
@@ -38,11 +40,13 @@ export const createReviewEntry = ({
             deps: live.deps,
             metrics: live.metrics,
             schema,
+            rules,
             versions,
         }
     }
     return {
         schema,
+        rules,
         routes: { review: createReviewHandler(options) },
         mcp: {
             toolDef: REQUEST_REVIEW_TOOL,

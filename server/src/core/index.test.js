@@ -9,10 +9,14 @@ import { readFileSync } from "node:fs"
 const SCHEMA = readFileSync(
     new URL("./review/codex-output.schema.json", import.meta.url)
 )
+const RULES = readFileSync(new URL("./review/review-rules.md", import.meta.url))
 
 const staging = (over = {}) =>
     Object.freeze({
-        resources: { "review/codex-output.schema.json": SCHEMA },
+        resources: {
+            "review/codex-output.schema.json": SCHEMA,
+            "review/review-rules.md": RULES,
+        },
         version: "abc123",
         packageVersion: "1.2.3",
         startedAt: 1000,

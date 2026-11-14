@@ -1,0 +1,8 @@
+{
+    "title": "A refactor drops the guard against out-of-order responses",
+    "rule": "Async work and lifecycle",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/search.js"], "near": "state.results = ", "minSeverity": "major", "slack": 10 }
+    ]
+}

@@ -1,0 +1,8 @@
+{
+    "title": "A debug log of the whole user record is left in the login path",
+    "rule": "Scope / Security: debug leftovers",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/auth.js"], "near": "console.log", "minSeverity": "minor" }
+    ]
+}

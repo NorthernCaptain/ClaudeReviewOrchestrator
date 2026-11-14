@@ -80,6 +80,68 @@ describe("wrapPrompt", () => {
         expect(out).toMatch(/<<<REVIEW_INPUT>>>\nDIFF\n<<<END_REVIEW_INPUT>>>/)
     })
 
+    describe("REVIEW_RULES", () => {
+        const block = (out) =>
+            out.slice(
+                out.indexOf("\n<<<REVIEW_RULES>>>\n") + 1,
+                out.indexOf("<<<END_REVIEW_RULES>>>")
+            )
+
+        test("absent when no rules are given", () => {
+            expect(wrapPrompt({ payloadText: "x" })).not.toContain(
+                "<<<END_REVIEW_RULES>>>"
+            )
+            expect(
+                wrapPrompt({ payloadText: "x", reviewRules: "" })
+            ).not.toContain("<<<END_REVIEW_RULES>>>")
+        })
+
+        test("sits between REVIEW_SYSTEM and REVIEW_INPUT, rules verbatim", () => {
+            const out = wrapPrompt({
+                payloadText: "DIFF",
+                reviewRules: "# Rules\n- check <<<things>>>",
+            })
+            const sysEnd = out.indexOf("<<<END_REVIEW_SYSTEM>>>")
+            const rules = out.indexOf("\n<<<REVIEW_RULES>>>\n")
+            const input = out.indexOf("\n<<<REVIEW_INPUT>>>\n")
+            expect(sysEnd).toBeLessThan(rules)
+            expect(rules).toBeLessThan(input)
+            expect(block(out)).toContain("\n\n# Rules\n- check <<<things>>>\n")
+        })
+
+        test("the directive names HEAD for working-tree changes", () => {
+            const out = wrapPrompt({ payloadText: "x", reviewRules: "R" })
+            expect(block(out)).toContain(
+                "`git --no-optional-locks show HEAD:<path>`"
+            )
+        })
+
+        test("the directive names a range's base commit", () => {
+            const out = wrapPrompt({
+                payloadText: "x",
+                reviewRules: "R",
+                diffRef: "abc1234def..HEAD",
+            })
+            expect(block(out)).toContain("show abc1234def:<path>")
+        })
+
+        test("an unexpected ref falls back to HEAD", () => {
+            const out = wrapPrompt({
+                payloadText: "x",
+                reviewRules: "R",
+                diffRef: "main; rm -rf /",
+            })
+            expect(block(out)).toContain("show HEAD:<path>")
+            expect(out).not.toContain("rm -rf")
+        })
+    })
+
+    test("the preamble limits repository guidance to adding criteria", () => {
+        expect(SYSTEM_PREAMBLE).toContain("<<<REVIEW_RULES>>>")
+        expect(SYSTEM_PREAMBLE).toContain("Repository guidance exception")
+        expect(SYSTEM_PREAMBLE).toMatch(/lower a severity/)
+    })
+
     test("omits PRIOR_FINDINGS section when none supplied", () => {
         // The preamble itself mentions the marker name; check for the end
         // tag which only appears when the section is emitted.

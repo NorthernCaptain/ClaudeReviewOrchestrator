@@ -224,7 +224,7 @@ const collectPriorFindingPaths = (priorFindings, repoRoot) => {
 // so a FIFO or device — directly or behind a symlink — can neither block
 // forever nor stream without end, and the path can't be swapped between
 // the check and the read.
-const openRegularFile = (abs) => {
+export const openRegularFile = (abs) => {
     const fd = openSync(abs, constants.O_RDONLY | constants.O_NONBLOCK)
     try {
         if (fstatSync(fd).isFile()) return fd

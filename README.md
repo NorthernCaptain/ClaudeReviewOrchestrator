@@ -102,6 +102,8 @@ Four components talk to one server:
 | Config backups and lock | `~/.config/review-orchestrator/config.json.bak-*` (last 10), `config.json.lock` |
 | Loaded core snapshots | `server/.core-versions/<id>-<nonce>/` |
 | Codex output schema copies | `~/.cache/review-orchestrator/codex-schemas/` |
+| Review rules (bundled) | `server/src/core/review/review-rules.md`, or `config.reviewer.rulesFile` |
+| Reviewer evaluation | `eval/eval.mjs`, cases in `eval/cases/<id>/` |
 
 ### Why a server instead of two independent integrations
 
@@ -621,6 +623,9 @@ Common ground:
 - If `config.codex.ignoreProjectRules: true` (default), codex gets
   `--ignore-rules` so the repo's `AGENTS.md` / `.codex/instructions.md`
   cannot contradict the reviewer system preamble or the output contract.
+  The review rules still have every reviewer read the repository's
+  `AGENTS.md` and `CLAUDE.md` and the files they point to, as data that
+  can only add review criteria (see "Review rules" below).
 
 **Unified output contract — one JSON object, always.** No raw
 `GOOD-TO-GO` string, no findings-only array. Every provider must emit:
@@ -1068,6 +1073,132 @@ the same repo, clear its `codexRounds` / `blockCount` / prior findings via
 scripts/reset-review.sh                 # current repo+branch
 scripts/reset-review.sh /path/to/repo   # a specific repo
 ```
+
+### 6a. Review rules (`server/src/core/review/review-rules.md`)
+
+What a reviewer checks and how it grades findings lives in a Markdown
+file, not in code, so a new check is a text edit. The prompt is built in
+this order:
+
+1. `REVIEW_SYSTEM`: the preamble in [`codex.js`](./server/src/core/review/codex.js).
+   It keeps only what the rules must not be able to change: the trust
+   model and the output contract.
+2. `REVIEW_RULES`: the rules text, trusted, with a server line saying how
+   to see a file's version from before the change (`git show <base>:<path>`).
+3. `REVIEW_INPUT`, then the optional blocks (omitted files, prior
+   findings, extra instructions, exclusions) as before.
+
+**Where the rules come from.** `config.reviewer.rulesFile` is `null` by
+default, which uses the copy bundled with the core. To edit those, change
+`review-rules.md` and reload (`scripts/reload.sh`); they are part of
+`reviewVersion`. Set `reviewer.rulesFile` to an absolute path (or one
+starting with `~/`) to keep the rules outside the repo. That file is read
+on every review, so an edit applies to the next review without a reload.
+It must be a regular file of at most 128 KB. If it is missing, empty or
+unreadable, every review returns `ESCALATE` with code
+`REVIEW_RULES_UNREADABLE` naming the path, and the reviewer isn't run.
+`.review-orchestrator.json` can't set it: a reviewed repository never
+chooses the rules it is reviewed by. Per-project additions still go in
+its `extraReviewerInstructions`.
+
+**Cache.** The rules' text hash is part of the `reviewKey`, so the first
+review after a rules change runs fresh instead of returning
+`NO_CHANGES`. The `config resolved` log line records the rules'
+`source` (`bundled` or the path) and hash.
+
+**Repository guidance.** The bundled rules tell the reviewer to read the
+repository's `AGENTS.md` / `CLAUDE.md` (root, and the folders of changed
+files and their parents), any file they point to for review or coding
+rules (two levels deep, inside the repo), `.cursorrules`,
+`.cursor/rules/` and `.github/copilot-instructions.md`. They apply that
+guidance's review rules and coding standards and skip its agent
+workflow steps (run tests, commit, open PRs). The preamble limits this:
+repository guidance is still untrusted data and can only *add* review
+criteria. It can't approve a change, lower a severity, excuse or suppress
+a finding, or change the output. When the change edits a guidance file,
+the reviewer uses the version from before the change.
+
+How each reviewer reads those files:
+
+- **codex** runs read-only shell commands (`cat`, `rg`, `git show`).
+  `--ignore-rules` stays on: it only stops codex from loading `AGENTS.md`
+  as its own top-level instructions.
+- **claude** uses Read, Grep and Glob. Bash is disallowed, so it can't run
+  `git show`; for an edited guidance file it rebuilds the old version
+  from the current file and the diff (added lines out, removed lines
+  back). When the prompt doesn't show that file's whole diff, it keeps
+  only the untouched parts of the file.
+- **gemini** is not covered by the evaluation below: the gemini CLI was not
+  installed when the rules were tested. Its `plan` approval mode can read
+  files, but whether it follows the `AGENTS.md` instructions and the
+  files they point to is unverified. Reviews still run on it with the same
+  prompt.
+
+### 6b. Reviewer evaluation (`eval/`)
+
+`eval/eval.mjs` measures reviewers against small fixture repositories.
+Each case in `eval/cases/<id>/` has a `base/` tree (committed), a
+`change/` tree (copied over it, left uncommitted) and a `case.json`:
+
+```json
+{
+  "title": "A rule that lives only in a file AGENTS.md points to",
+  "rule": "Repository guidance: follow referenced files",
+  "expect": "issues",
+  "findings": [
+    { "files": ["src/shipping.js"], "near": "FREE_SHIPPING", "minSeverity": "minor" }
+  ]
+}
+```
+
+An `issues` case passes when, for each expected finding, the reviewer
+reports one on one of `files`, at `minSeverity` (default `major`) or
+above, within `slack` lines (default 6) of the first line containing
+`near`. A `clean` case passes when there is no finding at a severity
+`blockingSeverities` blocks on.
+
+The harness runs the same core code the server does (`buildPayload`,
+`wrapPrompt`, the rules, the provider adapters, the shell's tool
+runner) straight from the checkout, without the server's state or cache.
+That lets you measure a rules or prompt change before reloading the
+daemon. It runs the real reviewer CLIs, so it costs real tokens and a few
+minutes per run:
+
+```bash
+npm run eval                                   # all cases, codex + claude
+node eval/eval.mjs --providers codex --cases guidance-injection
+node eval/eval.mjs --rules none                # the prompt without rules
+node eval/eval.mjs --rules ~/my-rules.md       # try other rules
+node eval/eval.mjs --work /tmp/ev --keep       # keep the case repos
+```
+
+The models and `blockingSeverities` come from
+`~/.config/review-orchestrator/config.json` (`--config` to change).
+The report has a pass/fail table per case and provider, a summary per
+provider, and every finding of each case that didn't pass;
+`results.json` in the work folder has all of them. The exit code is 0
+only when every case passed. Findings on files outside the change are
+dropped before scoring, as the server drops them, and listed as
+`dropped` in the report.
+
+Results when the rules were introduced (1.11.0; 19 cases, codex
+`gpt-6.1-sol` high and claude `claude-opus-5-5` high, blocking on
+blocker/major/minor):
+
+| Prompt | Reviewer | Planted caught | Clean passed | Findings (blocker/major/minor/nit) | Avg time |
+|---|---|---|---|---|---|
+| with rules | codex | 15/15 | 4/4 | 6 / 8 / 2 / 0 | 54 s |
+| with rules | claude | 15/15 | 4/4 | 9 / 11 / 6 / 0 | 97 s |
+| no rules | codex | 15/15 | 4/4 | 0 / 12 / 3 / 0 | 33 s |
+| no rules | claude | 15/15 | 4/4 | 3 / 14 / 19 / 1 | 96 s |
+
+Both reviewers already read `AGENTS.md` and the files it points to
+without being told, so these cases don't separate the two prompts on
+detection. What the rules changed is grading: codex rates security holes
+and data loss `blocker` instead of `major`, and claude raises far fewer
+`minor` findings, each of which blocks under a config that blocks on
+`minor`. Harder cases (larger repositories, cross-file contracts,
+subtler defects) are needed to measure detection.
 
 ### 7. Dashboard (`server/src/core/dashboard.js`, served at `GET /`)
 
@@ -1547,6 +1678,7 @@ example below shows every supported key and the current default):
 
   "reviewer": {
     "provider": "codex",
+    "rulesFile": null,
     "claude": {
       "binary": "claude",
       "model": "claude-opus-5",
@@ -1618,6 +1750,7 @@ example below shows every supported key and the current default):
 | Key | Default | Effect |
 |---|---|---|
 | `reviewer.provider` | `"codex"` | Selects the reviewer adapter: `codex`, `claude`, or `gemini`. Both sub-blocks ship pre-populated so flipping `provider` needs no other edits. |
+| `reviewer.rulesFile` | `null` (bundled) | The review rules (Markdown) every reviewer gets. `null` uses `server/src/core/review/review-rules.md`; an absolute or `~/` path is read on every review. See "Review rules". |
 | `reviewer.claude.effort` | `"high"` | Maps to Claude CLI `--effort`. One of `low\|medium\|high\|xhigh\|max`. |
 | `reviewer.claude.permissionMode` | `"bypassPermissions"` | Only mode that returns a clean assistant response in non-interactive `-p` mode; `disallowedTools` is the real safety boundary. |
 | `reviewer.gemini.model` | `"auto"` | Router alias = the CLI's interactive "Auto (Gemini 3)" mode. Pin to e.g. `"gemini-2.5-pro"` for reproducibility. |
@@ -1637,8 +1770,9 @@ Every cache shortcut requires the stored `reviewKey` to match. It covers
 the effective provider (a per-call override included), the effective
 config's review settings (`codex`, `reviewer`, `limits`, `ignorePaths`,
 `blockingSeverities`, `extraReviewerInstructions`, `payload`, merged with
-`.review-orchestrator.json`), the review code (`reviewVersion`) and the
-shell version. Changing any of them, by an edit, a reload or a restart,
+`.review-orchestrator.json`), the review code (`reviewVersion`), the
+shell version and the text of the review rules (a `reviewer.rulesFile`
+edit counts). Changing any of them, by an edit, a reload or a restart,
 busts cached baselines without needing `/reset`.
 
 ## Implementation plan

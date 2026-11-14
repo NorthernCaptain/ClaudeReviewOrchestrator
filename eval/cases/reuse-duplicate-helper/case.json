@@ -1,0 +1,8 @@
+{
+    "title": "New code reimplements an existing helper",
+    "rule": "Reuse",
+    "expect": "issues",
+    "findings": [
+        { "files": ["src/tags.js"], "near": "toTagSlug", "minSeverity": "minor", "slack": 12 }
+    ]
+}
