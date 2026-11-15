@@ -38,6 +38,21 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
         {
+            id: "gpt-6.1-terra:xhigh",
+            model: "gpt-6.1-terra",
+            effortOrMode: "xhigh",
+        },
+        {
+            id: "gpt-6.1-terra:high",
+            model: "gpt-6.1-terra",
+            effortOrMode: "high",
+        },
+        {
+            id: "gpt-6.1-terra:medium",
+            model: "gpt-6.1-terra",
+            effortOrMode: "medium",
+        },
+        {
             id: "gpt-6-astra:xhigh",
             model: "gpt-6-astra",
             effortOrMode: "xhigh",

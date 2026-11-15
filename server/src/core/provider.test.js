@@ -190,9 +190,11 @@ describe("handleSetReviewerPreset", () => {
         const models = (provider) => [
             ...new Set(REVIEWER_PRESETS[provider].map((p) => p.model)),
         ]
-        // Codex offers only the GPT-6 generation: 6.1 Sol plus 6 Astra / Luna.
+        // Codex offers only the GPT-6 generation: 6.1 Sol / Terra plus
+        // 6 Astra / Luna.
         expect(models("codex")).toEqual([
             "gpt-6.1-sol",
+            "gpt-6.1-terra",
             "gpt-6-astra",
             "gpt-6-luna",
         ])
@@ -203,6 +205,7 @@ describe("handleSetReviewerPreset", () => {
         ])
         for (const model of [
             "gpt-6.1-sol",
+            "gpt-6.1-terra",
             "gpt-6-astra",
             "gpt-6-luna",
             "claude-opus-5-5",
