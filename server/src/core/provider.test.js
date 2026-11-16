@@ -129,18 +129,29 @@ describe("handleSetReviewerPreset", () => {
         ])
     })
 
-    test("gemini: commits model and approval mode", async () => {
+    test("gemini: commits model and effort", async () => {
         const tx = fakeTransaction()
         await handleSetReviewerPreset({
-            body: { preset: "gemini-3.5-flash:plan" },
+            body: { preset: "gemini-4-carbon:low" },
             config: baseConfig(),
             configTransaction: tx,
         })
         expect(tx.calls).toEqual([
             [
-                [["reviewer", "gemini", "model"], "gemini-3.5-flash"],
-                [["reviewer", "gemini", "approvalMode"], "plan"],
+                [["reviewer", "gemini", "model"], "gemini-4-carbon"],
+                [["reviewer", "gemini", "effort"], "low"],
             ],
+        ])
+    })
+
+    test("gemini offers only hydrogen and carbon, three efforts each", () => {
+        expect(REVIEWER_PRESETS.gemini.map((p) => p.id)).toEqual([
+            "gemini-4-hydrogen:xhigh",
+            "gemini-4-hydrogen:high",
+            "gemini-4-hydrogen:medium",
+            "gemini-4-carbon:high",
+            "gemini-4-carbon:medium",
+            "gemini-4-carbon:low",
         ])
     })
 
@@ -182,7 +193,7 @@ describe("handleSetReviewerPreset", () => {
             expect.objectContaining({ id: "claude-sonnet-5:xhigh" })
         )
         expect(REVIEWER_PRESETS.gemini).toContainEqual(
-            expect.objectContaining({ id: "gemini-3.5-flash:plan" })
+            expect.objectContaining({ id: "gemini-4-hydrogen:high" })
         )
     })
 

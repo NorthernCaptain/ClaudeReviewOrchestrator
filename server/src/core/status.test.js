@@ -70,14 +70,15 @@ describe("redactConfig", () => {
         expect(redactConfig(null)).toBeNull()
     })
 
-    test("surfaces the gemini reviewer block (provider + model + approvalMode + timeout)", () => {
+    test("surfaces the gemini reviewer block (provider + model + effort + approvalMode + timeout)", () => {
         const cfg = {
             ...minimalConfig(),
             reviewer: {
                 provider: "gemini",
                 gemini: {
                     binary: "gemini",
-                    model: "auto",
+                    model: "gemini-4-hydrogen",
+                    effort: "high",
                     approvalMode: "plan",
                     timeoutSeconds: 600,
                     extraArgs: [],
@@ -86,7 +87,8 @@ describe("redactConfig", () => {
         }
         const r = redactConfig(cfg)
         expect(r.reviewer.provider).toBe("gemini")
-        expect(r.reviewer.gemini.model).toBe("auto")
+        expect(r.reviewer.gemini.model).toBe("gemini-4-hydrogen")
+        expect(r.reviewer.gemini.effort).toBe("high")
         expect(r.reviewer.gemini.approvalMode).toBe("plan")
         expect(r.reviewer.gemini.timeoutSeconds).toBe(600)
     })
@@ -310,13 +312,14 @@ describe("summarizeConfig", () => {
         expect(s.reviewerTimeoutSeconds).toBe(600)
     })
 
-    test("summarizeConfig picks gemini sub-config and approvalMode", () => {
+    test("summarizeConfig picks gemini sub-config and its effort", () => {
         const cfg = {
             port: 7777,
             reviewer: {
                 provider: "gemini",
                 gemini: {
-                    model: "auto",
+                    model: "gemini-4-carbon",
+                    effort: "medium",
                     approvalMode: "plan",
                     timeoutSeconds: 600,
                 },
@@ -325,8 +328,8 @@ describe("summarizeConfig", () => {
         }
         const s = summarizeConfig(cfg, "0.1.0")
         expect(s.provider).toBe("gemini")
-        expect(s.model).toBe("auto")
-        expect(s.effortOrMode).toBe("plan")
+        expect(s.model).toBe("gemini-4-carbon")
+        expect(s.effortOrMode).toBe("medium")
         expect(s.reviewerTimeoutSeconds).toBe(600)
     })
 

@@ -14,12 +14,13 @@
 // would rewrite paths and drop what the operator hand-authored.
 
 import { commitConfigChange, configChangeBody } from "./config.js"
+import { GEMINI_EFFORTS } from "./review/gemini.js"
 
 export const VALID_PROVIDERS = ["codex", "claude", "gemini"]
 
 // Curated, CLI-compatible reviewer choices for the dashboard, newest
-// generation first. Gemini's explicit names are the current coding-capable
-// choices, plus its router.
+// generation first. Gemini's come from GEMINI_EFFORTS, the models and
+// thinking levels install.sh writes aliases for.
 export const REVIEWER_PRESETS = {
     codex: [
         {
@@ -175,19 +176,13 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
     ],
-    gemini: [
-        { id: "auto:plan", model: "auto", effortOrMode: "plan" },
-        {
-            id: "gemini-3.5-flash:plan",
-            model: "gemini-3.5-flash",
-            effortOrMode: "plan",
-        },
-        {
-            id: "gemini-3.1-pro-preview:plan",
-            model: "gemini-3.1-pro-preview",
-            effortOrMode: "plan",
-        },
-    ],
+    gemini: Object.entries(GEMINI_EFFORTS).flatMap(([model, efforts]) =>
+        efforts.map((effort) => ({
+            id: `${model}:${effort}`,
+            model,
+            effortOrMode: effort,
+        }))
+    ),
 }
 
 export const handleSetReviewerPreset = async ({
@@ -214,14 +209,7 @@ export const handleSetReviewerPreset = async ({
               ]
             : [
                   [["reviewer", provider, "model"], preset.model],
-                  [
-                      [
-                          "reviewer",
-                          provider,
-                          provider === "claude" ? "effort" : "approvalMode",
-                      ],
-                      preset.effortOrMode,
-                  ],
+                  [["reviewer", provider, "effort"], preset.effortOrMode],
               ]
     const result = await commitConfigChange({
         configTransaction,

@@ -9,6 +9,7 @@ import { createHash } from "node:crypto"
 import http from "node:http"
 import {
     existsSync,
+    mkdirSync,
     mkdtempSync,
     readFileSync,
     realpathSync,
@@ -36,6 +37,7 @@ import {
     signedHeaders,
 } from "../../hooks/signed-client.mjs"
 import { rotateToken } from "../../install/rotate-token.mjs"
+import { mergeGeminiSettings } from "../../install/merge-gemini-settings.mjs"
 
 const minimalConfig = (over = {}) => ({
     port: 0,
@@ -950,6 +952,72 @@ describe("checkReviewerEnv", () => {
             { home: "/Users/u", read: fakeRead }
         )
         expect(p).toBeNull()
+    })
+
+    test("an OAuth settings file the installer added aliases to still passes", async () => {
+        // install.sh's alias containers carry a comment: the check reads
+        // JSONC, the way the gemini CLI does.
+        const home = mkdtempSync(path.join(tmpdir(), "preflight-home-"))
+        try {
+            const settings = path.join(home, ".gemini", "settings.json")
+            mkdirSync(path.dirname(settings))
+            writeFileSync(
+                settings,
+                JSON.stringify({
+                    security: { auth: { selectedType: "oauth-personal" } },
+                })
+            )
+            await mergeGeminiSettings({ settingsPath: settings })
+            // Plain JSON still: gemini's launcher reads it with JSON.parse.
+            expect(
+                JSON.parse(readFileSync(settings, "utf8")).security.auth
+                    .selectedType
+            ).toBe("oauth-personal")
+            expect(
+                checkReviewerEnv(
+                    { reviewer: { provider: "gemini" } },
+                    {},
+                    { home }
+                )
+            ).toBeNull()
+            // The same file under GEMINI_CLI_HOME, with an empty HOME.
+            const empty = mkdtempSync(path.join(tmpdir(), "preflight-empty-"))
+            expect(
+                checkReviewerEnv(
+                    { reviewer: { provider: "gemini" } },
+                    { GEMINI_CLI_HOME: home },
+                    { home: empty }
+                )
+            ).toBeNull()
+            expect(
+                checkReviewerEnv(
+                    { reviewer: { provider: "gemini" } },
+                    {},
+                    {
+                        home: empty,
+                    }
+                )
+            ).not.toBeNull()
+            rmSync(empty, { recursive: true, force: true })
+        } finally {
+            rmSync(home, { recursive: true, force: true })
+        }
+    })
+
+    test("reads settings under GEMINI_CLI_HOME when it is set", () => {
+        const reads = []
+        const fakeRead = (p) => {
+            reads.push(p)
+            return '{ // oauth\n "security": { "auth": { "selectedType": "oauth-personal" } } }'
+        }
+        expect(
+            checkReviewerEnv(
+                { reviewer: { provider: "gemini" } },
+                { GEMINI_CLI_HOME: "/g" },
+                { home: "/Users/u", read: fakeRead }
+            )
+        ).toBeNull()
+        expect(reads).toEqual(["/g/.gemini/settings.json"])
     })
 
     test("still blocks when selectedType is 'gemini-api-key' and key is missing", () => {

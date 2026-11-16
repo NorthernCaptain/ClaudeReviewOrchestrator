@@ -44,6 +44,7 @@ import { createConfigStore } from "./config-store.js"
 import { createReloadController, requiredHookWaitMs } from "./reload.js"
 import { MAX_FETCH_TIMEOUT_MS } from "../../hooks/stop-review.mjs"
 import { defaultServerInfoPath, SERVICE } from "../../hooks/signed-client.mjs"
+import { parseJsonc } from "../../install/jsonc.mjs"
 import {
     defaultCredentialsPath,
     writeFileAtomic,
@@ -858,12 +859,16 @@ export const checkReviewerEnv = (
 
     // No env key — see if the user has configured a non-api-key auth
     // method. If we can't read the file (missing / unreadable / not
-    // JSON), assume the worst (api-key mode) and require the env var.
+    // JSONC), assume the worst (api-key mode) and require the env var.
+    // The settings live where the gemini CLI looks: under
+    // GEMINI_CLI_HOME when set, else HOME. The CLI accepts comments in
+    // them (and install.sh's alias containers carry one).
     let selectedType = "gemini-api-key"
     try {
-        const settingsPath = path.join(home, ".gemini", "settings.json")
+        const geminiHome = env?.GEMINI_CLI_HOME || home
+        const settingsPath = path.join(geminiHome, ".gemini", "settings.json")
         const raw = read(settingsPath, "utf8")
-        const parsed = JSON.parse(raw)
+        const parsed = parseJsonc(raw).value
         const t = parsed?.security?.auth?.selectedType
         if (typeof t === "string" && t.length > 0) selectedType = t
     } catch {

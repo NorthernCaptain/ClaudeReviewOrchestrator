@@ -6,7 +6,7 @@
 // Gemini CLI adapter for the reviewer.
 //
 // CLI surface verified against:
-//   $ gemini --version  → 0.43.0  (2026-05-22)
+//   $ gemini --version  → 0.43.0  (2026-05-22), 0.68.0 (2026-11-15)
 //   $ gemini --help     confirmed flags used here:
 //     -p, --prompt <text>             Non-interactive mode. The value is
 //                                     appended to stdin, so we put the
@@ -15,12 +15,13 @@
 //                                     (system preamble + payload + prior
 //                                     findings) over stdin to stay well
 //                                     under macOS ARG_MAX.
-//     -m, --model <id>                Model id, e.g. "gemini-2.5-pro",
-//                                     or the routing alias "auto" —
-//                                     same as the CLI's interactive
-//                                     "Auto (Gemini 3)" picker, which
-//                                     routes between gemini-3.1-pro
-//                                     and gemini-3-flash per task.
+//     -m, --model <id>                Model id, e.g. "gemini-4-hydrogen",
+//                                     the routing alias "auto" (the
+//                                     CLI's interactive "Auto" picker;
+//                                     it routes only between the models
+//                                     the CLI release knows), or a
+//                                     settings alias (see
+//                                     GEMINI_ALIAS_PREFIX).
 //     --approval-mode <mode>          Choices: default, auto_edit, yolo,
 //                                     plan. We use "plan" — it's
 //                                     non-interactive AND read-only, the
@@ -60,7 +61,52 @@
 //     plist's EnvironmentVariables block.
 
 import { randomUUID } from "node:crypto"
+import path from "node:path"
 import { normalizeFindings } from "./codex.js"
+
+// The thinking levels each model offers as a review effort, strongest
+// first, as the Gemini API accepted them on 2026-11-15: neither model
+// takes `minimal`, and carbon has no `xhigh`.
+export const GEMINI_EFFORTS = Object.freeze({
+    "gemini-4-hydrogen": Object.freeze(["xhigh", "high", "medium"]),
+    "gemini-4-carbon": Object.freeze(["high", "medium", "low"]),
+})
+
+// The CLI has no flag for the thinking level. A named alias in
+// ~/.gemini/settings.json (modelConfigs.customAliases) can set one, so
+// install.sh writes an alias per model and effort, and a review names
+// it with -m. The prefix marks the aliases install.sh owns.
+export const GEMINI_ALIAS_PREFIX = "review-orchestrator-"
+
+export const geminiEffortAlias = (model, effort) =>
+    `${GEMINI_ALIAS_PREFIX}${model}-${effort}`
+
+// The efforts a model offers, or null (own keys only: a model named
+// "constructor" has none).
+export const geminiEffortsOf = (model) =>
+    Object.hasOwn(GEMINI_EFFORTS, model) ? GEMINI_EFFORTS[model] : null
+
+export const hasGeminiEffort = (model, effort) =>
+    geminiEffortsOf(model)?.includes(effort) ?? false
+
+// { alias: definition } for every model and effort in GEMINI_EFFORTS.
+export const geminiAliasDefinitions = () => {
+    const aliases = {}
+    for (const [model, efforts] of Object.entries(GEMINI_EFFORTS)) {
+        for (const effort of efforts) {
+            aliases[geminiEffortAlias(model, effort)] = {
+                extends: "chat-base",
+                modelConfig: {
+                    model,
+                    generateContentConfig: {
+                        thinkingConfig: { thinkingLevel: effort.toUpperCase() },
+                    },
+                },
+            }
+        }
+    }
+    return aliases
+}
 
 // Kept in sync with the JSON schema's category enum. Used to coerce
 // gemini's occasional creative category names ("correctness",
@@ -148,13 +194,29 @@ const extractFirstJsonObject = (s) => {
     return null
 }
 
+// The reviewer's environment: the server's, with REVIEW_ORCH_SKIP set so
+// a Stop hook the reviewer fires short-circuits (hooks/stop-review.mjs).
+// The reviewer runs in the reviewed repo, so a relative GEMINI_CLI_HOME
+// (the CLI's home override, where install.sh put the effort aliases)
+// is resolved against the server's own folder first.
+export const geminiEnv = (env = process.env, cwd = process.cwd()) => {
+    const out = { ...env, REVIEW_ORCH_SKIP: "1" }
+    const home = env.GEMINI_CLI_HOME
+    if (home && !path.isAbsolute(home)) {
+        out.GEMINI_CLI_HOME = path.resolve(cwd, home)
+    }
+    return out
+}
+
 export const buildGeminiArgs = ({ config, sessionId = randomUUID() }) => {
     const g = config.reviewer?.gemini ?? {}
+    const model = g.model ?? "auto"
+    // Config validation admits an effort only for a model that has it.
     const args = [
         "-p",
         REVIEWER_DIRECTIVE,
         "-m",
-        g.model ?? "auto",
+        g.effort ? geminiEffortAlias(model, g.effort) : model,
         "--approval-mode",
         g.approvalMode ?? "plan",
         "--skip-trust",
@@ -184,11 +246,7 @@ export const runGemini = ({
             child = spawn(binary, args, {
                 cwd: repoRoot,
                 stdio: ["pipe", "pipe", "pipe"],
-                // Mark the reviewer's process tree so any Stop hook it
-                // fires short-circuits instead of recursively calling
-                // the orchestrator (hooks/stop-review.mjs honors
-                // REVIEW_ORCH_SKIP).
-                env: { ...process.env, REVIEW_ORCH_SKIP: "1" },
+                env: geminiEnv(),
             })
         } catch (err) {
             reject(err)

@@ -52,6 +52,7 @@ const redactConfig = (config) => {
                       ? {
                             binary: config.reviewer.gemini.binary,
                             model: config.reviewer.gemini.model,
+                            effort: config.reviewer.gemini.effort ?? null,
                             approvalMode: config.reviewer.gemini.approvalMode,
                             timeoutSeconds:
                                 config.reviewer.gemini.timeoutSeconds,
@@ -169,11 +170,9 @@ export const summarizeConfig = (config, version = null) => {
               ? config?.reviewer?.gemini
               : config?.codex
     const effortOrMode =
-        provider === "claude"
-            ? (providerCfg?.effort ?? null)
-            : provider === "gemini"
-              ? (providerCfg?.approvalMode ?? null)
-              : (providerCfg?.reasoningEffort ?? null)
+        provider === "codex"
+            ? (providerCfg?.reasoningEffort ?? null)
+            : (providerCfg?.effort ?? null)
     const hookCfg = config?.hook?.fetchTimeoutSeconds
     return {
         version,

@@ -10,7 +10,15 @@ import { readFileSync } from "node:fs"
 import * as gemini from "./gemini.js"
 import { createOutputSchema } from "./schema.js"
 
-const { buildGeminiArgs, parseGeminiOutput, __defaults__ } = gemini
+const {
+    buildGeminiArgs,
+    parseGeminiOutput,
+    __defaults__,
+    GEMINI_EFFORTS,
+    geminiAliasDefinitions,
+    geminiEnv,
+    hasGeminiEffort,
+} = gemini
 
 // The core's output schema, as createCore builds it from its resources.
 const schema = createOutputSchema(
@@ -96,6 +104,24 @@ describe("buildGeminiArgs", () => {
         expect(args[args.indexOf("--approval-mode") + 1]).toBe("yolo")
     })
 
+    test("an effort runs the model through its settings alias", () => {
+        const args = buildGeminiArgs({
+            config: baseConfig({ model: "gemini-4-hydrogen", effort: "xhigh" }),
+            sessionId: "u",
+        })
+        expect(args[args.indexOf("-m") + 1]).toBe(
+            "review-orchestrator-gemini-4-hydrogen-xhigh"
+        )
+    })
+
+    test("a null effort runs the model by name", () => {
+        const args = buildGeminiArgs({
+            config: baseConfig({ model: "gemini-4-carbon", effort: null }),
+            sessionId: "u",
+        })
+        expect(args[args.indexOf("-m") + 1]).toBe("gemini-4-carbon")
+    })
+
     test("appends extraArgs verbatim", () => {
         const args = buildGeminiArgs({
             config: baseConfig({ extraArgs: ["--debug"] }),
@@ -108,6 +134,66 @@ describe("buildGeminiArgs", () => {
         expect(__defaults__.REVIEWER_DIRECTIVE).toMatch(
             /FIRST output character MUST be `\{`/
         )
+    })
+})
+
+describe("geminiEnv", () => {
+    test("marks the reviewer and keeps the rest of the environment", () => {
+        expect(geminiEnv({ A: "1" }, "/srv")).toEqual({
+            A: "1",
+            REVIEW_ORCH_SKIP: "1",
+        })
+    })
+
+    test("resolves a relative GEMINI_CLI_HOME against the server's folder", () => {
+        expect(
+            geminiEnv({ GEMINI_CLI_HOME: "g" }, "/srv").GEMINI_CLI_HOME
+        ).toBe("/srv/g")
+        expect(
+            geminiEnv({ GEMINI_CLI_HOME: "/abs/g" }, "/srv").GEMINI_CLI_HOME
+        ).toBe("/abs/g")
+    })
+
+    test("is what the reviewer is spawned with", async () => {
+        const spawn = fakeSpawn((child) => {
+            child.stdout.end(wrap({ status: "GOOD_TO_GO", findings: [] }))
+            child.emit("close", 0, null)
+        })
+        await runAndParse({
+            repoRoot: "/repo",
+            prompt: "p",
+            config: baseConfig(),
+            spawn,
+        })
+        const env = spawn.mock.calls[0][2].env
+        expect(env.REVIEW_ORCH_SKIP).toBe("1")
+    })
+})
+
+describe("gemini efforts", () => {
+    test("each model offers the levels the API accepts, strongest first", () => {
+        expect(GEMINI_EFFORTS).toEqual({
+            "gemini-4-hydrogen": ["xhigh", "high", "medium"],
+            "gemini-4-carbon": ["high", "medium", "low"],
+        })
+        expect(hasGeminiEffort("gemini-4-carbon", "low")).toBe(true)
+        expect(hasGeminiEffort("gemini-4-carbon", "xhigh")).toBe(false)
+        expect(hasGeminiEffort("auto", "high")).toBe(false)
+        expect(hasGeminiEffort("constructor", "high")).toBe(false)
+    })
+
+    test("every model and effort gets an alias that sets the thinking level", () => {
+        const aliases = geminiAliasDefinitions()
+        expect(Object.keys(aliases)).toHaveLength(6)
+        expect(aliases["review-orchestrator-gemini-4-carbon-low"]).toEqual({
+            extends: "chat-base",
+            modelConfig: {
+                model: "gemini-4-carbon",
+                generateContentConfig: {
+                    thinkingConfig: { thinkingLevel: "LOW" },
+                },
+            },
+        })
     })
 })
 

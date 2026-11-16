@@ -28,7 +28,7 @@
       <key>HOME</key>
       <string>__HOME__</string>
       <key>REVIEW_ORCH_CONFIG</key>
-      <string>__HOME__/.config/review-orchestrator/config.json</string>
+      <string>__HOME__/.config/review-orchestrator/config.json</string>__GEMINI_ENV__
     </dict>
 
     <key>RunAtLoad</key>

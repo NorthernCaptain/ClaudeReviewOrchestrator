@@ -99,7 +99,47 @@ describe("ConfigSchema", () => {
         })
         expect(r.reviewer.provider).toBe("gemini")
         expect(r.reviewer.gemini.model).toBe("auto")
+        expect(r.reviewer.gemini.effort).toBeNull()
         expect(r.reviewer.gemini.approvalMode).toBe("plan")
+    })
+    test("accepts a gemini effort the model offers", () => {
+        const r = ConfigSchema.parse({
+            authToken: "x",
+            reviewer: {
+                gemini: { model: "gemini-4-hydrogen", effort: "xhigh" },
+            },
+        })
+        expect(r.reviewer.gemini.effort).toBe("xhigh")
+    })
+    test("rejects a gemini effort the model doesn't offer", () => {
+        expect(() =>
+            ConfigSchema.parse({
+                authToken: "x",
+                reviewer: {
+                    gemini: { model: "gemini-4-carbon", effort: "xhigh" },
+                },
+            })
+        ).toThrow("gemini-4-carbon takes effort high, medium, low or null")
+    })
+    test("an inherited property name is not a model with efforts", () => {
+        for (const model of ["constructor", "toString", "__proto__"]) {
+            expect(() =>
+                ConfigSchema.parse({
+                    authToken: "x",
+                    reviewer: { gemini: { model, effort: "high" } },
+                })
+            ).toThrow(`${model} has no review efforts`)
+        }
+    })
+    test("rejects a gemini effort for a model without efforts", () => {
+        expect(() =>
+            ConfigSchema.parse({
+                authToken: "x",
+                reviewer: { gemini: { model: "auto", effort: "high" } },
+            })
+        ).toThrow(
+            "auto has no review efforts; use null or one of: gemini-4-hydrogen, gemini-4-carbon"
+        )
     })
     test("rejects an unknown reviewer.provider", () => {
         expect(() =>

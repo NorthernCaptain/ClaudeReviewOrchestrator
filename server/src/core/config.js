@@ -7,6 +7,11 @@ import { realpathSync } from "node:fs"
 import { homedir } from "node:os"
 import path from "node:path"
 import { z } from "zod"
+import {
+    GEMINI_EFFORTS,
+    geminiEffortsOf,
+    hasGeminiEffort,
+} from "./review/gemini.js"
 
 const DEFAULT_IGNORE_PATHS = [
     "**/node_modules/**",
@@ -130,15 +135,19 @@ const ConfigSchema = z
                 gemini: z
                     .object({
                         binary: z.string().default("gemini"),
-                        // "auto" is the router alias — same mode the
-                        // CLI's interactive picker calls "Auto (Gemini
-                        // 3)". The router picks between gemini-3.1-pro
-                        // and gemini-3-flash per task. Pinning a
-                        // specific model (e.g. "gemini-2.5-pro") is
-                        // fine for reproducibility; the router is the
-                        // right default for quality + cost balance on
-                        // a mix of large and small diffs.
+                        // "auto" is the CLI's router alias. It routes
+                        // only between the models the installed CLI
+                        // release knows, so newer models (gemini-4-*)
+                        // need to be named here.
                         model: z.string().default("auto"),
+                        // Thinking level, run through the alias
+                        // install.sh writes for this model and level
+                        // (GEMINI_EFFORTS in review/gemini.js). null
+                        // runs the model at its default level.
+                        effort: z
+                            .enum(["low", "medium", "high", "xhigh"])
+                            .nullable()
+                            .default(null),
                         // gemini CLI offers: default, auto_edit, yolo,
                         // plan. We default to "plan" — it's the only
                         // non-interactive mode that's also read-only,
@@ -155,6 +164,18 @@ const ConfigSchema = z
                             .max(MAX_REVIEWER_TIMEOUT_SECONDS)
                             .default(600),
                         extraArgs: z.array(z.string()).default([]),
+                    })
+                    .superRefine((g, ctx) => {
+                        if (g.effort && !hasGeminiEffort(g.model, g.effort)) {
+                            const efforts = geminiEffortsOf(g.model)
+                            ctx.addIssue({
+                                code: z.ZodIssueCode.custom,
+                                path: ["effort"],
+                                message: efforts
+                                    ? `${g.model} takes effort ${efforts.join(", ")} or null`
+                                    : `${g.model} has no review efforts; use null or one of: ${Object.keys(GEMINI_EFFORTS).join(", ")}`,
+                            })
+                        }
                     })
                     .default({}),
             })

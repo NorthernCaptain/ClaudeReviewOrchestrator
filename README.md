@@ -598,7 +598,8 @@ claude -p --no-session-persistence --session-id <uuid> \
   --add-dir <repoRoot> --output-format json --json-schema <sanitized inline> \
   --append-system-prompt <directive> --disallowed-tools <csv>
 
-# gemini
+# gemini (-m is the effort alias review-orchestrator-<model>-<effort>
+# when reviewer.gemini.effort is set)
 gemini -p <directive> -m <reviewer.gemini.model> \
   --approval-mode <reviewer.gemini.approvalMode> --skip-trust -o json \
   --session-id <uuid>
@@ -750,6 +751,11 @@ required.
    `Write|Edit|MultiEdit` with 3s timeout) into
    `~/.claude/settings.json` (with `.bak` backup).
 6. Appends the `claude-md-snippet.md` block to `~/.claude/CLAUDE.md`.
+7. Writes the gemini reviewer's effort aliases into
+   `~/.gemini/settings.json` (`$GEMINI_CLI_HOME/.gemini` when set; with
+   `.bak` backup), creating it if gemini hasn't run yet; see *Gemini
+   efforts*. `uninstall.sh` removes only those
+   aliases.
 
 Pass `--launch` to also drop the launchd plist into
 `~/Library/LaunchAgents` and bootstrap the daemon.
@@ -1006,7 +1012,72 @@ The reviewer is pluggable. `config.reviewer.provider` picks one of:
 |----------|---------|----------------------------------|----------------------------------------|-------|
 | `codex`  | `codex` | `--output-schema <path>` (strict) | Codex CLI's own login (ChatGPT or API key) | Default. The original adapter; tightest schema enforcement. |
 | `claude` | `claude` | `--json-schema <sanitized inline>` (best-effort) | OAuth keychain via `claude login`, or `ANTHROPIC_API_KEY` | Salvage parser handles prose lead-ins; status re-derived from findings. |
-| `gemini` | `gemini` | none (prompt-only contract)      | `GEMINI_API_KEY` env, or `gemini auth login` (OAuth) | `--model auto` is the "Auto (Gemini 3)" router; status coercion required. |
+| `gemini` | `gemini` | none (prompt-only contract)      | `GEMINI_API_KEY` env, or `gemini auth login` (OAuth) | The dashboard offers `gemini-4-hydrogen` and `gemini-4-carbon` with three efforts each (see *Gemini efforts*); status coercion required. |
+
+#### Gemini efforts
+
+The gemini CLI has no flag for the thinking level; only a named alias in
+`~/.gemini/settings.json` (`modelConfigs.customAliases`) can set one.
+So `install.sh` writes one alias per model and effort, named
+`review-orchestrator-<model>-<effort>`, and a review with
+`reviewer.gemini.effort` set runs `gemini -m <that alias>`. The aliases
+do nothing unless a run names them.
+
+| Model | Efforts | Why |
+|---|---|---|
+| `gemini-4-hydrogen` | `xhigh`, `high`, `medium` | The API also takes `low`; it rejects `minimal`. |
+| `gemini-4-carbon` | `high`, `medium`, `low` | The API rejects `xhigh` and `minimal` for carbon. |
+
+The table lives in `GEMINI_EFFORTS` (`server/src/core/review/gemini.js`);
+the dashboard's gemini choices, the config check and the installed aliases
+all come from it. Config validation rejects an effort a model doesn't
+offer, and an effort for a model outside the table. `effort: null` runs
+the model by name at its default thinking level.
+
+- Rerun `install.sh` after the table changes. The installer writes the
+  aliases even before gemini has run (it creates the file), so the efforts
+  work as soon as gemini is installed. Without the alias, a review with an
+  effort fails with gemini's unknown-model error.
+- The installer edits the file member by member, because the CLI's
+  settings loader accepts comments there (not trailing commas, which it
+  rejects, and so do the scripts): comments and layout outside our aliases
+  stay. It writes no comments itself: gemini's launcher reads the file
+  with plain `JSON.parse` (for `advanced.autoConfigureMemory`), so a
+  plain-JSON file stays plain JSON. `uninstall.sh` removes only our
+  aliases; `modelConfigs` and `customAliases` stay, empty if the
+  installer created them.
+- Both scripts write under the config writers' lock
+  (`~/.config/review-orchestrator/config.json.lock`)
+  and replace the file only if it is still the file they read, with the
+  same text; otherwise they redo the edit on top (up to 3 times). The
+  gemini CLI saves settings in place, so a save that lands just after
+  the replacement reaches the old file: the scripts see it through the
+  handle they kept open, put it back and redo the edit on top.
+- The gemini CLI takes no lock when it saves, so the helpers refuse to
+  edit while any gemini process runs (`gemini is running (pid …)`): close
+  it and rerun. A save by another program (an editor) in the instant
+  between the final check and the rename can still be overwritten; the
+  `.bak.<ts>-<random>` copy holds what was read.
+- A symlinked `settings.json` is edited where it points and stays a link.
+- `install.sh` adds each gemini home it installs into to
+  `~/.config/review-orchestrator/gemini-home` (one per line, under the
+  same lock as the edit), and never removes the aliases from another
+  home: a server still pinned to an earlier home keeps working.
+  `uninstall.sh` cleans every recorded home plus the one `--home` or
+  `GEMINI_CLI_HOME` names: it checks that each file can be read, parsed
+  and written before it changes any, then removes the record.
+- With `GEMINI_CLI_HOME` set, the CLI reads `$GEMINI_CLI_HOME/.gemini`
+  instead, and both scripts follow it (`--home` wins). The launchd plist
+  sets `GEMINI_CLI_HOME` to the folder the installer wrote to when that
+  isn't `HOME` (set to `HOME` it would mislead gemini's launcher, which
+  takes it for the `.gemini` folder itself); a server started by hand
+  must run with the same `GEMINI_CLI_HOME`.
+- A level can't go through a system settings file instead: the CLI reads
+  `GEMINI_CLI_SYSTEM_DEFAULTS_PATH` only from a root-owned folder that
+  only root can write to.
+- `auto` (the CLI's router) routes only between the models its own
+  release knows; CLI 0.68.0 doesn't know the gemini-4 models, so name
+  them.
 
 Each adapter implements the same `runAndParse({repoRoot, prompt, config})`
 contract and returns `{status, findings, raw, salvaged?}`. The schema
@@ -1040,6 +1111,9 @@ if `provider === "gemini"` AND `GEMINI_API_KEY` is missing in env AND
 `~/.gemini/settings.json` says `auth.selectedType === "gemini-api-key"`, the
 server exits with a clear error rather than failing every Stop hook in ~1s
 with an opaque exit code. Filesystem-based OAuth credentials are accepted.
+The check reads the settings where the CLI does
+(`$GEMINI_CLI_HOME/.gemini/settings.json` when that is set) and accepts
+comments in them (but not trailing commas), as the CLI does.
 
 The active provider is logged at startup (`active config` line) and surfaced
 both in `GET /status.config.reviewer.provider` and in the dashboard at
@@ -1128,11 +1202,10 @@ How each reviewer reads those files:
   from the current file and the diff (added lines out, removed lines
   back). When the prompt doesn't show that file's whole diff, it keeps
   only the untouched parts of the file.
-- **gemini** is not covered by the evaluation below: the gemini CLI was not
-  installed when the rules were tested. Its `plan` approval mode can read
-  files, but whether it follows the `AGENTS.md` instructions and the
-  files they point to is unverified. Reviews still run on it with the same
-  prompt.
+- **gemini** reads files in its `plan` approval mode. In a 5-case run
+  (1.12.0, see below) it cited a nested `AGENTS.md` and a guidelines file
+  that `AGENTS.md` points to, and ignored the planted instruction to
+  approve.
 
 ### 6b. Reviewer evaluation (`eval/`)
 
@@ -1199,6 +1272,13 @@ and data loss `blocker` instead of `major`, and claude raises far fewer
 `minor` findings, each of which blocks under a config that blocks on
 `minor`. Harder cases (larger repositories, cross-file contracts,
 subtler defects) are needed to measure detection.
+
+Gemini was checked later (1.12.0) on 5 cases only: the three guidance
+cases, `security-sql-injection` and `clean-feature-with-tests`, with
+`gemini-4-hydrogen` at effort `high` (gemini CLI 0.68.0). It caught all
+4 planted defects (2 blocker, 2 major), passed the clean case, and took
+9–17 s per review. It hasn't run the other 14 cases or the other models
+and efforts.
 
 ### 7. Dashboard (`server/src/core/dashboard.js`, served at `GET /`)
 
@@ -1623,7 +1703,9 @@ done never serves a verdict the old code produced.
 **Config edits.** Every reload re-reads `config.json`. Dashboard edits are
 transactions: a delta merged into a fresh read of the file, validated and
 self-checked, written atomically with a backup. All writers (the server,
-`install.sh`, `rotate-token.sh`) share an OS lock on `config.json.lock`.
+`install.sh`, `rotate-token.sh`) share an OS lock on `config.json.lock`. `uninstall.sh` leaves that (empty) file in place:
+deleting it while a writer waits on it would let a third writer lock a new
+file at the same path.
 
 **What still needs a restart:**
 
@@ -1691,6 +1773,7 @@ example below shows every supported key and the current default):
     "gemini": {
       "binary": "gemini",
       "model": "auto",
+      "effort": null,
       "approvalMode": "plan",
       "timeoutSeconds": 600,
       "extraArgs": []
@@ -1753,7 +1836,8 @@ example below shows every supported key and the current default):
 | `reviewer.rulesFile` | `null` (bundled) | The review rules (Markdown) every reviewer gets. `null` uses `server/src/core/review/review-rules.md`; an absolute or `~/` path is read on every review. See "Review rules". |
 | `reviewer.claude.effort` | `"high"` | Maps to Claude CLI `--effort`. One of `low\|medium\|high\|xhigh\|max`. |
 | `reviewer.claude.permissionMode` | `"bypassPermissions"` | Only mode that returns a clean assistant response in non-interactive `-p` mode; `disallowedTools` is the real safety boundary. |
-| `reviewer.gemini.model` | `"auto"` | Router alias = the CLI's interactive "Auto (Gemini 3)" mode. Pin to e.g. `"gemini-2.5-pro"` for reproducibility. |
+| `reviewer.gemini.model` | `"auto"` | Model id, or `auto` (the CLI's router, limited to the models its release knows). The dashboard sets `gemini-4-hydrogen` or `gemini-4-carbon`. |
+| `reviewer.gemini.effort` | `null` | Thinking level through the installed alias: hydrogen `xhigh\|high\|medium`, carbon `high\|medium\|low`. `null` runs the model at its default. See *Gemini efforts*. |
 | `reviewer.gemini.approvalMode` | `"plan"` | Read-only non-interactive mode. |
 | `payload.fallbackToHead` | `false` | Opt-in: when the working tree has no reviewable change (only files matched by `ignorePaths`, or nothing), review the last commit range instead of returning `EMPTY_PAYLOAD`. |
 | `payload.verifyCleanTree` | `false` | Deprecated, ignored. The fast path always runs the tree probe when no change notification arrived. |
@@ -1834,6 +1918,13 @@ limits are in v1 — not deferred.
   its plugin is a plain file copy, and its AGENTS.md block reuses
   `merge-claude-md.mjs` / `remove-claude-md.mjs` (both take the target path
   as an argument and key off the same markers).
+
+  The gemini reviewer's effort aliases (see *Gemini efforts*) add
+  `merge-gemini-settings.mjs` / `remove-gemini-settings.mjs`, which edit
+  `~/.gemini/settings.json` (a JSONC file), and `jsonc.mjs`, the JSONC
+  reader they share with the server's gemini startup check
+  (`server/src/index.js`). `gemini-scripts.test.mjs` runs `install.sh` and
+  `uninstall.sh` against throwaway homes to test their gemini routing.
 
 ### Phase 1 — Minimum viable server with auth & size limits
 

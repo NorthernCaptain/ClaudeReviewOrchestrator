@@ -20,10 +20,42 @@
 //   updated:<path>     — replaced an existing file (bytes differed)
 //   unchanged:<path>   — bytes match what's already on disk
 
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import {
+    existsSync,
+    readFileSync,
+    realpathSync,
+    renameSync,
+    writeFileSync,
+} from "node:fs"
 import path from "node:path"
 
 const PLACEHOLDERS = ["__NODE_BIN__", "__REPO_ROOT__", "__HOME__"]
+
+// __GEMINI_ENV__ becomes a GEMINI_CLI_HOME entry only when install.sh
+// wrote the reviewer's effort aliases to a gemini home other than HOME
+// (values.__GEMINI_HOME__), else nothing. Set to HOME it would mislead
+// gemini's launcher, which takes GEMINI_CLI_HOME for the .gemini folder
+// itself when it looks for its memory setting.
+const GEMINI_ENV = "__GEMINI_ENV__"
+// The same folder however it is spelled (trailing slash, symlink).
+const canonical = (p) => {
+    try {
+        return realpathSync(p)
+    } catch {
+        return path.resolve(p)
+    }
+}
+const geminiEnv = (values) => {
+    const home = values?.__GEMINI_HOME__
+    if (!home || canonical(home) === canonical(values?.__HOME__ ?? "")) {
+        return ""
+    }
+    return `
+      <!-- The gemini CLI's home, where install.sh wrote the reviewer's
+           effort aliases (GEMINI_CLI_HOME at install time). -->
+      <key>GEMINI_CLI_HOME</key>
+      <string>${xmlEscape(home)}</string>`
+}
 
 // XML escape per the spec for character data and attribute values.
 // Apostrophe is not strictly required inside <string>...</string>, but
@@ -51,7 +83,7 @@ export const renderPlist = ({
     writeAtomicFn = writeAtomic,
 }) => {
     const template = readFile(templatePath, "utf8")
-    let rendered = template
+    let rendered = template.replaceAll(GEMINI_ENV, geminiEnv(values))
     for (const key of PLACEHOLDERS) {
         const v = values?.[key]
         if (typeof v !== "string" || v.length === 0) {
@@ -80,7 +112,7 @@ export const renderPlist = ({
     return { action: existed ? "updated" : "installed", path: destPath }
 }
 
-export const __test__ = { xmlEscape, PLACEHOLDERS }
+export const __test__ = { xmlEscape, PLACEHOLDERS, GEMINI_ENV }
 
 /* istanbul ignore next */
 const isDirectInvocation = () => {
@@ -92,11 +124,11 @@ const isDirectInvocation = () => {
 /* istanbul ignore next */
 if (isDirectInvocation()) {
     try {
-        const [, , templatePath, destPath, nodeBin, repoRoot, home] =
+        const [, , templatePath, destPath, nodeBin, repoRoot, home, gemini] =
             process.argv
         if (!templatePath || !destPath || !nodeBin || !repoRoot || !home) {
             process.stderr.write(
-                "usage: render-plist.mjs <template> <dest> <node-bin> <repo-root> <home>\n"
+                "usage: render-plist.mjs <template> <dest> <node-bin> <repo-root> <home> [gemini-home]\n"
             )
             process.exit(1)
         }
@@ -107,6 +139,7 @@ if (isDirectInvocation()) {
                 __NODE_BIN__: nodeBin,
                 __REPO_ROOT__: repoRoot,
                 __HOME__: home,
+                __GEMINI_HOME__: gemini,
             },
         })
         process.stdout.write(`${r.action}:${r.path}\n`)

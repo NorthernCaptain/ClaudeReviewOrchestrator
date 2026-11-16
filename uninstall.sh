@@ -17,6 +17,7 @@ DRY_RUN=0
 CODEX=0
 OPENCODE=0
 HOME_DIR="${HOME:-}"
+HOME_FROM_FLAG=0
 KEEP_CONFIG=0
 
 usage() {
@@ -31,7 +32,8 @@ Usage: ./uninstall.sh [--codex] [--opencode] [--launch] [--dry-run] [--home <dir
                   AGENTS.md block in ~/.config/opencode).
   --launch        Also remove the launchd plist + bootout the agent.
   --dry-run       Print what would happen without writing.
-  --home DIR      Operate on DIR/.config, DIR/.claude, DIR/.codex instead of $HOME.
+  --home DIR      Operate on DIR/.config, DIR/.claude, DIR/.codex,
+                  DIR/.gemini instead of $HOME.
   --keep-config   Keep ~/.config/review-orchestrator/ intact (preserves
                   authToken + reviewsDir state in case of reinstall).
   --help, -h      Show this help.
@@ -47,7 +49,7 @@ while [ $# -gt 0 ]; do
         --home)
             shift
             [ $# -gt 0 ] || { echo "--home needs a value" >&2; exit 1; }
-            HOME_DIR="$1"; shift ;;
+            HOME_DIR="$1"; HOME_FROM_FLAG=1; shift ;;
         --keep-config) KEEP_CONFIG=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "unknown arg: $1" >&2; usage; exit 1 ;;
@@ -78,6 +80,16 @@ CODEX_CONFIG_TOML="$CODEX_DIR/config.toml"
 CODEX_HOOKS_JSON="$CODEX_DIR/hooks.json"
 CODEX_SKILL_DIR="$CODEX_DIR/skills/code-review-loop"
 CODEX_SKILL="$CODEX_SKILL_DIR/SKILL.md"
+# The gemini homes to clean: the one --home or GEMINI_CLI_HOME (the
+# gemini CLI's own override of its home) names, else HOME; the helper
+# adds every home install.sh recorded.
+GEMINI_HOME_RECORD="$CONFIG_DIR/gemini-home"
+GEMINI_HOME="$HOME_DIR"
+if [ "$HOME_FROM_FLAG" -eq 0 ] && [ -n "${GEMINI_CLI_HOME:-}" ]; then
+    GEMINI_HOME="$GEMINI_CLI_HOME"
+    # A relative home means this folder (install.sh resolves it the same).
+    case "$GEMINI_HOME" in /*) ;; *) GEMINI_HOME="$PWD/$GEMINI_HOME" ;; esac
+fi
 OPENCODE_DIR="$HOME_DIR/.config/opencode"
 OPENCODE_PLUGIN="$OPENCODE_DIR/plugin/review-orchestrator.js"
 OPENCODE_SKILL_DIR="$OPENCODE_DIR/skill/code-review-loop"
@@ -136,6 +148,24 @@ echo "  --launch:    $([ "$LAUNCH" -eq 1 ] && echo yes || echo no)"
 echo "  --dry-run:   $([ "$DRY_RUN" -eq 1 ] && echo yes || echo no)"
 echo "  keep config: $([ "$KEEP_CONFIG" -eq 1 ] && echo yes || echo no)"
 echo
+
+# 0. The gemini reviewer's effort aliases (only ours; other settings
+# stay). First: the helper refuses while gemini runs, and then nothing
+# else has been removed yet.
+if maybe "run helper: gemini reviewer aliases"; then
+    # Checks every file before changing any, then removes the record.
+    if ! GEMINI_OUT="$(node "$REPO_ROOT/install/remove-gemini-settings.mjs" \
+            --lock "$CONFIG_PATH" --record "$GEMINI_HOME_RECORD" \
+            "$GEMINI_HOME/.gemini/settings.json")"; then
+        echo "uninstall: helper gemini reviewer aliases failed: $GEMINI_OUT" >&2
+        exit 1
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] && note "  ${line%%:*}: gemini reviewer aliases (${line#*:})"
+    done <<EOF_GEMINI
+$GEMINI_OUT
+EOF_GEMINI
+fi
 
 # 1. launchd (first — bootout the agent before yanking the plist).
 if [ "$LAUNCH" -eq 1 ]; then
@@ -205,7 +235,12 @@ if [ "$KEEP_CONFIG" -eq 1 ]; then
 else
     remove_file_idempotent "$HEADERS_SCRIPT" "mcp-headers.sh"
     remove_file_idempotent "$CONFIG_PATH" "config.json"
-    remove_file_idempotent "$CONFIG_PATH.lock" "config.json lock file"
+    # The lock file stays: deleting it while another writer (an install, a
+    # token rotation) waits on it would let a third writer lock a new file
+    # at the same path. It is empty; delete it by hand when nothing runs.
+    if [ -e "$CONFIG_PATH.lock" ]; then
+        note "  kept:      config.json lock file ($CONFIG_PATH.lock; shared by config writers)"
+    fi
     remove_file_idempotent "$CREDENTIALS_CACHE" "hook credentials cache"
     # lib/ is ours unconditionally, so it goes even without --opencode —
     # otherwise it orphans here and the rmdir below silently fails.

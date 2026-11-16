@@ -17,6 +17,8 @@
 #   - the mcpServers.review entry in ~/.claude.json
 #   - the Stop + PostToolUse hook entries in ~/.claude/settings.json
 #   - the review-orchestrator block in ~/.claude/CLAUDE.md
+#   - the gemini reviewer's effort aliases in ~/.gemini/settings.json
+#     ($GEMINI_CLI_HOME/.gemini when set)
 #
 # Pass --codex to ALSO wire codex CLI as a main developer (additive —
 # the Claude wiring above still runs):
@@ -51,6 +53,7 @@ DRY_RUN=0
 CODEX=0
 OPENCODE=0
 HOME_DIR="${HOME:-}"
+HOME_FROM_FLAG=0
 
 usage() {
     cat <<'EOF'
@@ -70,8 +73,9 @@ Usage: ./install.sh [--codex] [--opencode] [--launch] [--dry-run] [--home <dir>]
                be started manually (npm start) for the MCP entry and
                Stop hook to do anything.
   --dry-run    Print what would happen without writing.
-  --home DIR   Install into DIR/.config, DIR/.claude, DIR/.codex instead
-               of $HOME. Primarily for the test harness.
+  --home DIR   Install into DIR/.config, DIR/.claude, DIR/.codex,
+               DIR/.gemini instead of $HOME. Primarily for the test
+               harness.
   --help, -h   Show this help.
 
 Idempotent: rerun any time. Existing authToken is preserved.
@@ -87,7 +91,7 @@ while [ $# -gt 0 ]; do
         --home)
             shift
             [ $# -gt 0 ] || { echo "--home needs a value" >&2; exit 1; }
-            HOME_DIR="$1"; shift ;;
+            HOME_DIR="$1"; HOME_FROM_FLAG=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "unknown arg: $1" >&2; usage; exit 1 ;;
     esac
@@ -110,6 +114,22 @@ SIGNED_CLIENT_PATH="$HOOKS_DIR/signed-client.mjs"
 CLAUDE_JSON="$HOME_DIR/.claude.json"
 SETTINGS_JSON="$CLAUDE_DIR/settings.json"
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
+# The gemini CLI keeps its settings under $GEMINI_CLI_HOME/.gemini when
+# that is set (the CLI's own override of its home), so the aliases go
+# where the reviewer's gemini reads them. --home wins, so a test install
+# stays inside DIR.
+GEMINI_HOME="$HOME_DIR"
+if [ "$HOME_FROM_FLAG" -eq 0 ] && [ -n "${GEMINI_CLI_HOME:-}" ]; then
+    GEMINI_HOME="$GEMINI_CLI_HOME"
+    # A relative home is resolved here: reviews run in other folders.
+    case "$GEMINI_HOME" in /*) ;; *) GEMINI_HOME="$PWD/$GEMINI_HOME" ;; esac
+    # One spelling per folder (no trailing slash, symlinks resolved), so
+    # the record and the plist's HOME comparison see the same path.
+    if [ -d "$GEMINI_HOME" ]; then GEMINI_HOME="$(cd "$GEMINI_HOME" && pwd -P)"; fi
+fi
+GEMINI_DIR="$GEMINI_HOME/.gemini"
+GEMINI_SETTINGS="$GEMINI_DIR/settings.json"
+GEMINI_HOME_RECORD="$CONFIG_DIR/gemini-home"
 CODEX_DIR="$HOME_DIR/.codex"
 CODEX_HOOKS_DIR="$CODEX_DIR/hooks"
 CODEX_STOP_HOOK="$CODEX_HOOKS_DIR/stop-review.mjs"
@@ -209,11 +229,12 @@ render_plist() {
     local node_bin="$3"
     local repo_root="$4"
     local home="$5"
+    local gemini_home="$6"
     if ! maybe "render plist: $src → $dst"; then return 2; fi
     mkdir -p "$(dirname "$dst")"
     local out
     if ! out="$(node "$REPO_ROOT/install/render-plist.mjs" \
-            "$src" "$dst" "$node_bin" "$repo_root" "$home" 2>&1)"; then
+            "$src" "$dst" "$node_bin" "$repo_root" "$home" "$gemini_home" 2>&1)"; then
         echo "install: render-plist failed: $out" >&2
         exit 1
     fi
@@ -248,6 +269,20 @@ echo "  --opencode:$([ "$OPENCODE" -eq 1 ] && echo " yes" || echo " no")"
 echo "  --launch:  $([ "$LAUNCH" -eq 1 ] && echo yes || echo no)"
 echo "  --dry-run: $([ "$DRY_RUN" -eq 1 ] && echo yes || echo no)"
 echo
+
+# 0. The gemini reviewer's effort aliases. The gemini CLI has no flag
+# for the thinking level, so each model + effort the reviewer offers is
+# a named alias in ~/.gemini/settings.json (see GEMINI_EFFORTS in
+# server/src/core/review/gemini.js). Written even before gemini has run
+# (the file is created then), so the dashboard's gemini efforts work as
+# soon as gemini is installed; gemini keeps them when it adds its own
+# settings. First, because the helper refuses while gemini runs, and
+# then nothing else has been changed yet.
+# The helper also adds this gemini home to the record (one per line),
+# under the same lock; uninstall.sh cleans every home listed. Earlier
+# homes keep their aliases: a server still pinned to one keeps working.
+run_helper "~/.gemini/settings.json (reviewer aliases)" "$REPO_ROOT/install/merge-gemini-settings.mjs" \
+    "$GEMINI_SETTINGS" "$CONFIG_PATH" "$GEMINI_HOME_RECORD"
 
 # 1. authToken + config.json (under the config lock; also refreshes
 # ~/.cache/review-orchestrator/hook-credentials.json)
@@ -354,7 +389,7 @@ if [ "$LAUNCH" -eq 1 ]; then
         mkdir -p "$LOGS_DIR"
     fi
 
-    render_plist "$PLIST_SRC" "$PLIST_DST" "$NODE_BIN" "$REPO_ROOT" "$HOME_DIR" || true
+    render_plist "$PLIST_SRC" "$PLIST_DST" "$NODE_BIN" "$REPO_ROOT" "$HOME_DIR" "$GEMINI_HOME" || true
 
     if ! maybe "launchctl bootstrap"; then
         :

@@ -76,12 +76,12 @@ const DEFAULTS = {
         },
         gemini: {
             binary: "gemini",
-            // "auto" is the router alias — same as the CLI's interactive
-            // "Auto (Gemini 3)" picker, routing between gemini-3.1-pro
-            // and gemini-3-flash per task. Pin to a specific ID like
-            // "gemini-2.5-pro" if you want reproducible per-model
-            // behavior across machines.
+            // "auto" is the CLI's router alias; it routes only between
+            // the models the installed CLI release knows. Pick a model
+            // and effort from the dashboard (gemini-4-hydrogen or
+            // gemini-4-carbon) to name one explicitly.
             model: "auto",
+            effort: null,
             approvalMode: "plan",
             timeoutSeconds: 600,
             extraArgs: [],

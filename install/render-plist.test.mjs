@@ -3,7 +3,13 @@
  * Author: Leo Khramov
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+    mkdtempSync,
+    readFileSync,
+    rmSync,
+    symlinkSync,
+    writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { renderPlist, __test__ } from "./render-plist.mjs"
@@ -147,6 +153,50 @@ describe("renderPlist", () => {
             },
         })
         expect(r.action).toBe("updated")
+    })
+
+    test("GEMINI_CLI_HOME is set only for a gemini home other than HOME", () => {
+        writeFileSync(template, "<dict>__GEMINI_ENV__\n</dict>")
+        const dest = path.join(dir, "out.plist")
+        const base = { __NODE_BIN__: "/n", __REPO_ROOT__: "/r", __HOME__: "/h" }
+        for (const values of [base, { ...base, __GEMINI_HOME__: "/h" }]) {
+            renderPlist({ templatePath: template, destPath: dest, values })
+            expect(readFileSync(dest, "utf8")).toBe("<dict>\n</dict>")
+        }
+        // HOME spelled another way (trailing slash, a symlink) is HOME.
+        const real = mkdtempSync(path.join(tmpdir(), "plist-home-"))
+        const link = path.join(dir, "home-link")
+        symlinkSync(real, link)
+        for (const gemini of [`${real}/`, link]) {
+            renderPlist({
+                templatePath: template,
+                destPath: dest,
+                values: { ...base, __HOME__: real, __GEMINI_HOME__: gemini },
+            })
+            expect(readFileSync(dest, "utf8")).toBe("<dict>\n</dict>")
+        }
+        rmSync(real, { recursive: true, force: true })
+        renderPlist({
+            templatePath: template,
+            destPath: dest,
+            values: { ...base, __GEMINI_HOME__: "/g&h" },
+        })
+        expect(readFileSync(dest, "utf8")).toMatch(
+            /<key>GEMINI_CLI_HOME<\/key>\s*<string>\/g&amp;h<\/string>\n<\/dict>$/
+        )
+    })
+
+    test("the shipped plist has the GEMINI_CLI_HOME slot", () => {
+        const shipped = readFileSync(
+            new URL(
+                "../launchd/com.leo.review-orchestrator.plist",
+                import.meta.url
+            ),
+            "utf8"
+        )
+        expect(shipped).toContain(
+            "config.json</string>__GEMINI_ENV__\n    </dict>"
+        )
     })
 
     test("throws if a placeholder value is missing", () => {

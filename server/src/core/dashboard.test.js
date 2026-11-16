@@ -31,8 +31,8 @@ const baseConfig = () => ({
     port: 7777,
     bind: "127.0.0.1",
     provider: "gemini",
-    model: "auto",
-    effortOrMode: "plan",
+    model: "gemini-4-hydrogen",
+    effortOrMode: "high",
     reviewerTimeoutSeconds: 600,
     hookFetchTimeoutSeconds: null,
     maxCodexRounds: 5,
@@ -1292,8 +1292,8 @@ describe("live updates (v0.1.37)", () => {
             version: "0.1.37",
             config: {
                 provider: "gemini",
-                model: "auto",
-                effortOrMode: "plan",
+                model: "gemini-4-hydrogen",
+                effortOrMode: "high",
             },
             records: [],
         })
@@ -1301,7 +1301,8 @@ describe("live updates (v0.1.37)", () => {
         expect(html).toContain('id="provider-select"')
         expect(html).toMatch(/<dd data-config-key="model"><select/)
         expect(html).toContain('id="reviewer-preset-select"')
-        expect(html).toContain("gemini-3.5-flash · plan")
+        expect(html).toContain("gemini-4-carbon · low")
+        expect(html).toMatch(/<option value="gemini-4-hydrogen:high" selected>/)
     })
 
     test("client script wires section refresh on in-flight count drop", () => {
