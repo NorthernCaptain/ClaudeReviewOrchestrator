@@ -92,6 +92,20 @@ describe("ConfigSchema", () => {
         })
         expect(r.reviewer.provider).toBe("claude")
     })
+    test("accepts reviewer.provider=klaude with the claude knobs and its own binary", () => {
+        const r = ConfigSchema.parse({
+            authToken: "x",
+            reviewer: { provider: "klaude", klaude: { effort: "max" } },
+        })
+        expect(r.reviewer.provider).toBe("klaude")
+        expect(r.reviewer.klaude.binary).toBe("klaude")
+        expect(r.reviewer.klaude.effort).toBe("max")
+        expect(r.reviewer.klaude.disallowedTools).toEqual(
+            r.reviewer.claude.disallowedTools
+        )
+        expect(r.reviewer.claude.binary).toBe("claude")
+    })
+
     test("accepts reviewer.provider=gemini with defaults", () => {
         const r = ConfigSchema.parse({
             authToken: "x",

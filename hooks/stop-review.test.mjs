@@ -185,6 +185,18 @@ describe("resolveFetchTimeoutMs", () => {
         ).toBe(960_000)
     })
 
+    test("counts reviewer.klaude.timeoutSeconds too", () => {
+        expect(
+            resolveFetchTimeoutMs({
+                reviewer: {
+                    claude: { timeoutSeconds: 200 },
+                    klaude: { timeoutSeconds: 1000 },
+                },
+                limits: { codexTimeoutSeconds: 400 },
+            })
+        ).toBe(1_060_000)
+    })
+
     test("picks the larger of reviewer and codex timeouts when both set", () => {
         expect(
             resolveFetchTimeoutMs({

@@ -129,6 +129,22 @@ describe("handleSetReviewerPreset", () => {
         ])
     })
 
+    test("klaude: offers the claude presets and commits to reviewer.klaude", async () => {
+        expect(REVIEWER_PRESETS.klaude).toEqual(REVIEWER_PRESETS.claude)
+        const tx = fakeTransaction()
+        await handleSetReviewerPreset({
+            body: { preset: "claude-opus-5-5:high" },
+            config: { reviewer: { provider: "klaude" } },
+            configTransaction: tx,
+        })
+        expect(tx.calls).toEqual([
+            [
+                [["reviewer", "klaude", "model"], "claude-opus-5-5"],
+                [["reviewer", "klaude", "effort"], "high"],
+            ],
+        ])
+    })
+
     test("gemini: commits model and effort", async () => {
         const tx = fakeTransaction()
         await handleSetReviewerPreset({

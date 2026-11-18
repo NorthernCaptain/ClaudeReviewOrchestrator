@@ -164,10 +164,10 @@ export const REQUEST_REVIEW_INPUT_SHAPE = {
             "When true, bypass cache short-circuits (NO_CHANGES, NO_PROGRESS_WITH_OPEN_ISSUES, CODEX_ERROR_CACHED, dirty-flag fast path) and safety caps (MAX_BLOCKS, MAX_CODEX_ROUNDS). Spawns a fresh reviewer run unconditionally. Counters still increment."
         ),
     provider: z
-        .enum(["codex", "claude", "gemini"])
+        .enum(["codex", "claude", "klaude", "gemini"])
         .optional()
         .describe(
-            "Optional per-request reviewer override. One of: codex, claude, gemini. Falls back to the server's configured provider when omitted. If the named binary or auth is missing, the call returns ESCALATE."
+            "Optional per-request reviewer override. One of: codex, claude, klaude (Claude under a second account), gemini. Falls back to the server's configured provider when omitted. If the named binary or auth is missing, the call returns ESCALATE."
         ),
 }
 
@@ -261,7 +261,7 @@ export const REQUEST_REVIEW_TOOL = Object.freeze({
     title: "Run a code review",
     description:
         "Run a code review of the current git changes in `cwd`. " +
-        "Provider (codex / claude / gemini) is selected by " +
+        "Provider (codex / claude / klaude / gemini) is selected by " +
         "config.reviewer.provider on the server side, or per-call via " +
         "the optional `provider` input. Pass `force: true` to bypass the " +
         "server-side cache and safety caps and force a fresh reviewer " +

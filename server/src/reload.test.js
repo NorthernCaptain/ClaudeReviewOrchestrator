@@ -1887,6 +1887,16 @@ describe("requiredHookWaitMs", () => {
         ).toBe(960_000)
         expect(
             requiredHookWaitMs({
+                ...defaults,
+                reviewer: {
+                    ...defaults.reviewer,
+                    provider: "klaude",
+                    klaude: { timeoutSeconds: 700 },
+                },
+            })
+        ).toBe(760_000)
+        expect(
+            requiredHookWaitMs({
                 reviewer: { provider: "claude" },
                 limits: { codexTimeoutSeconds: 120 },
             })

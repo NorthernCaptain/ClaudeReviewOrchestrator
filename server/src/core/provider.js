@@ -16,7 +16,101 @@
 import { commitConfigChange, configChangeBody } from "./config.js"
 import { GEMINI_EFFORTS } from "./review/gemini.js"
 
-export const VALID_PROVIDERS = ["codex", "claude", "gemini"]
+export const VALID_PROVIDERS = ["codex", "claude", "klaude", "gemini"]
+
+// Claude CLI models and efforts, shared by claude and klaude.
+const CLAUDE_PRESETS = [
+    {
+        id: "claude-opus-5-5:xhigh",
+        model: "claude-opus-5-5",
+        effortOrMode: "xhigh",
+    },
+    {
+        id: "claude-opus-5-5:high",
+        model: "claude-opus-5-5",
+        effortOrMode: "high",
+    },
+    {
+        id: "claude-opus-5-5:medium",
+        model: "claude-opus-5-5",
+        effortOrMode: "medium",
+    },
+    {
+        id: "claude-fable-5-1:xhigh",
+        model: "claude-fable-5-1",
+        effortOrMode: "xhigh",
+    },
+    {
+        id: "claude-fable-5-1:high",
+        model: "claude-fable-5-1",
+        effortOrMode: "high",
+    },
+    {
+        id: "claude-fable-5-1:medium",
+        model: "claude-fable-5-1",
+        effortOrMode: "medium",
+    },
+    {
+        id: "claude-sonnet-5-5:xhigh",
+        model: "claude-sonnet-5-5",
+        effortOrMode: "xhigh",
+    },
+    {
+        id: "claude-sonnet-5-5:high",
+        model: "claude-sonnet-5-5",
+        effortOrMode: "high",
+    },
+    {
+        id: "claude-sonnet-5-5:medium",
+        model: "claude-sonnet-5-5",
+        effortOrMode: "medium",
+    },
+    {
+        id: "claude-opus-5:xhigh",
+        model: "claude-opus-5",
+        effortOrMode: "xhigh",
+    },
+    {
+        id: "claude-opus-5:high",
+        model: "claude-opus-5",
+        effortOrMode: "high",
+    },
+    {
+        id: "claude-opus-5:medium",
+        model: "claude-opus-5",
+        effortOrMode: "medium",
+    },
+    {
+        id: "claude-fable-5:xhigh",
+        model: "claude-fable-5",
+        effortOrMode: "xhigh",
+    },
+    {
+        id: "claude-fable-5:high",
+        model: "claude-fable-5",
+        effortOrMode: "high",
+    },
+    {
+        id: "claude-fable-5:medium",
+        model: "claude-fable-5",
+        effortOrMode: "medium",
+    },
+    {
+        id: "claude-sonnet-5:xhigh",
+        model: "claude-sonnet-5",
+        effortOrMode: "xhigh",
+    },
+    {
+        id: "claude-sonnet-5:high",
+        model: "claude-sonnet-5",
+        effortOrMode: "high",
+    },
+    {
+        id: "claude-sonnet-5:medium",
+        model: "claude-sonnet-5",
+        effortOrMode: "medium",
+    },
+]
 
 // Curated, CLI-compatible reviewer choices for the dashboard, newest
 // generation first. Gemini's come from GEMINI_EFFORTS, the models and
@@ -84,98 +178,9 @@ export const REVIEWER_PRESETS = {
             effortOrMode: "medium",
         },
     ],
-    claude: [
-        {
-            id: "claude-opus-5-5:xhigh",
-            model: "claude-opus-5-5",
-            effortOrMode: "xhigh",
-        },
-        {
-            id: "claude-opus-5-5:high",
-            model: "claude-opus-5-5",
-            effortOrMode: "high",
-        },
-        {
-            id: "claude-opus-5-5:medium",
-            model: "claude-opus-5-5",
-            effortOrMode: "medium",
-        },
-        {
-            id: "claude-fable-5-1:xhigh",
-            model: "claude-fable-5-1",
-            effortOrMode: "xhigh",
-        },
-        {
-            id: "claude-fable-5-1:high",
-            model: "claude-fable-5-1",
-            effortOrMode: "high",
-        },
-        {
-            id: "claude-fable-5-1:medium",
-            model: "claude-fable-5-1",
-            effortOrMode: "medium",
-        },
-        {
-            id: "claude-sonnet-5-5:xhigh",
-            model: "claude-sonnet-5-5",
-            effortOrMode: "xhigh",
-        },
-        {
-            id: "claude-sonnet-5-5:high",
-            model: "claude-sonnet-5-5",
-            effortOrMode: "high",
-        },
-        {
-            id: "claude-sonnet-5-5:medium",
-            model: "claude-sonnet-5-5",
-            effortOrMode: "medium",
-        },
-        {
-            id: "claude-opus-5:xhigh",
-            model: "claude-opus-5",
-            effortOrMode: "xhigh",
-        },
-        {
-            id: "claude-opus-5:high",
-            model: "claude-opus-5",
-            effortOrMode: "high",
-        },
-        {
-            id: "claude-opus-5:medium",
-            model: "claude-opus-5",
-            effortOrMode: "medium",
-        },
-        {
-            id: "claude-fable-5:xhigh",
-            model: "claude-fable-5",
-            effortOrMode: "xhigh",
-        },
-        {
-            id: "claude-fable-5:high",
-            model: "claude-fable-5",
-            effortOrMode: "high",
-        },
-        {
-            id: "claude-fable-5:medium",
-            model: "claude-fable-5",
-            effortOrMode: "medium",
-        },
-        {
-            id: "claude-sonnet-5:xhigh",
-            model: "claude-sonnet-5",
-            effortOrMode: "xhigh",
-        },
-        {
-            id: "claude-sonnet-5:high",
-            model: "claude-sonnet-5",
-            effortOrMode: "high",
-        },
-        {
-            id: "claude-sonnet-5:medium",
-            model: "claude-sonnet-5",
-            effortOrMode: "medium",
-        },
-    ],
+    claude: CLAUDE_PRESETS,
+    // The second Claude account runs the same models.
+    klaude: CLAUDE_PRESETS,
     gemini: Object.entries(GEMINI_EFFORTS).flatMap(([model, efforts]) =>
         efforts.map((effort) => ({
             id: `${model}:${effort}`,

@@ -31,6 +31,7 @@ const MAX_BUFFER_BYTES = 64 * 1024 * 1024
 export const REVIEWER_TOOLS = Object.freeze({
     codex: (config) => config?.codex?.binary ?? "codex",
     claude: (config) => config?.reviewer?.claude?.binary ?? "claude",
+    klaude: (config) => config?.reviewer?.klaude?.binary ?? "klaude",
     gemini: (config) => config?.reviewer?.gemini?.binary ?? "gemini",
 })
 

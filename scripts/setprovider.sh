@@ -8,6 +8,7 @@
 # Usage:
 #   scripts/setprovider.sh gemini
 #   scripts/setprovider.sh claude
+#   scripts/setprovider.sh klaude    # Claude under the second account
 #   scripts/setprovider.sh codex
 #
 # Requires: jq, node. Sends the request through hooks/signed-client.mjs,
@@ -19,11 +20,11 @@ set -euo pipefail
 CONFIG_PATH="${REVIEW_ORCH_CONFIG:-$HOME/.config/review-orchestrator/config.json}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT="$SCRIPT_DIR/../hooks/signed-client.mjs"
-VALID="codex claude gemini"
+VALID="codex claude klaude gemini"
 
 usage() {
     cat <<EOF >&2
-usage: $(basename "$0") <codex|claude|gemini>
+usage: $(basename "$0") <codex|claude|klaude|gemini>
 
 Switches the reviewer provider on the running server. Takes effect on
 the next review and is persisted to:

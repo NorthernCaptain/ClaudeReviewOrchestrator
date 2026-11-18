@@ -819,7 +819,7 @@ Tools the MCP server advertises (v1.0):
 
 - `request_review` — input
   `{ cwd: string, scope?: "uncommitted", extra_instructions?: string,
-  force?: boolean, provider?: "codex" | "claude" | "gemini" }`,
+  force?: boolean, provider?: "codex" | "claude" | "klaude" | "gemini" }`,
   returns review result. `force: true` bypasses cache + safety caps;
   `provider` is a one-shot reviewer override.
 - `reset_review_context` — input `{ cwd: string }`, returns `{ ok: true }`.
@@ -1012,6 +1012,7 @@ The reviewer is pluggable. `config.reviewer.provider` picks one of:
 |----------|---------|----------------------------------|----------------------------------------|-------|
 | `codex`  | `codex` | `--output-schema <path>` (strict) | Codex CLI's own login (ChatGPT or API key) | Default. The original adapter; tightest schema enforcement. |
 | `claude` | `claude` | `--json-schema <sanitized inline>` (best-effort) | OAuth keychain via `claude login`, or `ANTHROPIC_API_KEY` | Salvage parser handles prose lead-ins; status re-derived from findings. |
+| `klaude` | `klaude` | same as `claude` | The second account's login (the wrapper sets its own `CLAUDE_CONFIG_DIR`) | The Claude adapter with its own `reviewer.klaude` block and the same dashboard presets, so a second Claude account can review when the first one is rate-limited. `klaude` must be on the server's `PATH`, or set `reviewer.klaude.binary` to its absolute path. |
 | `gemini` | `gemini` | none (prompt-only contract)      | `GEMINI_API_KEY` env, or `gemini auth login` (OAuth) | The dashboard offers `gemini-4-hydrogen` and `gemini-4-carbon` with three efforts each (see *Gemini efforts*); status coercion required. |
 
 #### Gemini efforts
@@ -1130,7 +1131,7 @@ in-memory switch still succeeds and `persisted` is `false`. Convenience
 wrapper:
 
 ```bash
-scripts/setprovider.sh gemini     # or claude / codex
+scripts/setprovider.sh gemini     # or claude / klaude / codex
 ```
 
 A single review can also override the provider for just that call via the
@@ -1770,6 +1771,15 @@ example below shows every supported key and the current default):
       "timeoutSeconds": 600,
       "extraArgs": []
     },
+    "klaude": {
+      "binary": "klaude",
+      "model": "claude-opus-5",
+      "effort": "high",
+      "permissionMode": "bypassPermissions",
+      "disallowedTools": ["Bash","Edit","Write","NotebookEdit","WebFetch","WebSearch","Task"],
+      "timeoutSeconds": 600,
+      "extraArgs": []
+    },
     "gemini": {
       "binary": "gemini",
       "model": "auto",
@@ -1832,10 +1842,11 @@ example below shows every supported key and the current default):
 
 | Key | Default | Effect |
 |---|---|---|
-| `reviewer.provider` | `"codex"` | Selects the reviewer adapter: `codex`, `claude`, or `gemini`. Both sub-blocks ship pre-populated so flipping `provider` needs no other edits. |
+| `reviewer.provider` | `"codex"` | Selects the reviewer adapter: `codex`, `claude`, `klaude`, or `gemini`. Every sub-block has defaults, so flipping `provider` needs no other edits. |
 | `reviewer.rulesFile` | `null` (bundled) | The review rules (Markdown) every reviewer gets. `null` uses `server/src/core/review/review-rules.md`; an absolute or `~/` path is read on every review. See "Review rules". |
 | `reviewer.claude.effort` | `"high"` | Maps to Claude CLI `--effort`. One of `low\|medium\|high\|xhigh\|max`. |
 | `reviewer.claude.permissionMode` | `"bypassPermissions"` | Only mode that returns a clean assistant response in non-interactive `-p` mode; `disallowedTools` is the real safety boundary. |
+| `reviewer.klaude.*` | as `reviewer.claude.*`, `binary` `"klaude"` | The same knobs for the Claude CLI under the second account. |
 | `reviewer.gemini.model` | `"auto"` | Model id, or `auto` (the CLI's router, limited to the models its release knows). The dashboard sets `gemini-4-hydrogen` or `gemini-4-carbon`. |
 | `reviewer.gemini.effort` | `null` | Thinking level through the installed alias: hydrogen `xhigh\|high\|medium`, carbon `high\|medium\|low`. `null` runs the model at its default. See *Gemini efforts*. |
 | `reviewer.gemini.approvalMode` | `"plan"` | Read-only non-interactive mode. |

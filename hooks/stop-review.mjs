@@ -70,7 +70,7 @@ export const MAX_FETCH_TIMEOUT_MS = 1_740_000 // 29 min
 // Precedence:
 //   1. hook.fetchTimeoutSeconds (when set to a positive integer) — pin
 //      the hook timeout independent of the reviewer.
-//   2. Auto-derived: max(reviewer.claude.timeoutSeconds,
+//   2. Auto-derived: max(reviewer.{claude,klaude,gemini}.timeoutSeconds,
 //      limits.codexTimeoutSeconds) + AUTO_BUFFER_MS — one knob (the
 //      reviewer timeout) controls both. The buffer covers the time the
 //      server needs to kill a runaway subprocess and serialize the
@@ -86,9 +86,10 @@ export const resolveFetchTimeoutMs = (parsed) => {
         ms = explicit * 1000
     } else {
         const claudeSec = parsed?.reviewer?.claude?.timeoutSeconds
+        const klaudeSec = parsed?.reviewer?.klaude?.timeoutSeconds
         const geminiSec = parsed?.reviewer?.gemini?.timeoutSeconds
         const codexSec = parsed?.limits?.codexTimeoutSeconds
-        const candidates = [claudeSec, geminiSec, codexSec].filter(
+        const candidates = [claudeSec, klaudeSec, geminiSec, codexSec].filter(
             (v) => Number.isInteger(v) && v > 0
         )
         ms =

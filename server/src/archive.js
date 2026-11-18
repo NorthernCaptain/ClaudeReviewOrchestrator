@@ -203,8 +203,8 @@ const buildRecord = ({
         ? {
               binary: (codexRaw.argv ?? [])[0] ?? null,
               // `provider` is the actual reviewer that ran (codex,
-              // claude, gemini). The archive blob's outer field stays
-              // named "codex" for back-compat with archived records
+              // claude, klaude, gemini). The archive blob's outer field
+              // stays named "codex" for back-compat with archived records
               // from before the multi-provider switch.
               provider: codexRaw.provider ?? null,
               model: codexRaw.model ?? null,

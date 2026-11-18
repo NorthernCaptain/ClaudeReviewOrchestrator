@@ -26,6 +26,10 @@
 //     --append-system-prompt <s>     appended to default system prompt
 //     --disallowed-tools <csv|list>  comma-separated tool names
 //
+// `name` picks the config block and default binary: "claude", or
+// "klaude" for a second account (a wrapper with its own
+// CLAUDE_CONFIG_DIR). Both run the same CLI.
+//
 // Mirrors the shape of codex.js — same runAndParse contract so the
 // review pipeline can switch providers without knowing the difference.
 // Differences vs codex:
@@ -124,8 +128,9 @@ export const buildClaudeArgs = ({
     config,
     schemaText,
     sessionId = randomUUID(),
+    name = "claude",
 }) => {
-    const c = config.reviewer?.claude ?? {}
+    const c = config.reviewer?.[name] ?? {}
     // NOTE: we do NOT pass --bare. --bare disables OAuth/keychain auth
     // and requires ANTHROPIC_API_KEY in the env, which is rarely set on
     // dev machines using interactive Claude Code login. We accept the
@@ -169,6 +174,7 @@ export const runClaude = ({
     spawn,
     now = Date.now,
     sessionId,
+    name = "claude",
 }) =>
     new Promise((resolve, reject) => {
         const args = buildClaudeArgs({
@@ -176,8 +182,9 @@ export const runClaude = ({
             config,
             schemaText,
             sessionId,
+            name,
         })
-        const binary = config.reviewer?.claude?.binary ?? "claude"
+        const binary = config.reviewer?.[name]?.binary ?? name
         const startedAt = now()
         let child
         try {
@@ -196,7 +203,7 @@ export const runClaude = ({
         }
 
         const timeoutMs =
-            (config.reviewer?.claude?.timeoutSeconds ??
+            (config.reviewer?.[name]?.timeoutSeconds ??
                 config.limits?.codexTimeoutSeconds ??
                 240) * 1000
         // STDOUT is the contract (one JSON object, tiny). STDERR is
@@ -433,6 +440,7 @@ export const runAndParse = async ({
     spawn,
     validator,
     now = Date.now,
+    name = "claude",
 }) => {
     const v = validator ?? schema.validator()
     const raw = await runClaude({
@@ -442,16 +450,17 @@ export const runAndParse = async ({
         schemaText: schemaText ?? schema.claudeText,
         spawn,
         now,
+        name,
     })
 
     if (raw.timedOut) {
         const sec =
-            config.reviewer?.claude?.timeoutSeconds ??
+            config.reviewer?.[name]?.timeoutSeconds ??
             config.limits?.codexTimeoutSeconds ??
             240
         return {
             status: "ESCALATE",
-            reason: `claude timed out after ${sec}s`,
+            reason: `${name} timed out after ${sec}s`,
             raw,
         }
     }
@@ -459,7 +468,7 @@ export const runAndParse = async ({
         const cap = config.limits?.maxCodexOutputBytes ?? 1024 * 1024
         return {
             status: "ESCALATE",
-            reason: `claude stdout exceeded ${cap} bytes; killed (runaway result)`,
+            reason: `${name} stdout exceeded ${cap} bytes; killed (runaway result)`,
             raw,
         }
     }
@@ -485,7 +494,7 @@ export const runAndParse = async ({
     if (raw.exitCode !== 0) {
         return {
             status: "ESCALATE",
-            reason: `claude exited with code ${raw.exitCode}${raw.signal ? ` (signal ${raw.signal})` : ""}`,
+            reason: `${name} exited with code ${raw.exitCode}${raw.signal ? ` (signal ${raw.signal})` : ""}`,
             schemaError: parsed.error,
             raw,
         }
@@ -493,7 +502,7 @@ export const runAndParse = async ({
 
     return {
         status: "ESCALATE",
-        reason: `claude output ${parsed.error.code}: ${parsed.error.message}`,
+        reason: `${name} output ${parsed.error.code}: ${parsed.error.message}`,
         schemaError: parsed.error,
         raw,
     }

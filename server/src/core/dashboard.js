@@ -691,7 +691,7 @@ export const renderInFlight = (inFlight = []) =>
 
 // Inline dashboard controls (v0.1.35). Provider and model controls live
 // directly in the active-config grid; this bar only holds context actions.
-const VALID_PROVIDER_OPTIONS = ["codex", "claude", "gemini"]
+const VALID_PROVIDER_OPTIONS = ["codex", "claude", "klaude", "gemini"]
 
 export const renderControls = (_currentProvider, contexts = []) => {
     const sorted = [...(contexts ?? [])].sort((a, b) =>

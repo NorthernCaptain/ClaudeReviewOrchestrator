@@ -143,11 +143,14 @@ describe("createTools — resolveBinary", () => {
             codex: { binary: "/opt/codex" },
             reviewer: {
                 claude: { binary: "/opt/claude" },
+                klaude: { binary: "/opt/klaude" },
                 gemini: { binary: "/opt/gemini" },
             },
         }
         expect(tools.resolveBinary("codex", config)).toBe("/opt/codex")
         expect(tools.resolveBinary("claude", config)).toBe("/opt/claude")
+        expect(tools.resolveBinary("klaude", config)).toBe("/opt/klaude")
+        expect(tools.resolveBinary("klaude", {})).toBe("klaude")
         expect(tools.resolveBinary("gemini", config)).toBe("/opt/gemini")
         expect(tools.resolveBinary("codex", {})).toBe("codex")
     })

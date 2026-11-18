@@ -30,7 +30,7 @@ const DEFAULT_IGNORE_PATHS = [
 
 const Severity = z.enum(["blocker", "major", "minor", "nit"])
 
-// Hard cap on any reviewer-run timeout (codex / claude / gemini), in
+// Hard cap on any reviewer-run timeout (codex / claude / klaude / gemini), in
 // seconds. The Stop hook waits reviewer + 60s for the server and is
 // itself clamped to a fixed ceiling (hooks/stop-review.mjs
 // MAX_FETCH_TIMEOUT_MS = 1_740_000ms = 1740s), above which the
@@ -40,6 +40,51 @@ const Severity = z.enum(["blocker", "major", "minor", "nit"])
 // holds for ANY config without a reinstall. Bumping this REQUIRES
 // bumping MAX_FETCH_TIMEOUT_MS and the harness timeout in lockstep.
 export const MAX_REVIEWER_TIMEOUT_SECONDS = 1680
+
+// A Claude CLI reviewer block; `binary` is its default executable.
+const claudeReviewer = (binary) =>
+    z
+        .object({
+            binary: z.string().default(binary),
+            model: z.string().default("claude-opus-5"),
+            // Maps to `--effort <level>` on the Claude CLI.
+            effort: z
+                .enum(["low", "medium", "high", "xhigh", "max"])
+                .default("high"),
+            // bypassPermissions paired with disallowedTools is the only
+            // mode that returns a clean assistant response in
+            // non-interactive `-p` mode. The disallowed list below is the
+            // real safety boundary.
+            permissionMode: z
+                .enum([
+                    "acceptEdits",
+                    "auto",
+                    "bypassPermissions",
+                    "default",
+                    "dontAsk",
+                    "plan",
+                ])
+                .default("bypassPermissions"),
+            disallowedTools: z
+                .array(z.string())
+                .default([
+                    "Bash",
+                    "Edit",
+                    "Write",
+                    "NotebookEdit",
+                    "WebFetch",
+                    "WebSearch",
+                    "Task",
+                ]),
+            timeoutSeconds: z
+                .number()
+                .int()
+                .min(1)
+                .max(MAX_REVIEWER_TIMEOUT_SECONDS)
+                .default(600),
+            extraArgs: z.array(z.string()).default([]),
+        })
+        .default({})
 
 const ConfigSchema = z
     .object({
@@ -69,13 +114,13 @@ const ConfigSchema = z
             .default({}),
         // Reviewer provider selector. Defaults to "codex" for
         // backwards-compatibility with installs predating this block;
-        // flip to "claude" or "gemini" to use the respective CLI
+        // flip to "claude", "klaude" or "gemini" to use the respective CLI
         // adapter. Provider-specific knobs live under their own
         // sub-keys.
         reviewer: z
             .object({
                 provider: z
-                    .enum(["codex", "claude", "gemini"])
+                    .enum(["codex", "claude", "klaude", "gemini"])
                     .default("codex"),
                 // The review rules (Markdown) every reviewer gets. null
                 // uses the copy bundled with the core
@@ -89,49 +134,11 @@ const ConfigSchema = z
                     )
                     .nullable()
                     .default(null),
-                claude: z
-                    .object({
-                        binary: z.string().default("claude"),
-                        model: z.string().default("claude-opus-5"),
-                        // Maps to `--effort <level>` on the Claude CLI.
-                        effort: z
-                            .enum(["low", "medium", "high", "xhigh", "max"])
-                            .default("high"),
-                        // bypassPermissions paired with disallowedTools
-                        // is the only mode that returns a clean
-                        // assistant response in non-interactive `-p`
-                        // mode. The disallowed list below is the real
-                        // safety boundary.
-                        permissionMode: z
-                            .enum([
-                                "acceptEdits",
-                                "auto",
-                                "bypassPermissions",
-                                "default",
-                                "dontAsk",
-                                "plan",
-                            ])
-                            .default("bypassPermissions"),
-                        disallowedTools: z
-                            .array(z.string())
-                            .default([
-                                "Bash",
-                                "Edit",
-                                "Write",
-                                "NotebookEdit",
-                                "WebFetch",
-                                "WebSearch",
-                                "Task",
-                            ]),
-                        timeoutSeconds: z
-                            .number()
-                            .int()
-                            .min(1)
-                            .max(MAX_REVIEWER_TIMEOUT_SECONDS)
-                            .default(600),
-                        extraArgs: z.array(z.string()).default([]),
-                    })
-                    .default({}),
+                claude: claudeReviewer("claude"),
+                // The Claude CLI signed in with a second account (a
+                // wrapper that sets its own CLAUDE_CONFIG_DIR). Same
+                // knobs as claude.
+                klaude: claudeReviewer("klaude"),
                 gemini: z
                     .object({
                         binary: z.string().default("gemini"),

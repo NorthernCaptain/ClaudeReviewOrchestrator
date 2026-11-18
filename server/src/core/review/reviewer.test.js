@@ -3,6 +3,7 @@
  * Author: Leo Khramov
  */
 
+import { jest } from "@jest/globals"
 import {
     pickReviewer,
     providerCfg,
@@ -53,6 +54,46 @@ describe("pickReviewer", () => {
         )
         expect(r.name).toBe("claude")
         expect(r.runAndParse).toBe(claudeRunAndParse)
+    })
+
+    test("returns the claude adapter under the klaude block when provider=klaude", async () => {
+        const r = pickReviewer(
+            minimalConfig({ reviewer: { provider: "klaude" } })
+        )
+        expect(r.name).toBe("klaude")
+        expect(r.binary).toBe("klaude")
+        const args = r.buildArgs({
+            repoRoot: "/r",
+            config: {
+                reviewer: {
+                    claude: { model: "claude-opus-5" },
+                    klaude: { model: "claude-sonnet-5-5" },
+                },
+            },
+        })
+        expect(args[args.indexOf("--model") + 1]).toBe("claude-sonnet-5-5")
+        expect(args).toContain("<reviewer-output-schema>")
+    })
+
+    test("klaude runAndParse runs the klaude binary", async () => {
+        const spawn = jest.fn(() => {
+            throw new Error("spawned")
+        })
+        const r = pickReviewer(
+            minimalConfig({
+                reviewer: { provider: "klaude", klaude: { binary: "kb" } },
+            })
+        )
+        await expect(
+            r.runAndParse({
+                repoRoot: "/r",
+                prompt: "x",
+                config: { reviewer: { klaude: { binary: "kb" } } },
+                schema: { validator: () => () => true, claudeText: "{}" },
+                spawn,
+            })
+        ).rejects.toThrow("spawned")
+        expect(spawn.mock.calls[0][0]).toBe("kb")
     })
 
     test("returns gemini adapter when provider=gemini", () => {
@@ -106,11 +147,13 @@ describe("pickReviewer", () => {
             codex: { model: "gpt-5.5" },
             reviewer: {
                 claude: { model: "claude-opus-4-7" },
+                klaude: { model: "claude-sonnet-5-5" },
                 gemini: { model: "gemini-2.5-pro" },
             },
         }
         expect(providerCfg("codex", cfg).model).toBe("gpt-5.5")
         expect(providerCfg("claude", cfg).model).toBe("claude-opus-4-7")
+        expect(providerCfg("klaude", cfg).model).toBe("claude-sonnet-5-5")
         expect(providerCfg("gemini", cfg).model).toBe("gemini-2.5-pro")
     })
 

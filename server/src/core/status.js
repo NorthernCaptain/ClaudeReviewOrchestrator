@@ -11,6 +11,20 @@
 
 const REDACTED = "<redacted>"
 
+// A Claude CLI reviewer block (claude or klaude) for the summary.
+const claudeSummary = (c) =>
+    c
+        ? {
+              binary: c.binary,
+              model: c.model,
+              effort: c.effort,
+              permissionMode: c.permissionMode,
+              disallowedTools: c.disallowedTools,
+              timeoutSeconds: c.timeoutSeconds,
+              extraArgs: c.extraArgs,
+          }
+        : null
+
 // Strip secrets from the config object before exposing it. The auth
 // token is the obvious one; we also drop anything else that could
 // identify the user's home or hand-edited internals.
@@ -34,20 +48,8 @@ const redactConfig = (config) => {
             ? {
                   provider: config.reviewer.provider,
                   rulesFile: config.reviewer.rulesFile ?? null,
-                  claude: config.reviewer.claude
-                      ? {
-                            binary: config.reviewer.claude.binary,
-                            model: config.reviewer.claude.model,
-                            effort: config.reviewer.claude.effort,
-                            permissionMode:
-                                config.reviewer.claude.permissionMode,
-                            disallowedTools:
-                                config.reviewer.claude.disallowedTools,
-                            timeoutSeconds:
-                                config.reviewer.claude.timeoutSeconds,
-                            extraArgs: config.reviewer.claude.extraArgs,
-                        }
-                      : null,
+                  claude: claudeSummary(config.reviewer.claude),
+                  klaude: claudeSummary(config.reviewer.klaude),
                   gemini: config.reviewer.gemini
                       ? {
                             binary: config.reviewer.gemini.binary,
@@ -164,8 +166,8 @@ export const handleStatus = ({
 export const summarizeConfig = (config, version = null) => {
     const provider = config?.reviewer?.provider ?? "codex"
     const providerCfg =
-        provider === "claude"
-            ? config?.reviewer?.claude
+        provider === "claude" || provider === "klaude"
+            ? config?.reviewer?.[provider]
             : provider === "gemini"
               ? config?.reviewer?.gemini
               : config?.codex

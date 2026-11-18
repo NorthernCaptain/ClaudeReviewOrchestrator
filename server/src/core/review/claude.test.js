@@ -690,3 +690,66 @@ describe("runAndParse", () => {
         expect(result.reason).toMatch(/timed out/)
     })
 })
+
+describe("name selects the config block (klaude)", () => {
+    const klaudeConfig = () => ({
+        reviewer: {
+            claude: { binary: "claude", model: "claude-opus-5", effort: "low" },
+            klaude: {
+                model: "claude-sonnet-5-5",
+                effort: "medium",
+                timeoutSeconds: 0.05,
+            },
+        },
+        limits: { codexTimeoutSeconds: 60, maxCodexOutputBytes: 65536 },
+    })
+
+    test("buildClaudeArgs reads reviewer.klaude", () => {
+        const args = buildClaudeArgs({
+            repoRoot: "/r",
+            config: klaudeConfig(),
+            name: "klaude",
+        })
+        expect(args[args.indexOf("--model") + 1]).toBe("claude-sonnet-5-5")
+        expect(args[args.indexOf("--effort") + 1]).toBe("medium")
+    })
+
+    test("runs the klaude binary by default and names it in errors", async () => {
+        const spawn = fakeSpawn((child) => {
+            child.kill = jest.fn(() => {
+                process.nextTick(() => child.emit("close", null, "SIGTERM"))
+            })
+        })
+        const result = await runAndParse({
+            repoRoot: "/r",
+            prompt: "x",
+            config: klaudeConfig(),
+            spawn,
+            name: "klaude",
+        })
+        expect(spawn.mock.calls[0][0]).toBe("klaude")
+        expect(spawn.mock.calls[0][2].env.REVIEW_ORCH_SKIP).toBe("1")
+        expect(result.status).toBe("ESCALATE")
+        expect(result.reason).toBe("klaude timed out after 0.05s")
+        expect(result.raw.argv[0]).toBe("klaude")
+    })
+
+    test("a configured klaude binary wins", async () => {
+        const config = klaudeConfig()
+        config.reviewer.klaude.binary = "/Users/me/bin/klaude"
+        const spawn = fakeSpawn((child) => {
+            child.stdout.end()
+            child.stderr.end()
+            child.emit("close", 1, null)
+        })
+        const result = await runAndParse({
+            repoRoot: "/r",
+            prompt: "x",
+            config,
+            spawn,
+            name: "klaude",
+        })
+        expect(spawn.mock.calls[0][0]).toBe("/Users/me/bin/klaude")
+        expect(result.reason).toBe("klaude exited with code 1")
+    })
+})

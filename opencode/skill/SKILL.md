@@ -28,8 +28,9 @@ resolve the repo root and the active branch.
     MAX_CODEX_ROUNDS) for this one call. Use it when the user explicitly asks
     for a re-review or when you've changed review-relevant config
     (`.review-orchestrator.json`, ignore paths).
-  - `provider: "codex" | "claude" | "gemini"` overrides the configured reviewer
-    for this one call. The next review reverts to the server default.
+  - `provider: "codex" | "claude" | "klaude" | "gemini"` overrides the
+    configured reviewer for this one call. The next review reverts to the
+    server default.
 - `reset_review_context({ cwd })` — clear the retry counter and prior-findings
   cache for this repo+branch. Call this when starting a fresh, unrelated coding
   task.
@@ -96,7 +97,7 @@ resolve the repo root and the active branch.
   automatic review but reports findings as a toast instead of continuing the
   session with them.
 - Convenience scripts (in the orchestrator repo's `scripts/`):
-  - `setprovider.sh <codex|claude|gemini>` — server-wide reviewer switch.
+  - `setprovider.sh <codex|claude|klaude|gemini>` — server-wide reviewer switch.
   - `reset-review.sh [path]` — clear loop counters for a repo+branch.
   - `replay-review.sh` — re-fire the last hook payload at the server for
     debugging.

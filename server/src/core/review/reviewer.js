@@ -4,7 +4,7 @@
  */
 
 // Reviewer provider picker. Maps config.reviewer.provider ("codex" |
-// "claude" | "gemini") to the matching adapter module exports. All
+// "claude" | "klaude" | "gemini") to the matching adapter module exports. All
 // modules implement the same runAndParse / buildArgs / wrapPrompt
 // contract so review.js can dispatch without provider-specific
 // branches.
@@ -49,6 +49,20 @@ const PROVIDERS = {
                 sessionId: "<session>",
             }),
     },
+    // The Claude CLI under the second account: same adapter, its own
+    // config block (reviewer.klaude).
+    klaude: {
+        name: "klaude",
+        runAndParse: (opts) => claudeRunAndParse({ ...opts, name: "klaude" }),
+        buildArgs: ({ repoRoot, config }) =>
+            buildClaudeArgs({
+                repoRoot,
+                config,
+                schemaText: "<reviewer-output-schema>",
+                sessionId: "<session>",
+                name: "klaude",
+            }),
+    },
     gemini: {
         name: "gemini",
         runAndParse: geminiRunAndParse,
@@ -63,6 +77,7 @@ const PROVIDERS = {
 const BINARY_RESOLVERS = {
     codex: (config) => config?.codex?.binary ?? "codex",
     claude: (config) => config?.reviewer?.claude?.binary ?? "claude",
+    klaude: (config) => config?.reviewer?.klaude?.binary ?? "klaude",
     gemini: (config) => config?.reviewer?.gemini?.binary ?? "gemini",
 }
 
@@ -84,6 +99,7 @@ export const pickReviewer = (config, override = null) => {
 // log + archive metadata) don't have to branch on provider name.
 export const providerCfg = (providerName, config) => {
     if (providerName === "claude") return config?.reviewer?.claude
+    if (providerName === "klaude") return config?.reviewer?.klaude
     if (providerName === "gemini") return config?.reviewer?.gemini
     return config?.codex
 }

@@ -312,6 +312,28 @@ describe("summarizeConfig", () => {
         expect(s.reviewerTimeoutSeconds).toBe(600)
     })
 
+    test("summarizeConfig picks the klaude sub-config", () => {
+        const s = summarizeConfig(
+            {
+                reviewer: {
+                    provider: "klaude",
+                    claude: { model: "claude-opus-5", timeoutSeconds: 300 },
+                    klaude: {
+                        model: "claude-sonnet-5-5",
+                        effort: "xhigh",
+                        timeoutSeconds: 900,
+                    },
+                },
+                limits: { codexTimeoutSeconds: 240 },
+            },
+            "0.1.0"
+        )
+        expect(s.provider).toBe("klaude")
+        expect(s.model).toBe("claude-sonnet-5-5")
+        expect(s.effortOrMode).toBe("xhigh")
+        expect(s.reviewerTimeoutSeconds).toBe(900)
+    })
+
     test("summarizeConfig picks gemini sub-config and its effort", () => {
         const cfg = {
             port: 7777,
